@@ -1,0 +1,19 @@
+{
+  "name": "@kovela/license",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./signing": {
+      "types": "./src/signing.d.ts",
+      "default": "./src/signing.js"
+    }
+  },
+  "dependencies": {
+    "tweetnacl": "1.0.3"
+  }
+}

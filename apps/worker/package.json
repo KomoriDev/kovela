@@ -1,0 +1,25 @@
+{
+  "name": "@kovela/worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "deploy": "wrangler deploy",
+    "db:local": "wrangler d1 migrations apply kovela --local",
+    "db:remote": "wrangler d1 migrations apply kovela --remote",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@kovela/afdian": "workspace:*",
+    "@kovela/license": "workspace:*",
+    "@kovela/protocol": "workspace:*",
+    "cordis": "3.18.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260911.1",
+    "miniflare": "5.20260911.0-alpha",
+    "wrangler": "4.131.1"
+  }
+}

@@ -1,0 +1,86 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@custom-variant dark (&:where(.dark, .dark *));
+@theme inline {
+  --font-sans: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-input: var(--border);
+  --color-popover: var(--card);
+  --color-popover-foreground: var(--foreground);
+  --color-accent: var(--muted);
+  --color-accent-foreground: var(--foreground);
+  --color-ring: var(--primary);
+  --color-destructive: #dc2626;
+}
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+}
+:root {
+  color-scheme: light;
+  --background: #fcfbfe;
+  --foreground: #252231;
+  --card: #ffffff;
+  --primary: #7c3aed;
+  --primary-foreground: #ffffff;
+  --muted: #f2eff7;
+  --muted-foreground: #817b90;
+  --border: #e9e5ef;
+  font-family: var(--font-sans);
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+}
+.dark {
+  color-scheme: dark;
+  --background: #131019;
+  --foreground: #eeebf5;
+  --card: #1b1724;
+  --primary: #a78bfa;
+  --primary-foreground: #211039;
+  --muted: #262031;
+  --muted-foreground: #a79db9;
+  --border: #342a43;
+}
+body {
+  margin: 0;
+  min-width: 0;
+  background: var(--background);
+  color: var(--foreground);
+}
+button,
+a,
+input {
+  -webkit-tap-highlight-color: transparent;
+}
+button:not(:disabled),
+a {
+  cursor: pointer;
+}
+::selection {
+  background: #ddd0fc;
+  color: #402075;
+}
+.hero-glow {
+  background: radial-gradient(ellipse at 28% 40%, #a78bfa16, transparent 65%);
+}
+.card-shadow {
+  box-shadow:
+    0 3px 8px #251b4003,
+    0 24px 70px -28px #4c287c24;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

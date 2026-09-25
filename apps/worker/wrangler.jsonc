@@ -1,0 +1,62 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kovela",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "dev": { "host": "127.0.0.1" },
+  "assets": {
+    "directory": "../web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"],
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "kovela",
+      "database_id": "115b1c16-7986-4761-bc95-a207898a3ebe",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "triggers": {
+    "crons": ["* * * * *"],
+  },
+  "observability": {
+    "enabled": false,
+  },
+  "routes": [
+    {
+      "pattern": "kovela.komoridevs.icu",
+      "custom_domain": true,
+    },
+  ],
+  "vars": {
+    "PUBLIC_ORIGIN": "https://kovela.komoridevs.icu",
+    "PRODUCTS": [
+      {
+        "productId": "com.komoridev.billiard",
+        "productName": "口袋台球",
+        "purchaseUrl": "",
+        "planIds": [],
+        "skuIds": [],
+      },
+      {
+        "productId": "com.komoridev.breakout",
+        "productName": "打砖块",
+        "purchaseUrl": "",
+        "planIds": [],
+        "skuIds": [],
+      },
+      {
+        "productId": "com.komoridev.tankturmoil",
+        "productName": "坦克动荡",
+        "purchaseUrl": "https://ifdian.net/item/285dd096af2511f1ac1552540025c377",
+        "planIds": ["285dd096af2511f1ac1552540025c377"],
+        "skuIds": [],
+      },
+    ],
+    "AFDIAN_USER_ID": "9c2257f6628d11edb5e652540025c377",
+    "TURNSTILE_SITE_KEY": "0x4AAAAAAEyF9L78iJGDnnH2",
+    "DEV_MODE": "false",
+  },
+}

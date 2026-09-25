@@ -1,0 +1,14 @@
+{
+  "name": "@kovela/afdian",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "cordis": "3.18.1",
+    "@noble/hashes": "1.8.0"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}

@@ -1,0 +1,15 @@
+# Local development only. Copy to .dev.vars; never commit real credentials.
+# Production uses wrangler.jsonc public vars and Cloudflare Secrets.
+PUBLIC_ORIGIN=http://127.0.0.1:5173
+DEV_MODE=true
+
+AFDIAN_USER_ID=
+AFDIAN_TOKEN=
+
+# Copy from the untracked .secrets/worker-license.vars created by pnpm keys:create.
+# Do not generate a new key when applications are already signed with the existing one.
+LICENSE_SIGNING_SEED=
+
+WEBHOOK_TOKEN=
+TURNSTILE_SITE_KEY=
+TURNSTILE_SECRET_KEY=

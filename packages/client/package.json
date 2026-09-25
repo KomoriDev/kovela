@@ -1,0 +1,14 @@
+{
+  "name": "@kovela/client",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "cordis": "3.18.1",
+    "@kovela/protocol": "workspace:*"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}

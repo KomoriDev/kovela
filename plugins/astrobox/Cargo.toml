@@ -1,0 +1,20 @@
+[package]
+name = "kovela-astrobox"
+version = "1.0.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+astrobox-ng-wit = "=0.3.1"
+waki = "0.5.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = "debuginfo"
