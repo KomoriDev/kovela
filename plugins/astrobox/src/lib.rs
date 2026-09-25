@@ -10,7 +10,7 @@ use std::{cell::RefCell, time::Duration};
 use url::Url;
 use uuid::Uuid;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Handoff {
     v: u8,
@@ -96,18 +96,24 @@ fn parse_handoff(input: &str) -> Result<Handoff, String> {
     let owned;
     let source = if input.trim().starts_with("astrobox://") {
         let url = Url::parse(input.trim()).map_err(|_| "激活链接格式错误。")?;
-        if url.host_str() != Some("open")
-            || !url
-                .query_pairs()
-                .any(|(k, v)| k == "pluginName" && v == "Kovela")
-        {
+        if url.host_str() != Some("open") {
             return Err("这不是 Kovela 激活链接。".into());
         }
-        owned = url
-            .query_pairs()
-            .find(|(k, _)| k == "data")
-            .map(|(_, v)| v.into_owned())
-            .ok_or("激活链接缺少凭证。")?;
+        let mut named = false;
+        let mut payload = None;
+        let mut legacy = None;
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "name" | "pluginName" if value == "Kovela" => named = true,
+                "payload" => payload = Some(value.into_owned()),
+                "data" => legacy = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+        if !named {
+            return Err("这不是 Kovela 激活链接。".into());
+        }
+        owned = payload.or(legacy).ok_or("激活链接缺少凭证。")?;
         owned.as_str()
     } else {
         input.trim()
@@ -743,3 +749,57 @@ impl event_v3::Guest for Kovela {
     }
 }
 astrobox_ng_wit::export!(Kovela);
+
+#[cfg(test)]
+mod tests {
+    use super::parse_handoff;
+
+    const BODY: &str = r#"{"v":2,"serverOrigin":"https://kovela.komoridevs.icu","handoffToken":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","productId":"com.komoridev.billiard","productName":"口袋台球"}"#;
+
+    fn link(pairs: &[(&str, &str)]) -> String {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(pairs)
+            .finish();
+        format!("astrobox://open?{query}")
+    }
+
+    #[test]
+    fn accepts_payload_json_from_the_host_event() {
+        let handoff = parse_handoff(BODY).unwrap();
+        assert_eq!(handoff.product_id, "com.komoridev.billiard");
+        assert_eq!(handoff.product_name, "口袋台球");
+    }
+
+    #[test]
+    fn accepts_plugdata_link() {
+        let handoff = parse_handoff(&link(&[
+            ("source", "plugdata"),
+            ("name", "Kovela"),
+            ("payload", BODY),
+        ]))
+        .unwrap();
+        assert_eq!(handoff.server_origin, "https://kovela.komoridevs.icu");
+    }
+
+    #[test]
+    fn still_accepts_legacy_open_plugin_link() {
+        let handoff = parse_handoff(&link(&[
+            ("source", "openPlugin"),
+            ("pluginName", "Kovela"),
+            ("data", BODY),
+        ]))
+        .unwrap();
+        assert_eq!(handoff.handoff_token.len(), 64);
+    }
+
+    #[test]
+    fn rejects_a_different_plugin_name() {
+        let error = parse_handoff(&link(&[
+            ("source", "plugdata"),
+            ("name", "Other"),
+            ("payload", BODY),
+        ]))
+        .unwrap_err();
+        assert!(error.contains("Kovela"));
+    }
+}
