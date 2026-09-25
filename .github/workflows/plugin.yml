@@ -41,5 +41,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Kovela-astrobox
-          path: plugins/astrobox/dist/Kovela.abp
+          path: |
+            plugins/astrobox/dist/Kovela.abp
+            plugins/astrobox/dist/Kovela-v4.abp
           if-no-files-found: error

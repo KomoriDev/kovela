@@ -367,6 +367,7 @@ dependencies = [
  "url",
  "uuid",
  "waki",
+ "wit-bindgen 0.57.1",
 ]
 
 [[package]]

@@ -1,5 +1,22 @@
+#[cfg(feature = "api4")]
+wit_bindgen::generate!({
+    path: "wit",
+    world: "kovela",
+    generate_all,
+});
+
+#[cfg(feature = "api4")]
+use astrobox::psys_host_v4::{device, interconnect, notification, register, timer, ui};
+#[cfg(feature = "api4")]
+use exports::astrobox::psys_plugin_v4::{
+    event::{self, EventType},
+    lifecycle,
+};
+#[cfg(not(feature = "api4"))]
 use astrobox_ng_wit::FutureReader;
+#[cfg(not(feature = "api4"))]
 use astrobox_ng_wit::astrobox::psys_host::{device, interconnect, register, timer, ui_v3 as ui};
+#[cfg(not(feature = "api4"))]
 use astrobox_ng_wit::exports::astrobox::psys_plugin::{
     event_v3::{self, EventType},
     lifecycle,
@@ -60,6 +77,54 @@ struct State {
 }
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
 struct Kovela;
+async fn host_register_deeplink() -> Result<(), String> {
+    #[cfg(feature = "api4")]
+    {
+        register::register_deeplink_action().await
+    }
+    #[cfg(not(feature = "api4"))]
+    {
+        register::register_deeplink_action()
+            .await
+            .map_err(|()| "权限被拒绝".into())
+    }
+}
+async fn host_register_recv(addr: &str, package: &str) -> Result<(), String> {
+    #[cfg(feature = "api4")]
+    {
+        register::register_interconnect_recv(addr.to_string(), package.to_string()).await
+    }
+    #[cfg(not(feature = "api4"))]
+    {
+        register::register_interconnect_recv(addr, package)
+            .await
+            .map_err(|()| "权限被拒绝".into())
+    }
+}
+async fn host_send(addr: &str, package: &str, data: &str) -> Result<(), String> {
+    #[cfg(feature = "api4")]
+    {
+        interconnect::send_qaic_message(addr.to_string(), package.to_string(), data.to_string())
+            .await
+    }
+    #[cfg(not(feature = "api4"))]
+    {
+        interconnect::send_qaic_message(addr, package, data)
+            .await
+            .map_err(|()| "发送失败".into())
+    }
+}
+async fn host_timeout(delay_ms: u64, payload: &str) {
+    #[cfg(feature = "api4")]
+    {
+        let _ = timer::set_timeout(delay_ms, payload);
+    }
+    #[cfg(not(feature = "api4"))]
+    {
+        timer::set_timeout(delay_ms, payload).await;
+    }
+}
+
 
 fn is_hex(value: &str) -> bool {
     value.len() == 64
@@ -375,14 +440,14 @@ async fn send_install(pending: Pending) {
     }
     render();
     let data=json!({"v":1,"id":pending.id,"type":"install-license","licenseId":issued.license_id,"licenseToken":issued.license_token}).to_string();
-    if interconnect::send_qaic_message(&pending.addr, &issued.product_id, &data)
+    if host_send(&pending.addr, &issued.product_id, &data)
         .await
         .is_err()
     {
         fail("许可证传输失败。请打开手环应用、检查连接，然后重试当前激活。");
         return;
     }
-    timer::set_timeout(30_000, &format!("install:{}", pending.id)).await;
+    host_timeout(30_000, &format!("install:{}", pending.id)).await;
 }
 
 async fn start_activation() {
@@ -436,7 +501,7 @@ async fn start_activation() {
         return;
     };
     render();
-    if register::register_interconnect_recv(&addr, &handoff.product_id)
+    if host_register_recv(&addr, &handoff.product_id)
         .await
         .is_err()
     {
@@ -444,7 +509,7 @@ async fn start_activation() {
         return;
     }
     let message = json!({"v":1,"id":id,"type":"hello"}).to_string();
-    if interconnect::send_qaic_message(&addr, &handoff.product_id, &message)
+    if host_send(&addr, &handoff.product_id, &message)
         .await
         .is_err()
     {
@@ -454,7 +519,27 @@ async fn start_activation() {
         ));
         return;
     }
-    timer::set_timeout(20_000, &format!("hello:{id}")).await;
+    host_timeout(20_000, &format!("hello:{id}")).await;
+}
+
+async fn notify_activated(addr: String, product: String) {
+    #[cfg(not(feature = "api4"))]
+    {
+        let _ = (addr, product);
+    }
+    #[cfg(feature = "api4")]
+    {
+        let message = notification::Message {
+            id: 1,
+            app_name: "Kovela".into(),
+            title: format!("{product}已激活"),
+            sub_title: String::new(),
+            body: "许可证已保存在手环上，现在可以离线使用。".into(),
+            timestamp_ms: None,
+            live_activity: None,
+        };
+        let _ = notification::send(addr, message).await;
+    }
 }
 
 async fn report(pending: Pending) {
@@ -473,6 +558,17 @@ async fn report(pending: Pending) {
         return;
     }
     render();
+    if success {
+        let product = STATE.with(|state| {
+            state
+                .borrow()
+                .handoff
+                .as_ref()
+                .map(|handoff| handoff.product_name.clone())
+                .unwrap_or_else(|| "应用".into())
+        });
+        notify_activated(pending.addr.clone(), product).await;
+    }
     let origin = STATE.with(|state| {
         state
             .borrow()
@@ -637,48 +733,116 @@ async fn on_device_message(raw: &str) {
     }
 }
 
-impl lifecycle::Guest for Kovela {
-    fn on_load() {
-        astrobox_ng_wit::spawn(async {
-            if register::register_deeplink_action().await.is_err() {
-                fail("无法注册网页唤起，请允许 Deeplink 权限或手动粘贴激活链接。");
-            }
+async fn startup() {
+    if let Err(reason) = host_register_deeplink().await {
+        fail(format!(
+            "无法注册网页唤起（{reason}）。请允许 Deeplink 权限，或手动粘贴激活链接。"
+        ));
+    }
+    load_devices().await;
+}
+async fn dispatch_event(kind: EventType, payload: String) {
+    match kind {
+        EventType::DeeplinkAction => {
+            accept_link(&payload);
             load_devices().await;
-        });
+        }
+        EventType::InterconnectMessage => on_device_message(&payload).await,
+        EventType::Timer => {
+            if let Ok(value) = serde_json::from_str::<Value>(&payload) {
+                if let Some(payload) = value.get("payload").and_then(Value::as_str) {
+                    let waiting = STATE.with(|state| {
+                        let s = state.borrow();
+                        s.pending.as_ref().is_some_and(|p| {
+                            (p.phase == Phase::Hello && payload == format!("hello:{}", p.id))
+                                || (p.phase == Phase::Installing
+                                    && payload == format!("install:{}", p.id))
+                        })
+                    });
+                    if waiting {
+                        fail("等待设备回执超时。请保持手环应用打开并重试；尚未确认激活成功。");
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
+async fn dispatch_ui(id: String, event: ui::Event, payload: String) {
+    if matches!(event, ui::Event::Input) && id == "handoff-input" && !busy() && payload.len() <= 8192
+    {
+        let parsed = serde_json::from_str::<Value>(&payload).ok();
+        let text = parsed
+            .as_ref()
+            .and_then(|v| v.get("value").and_then(Value::as_str).or_else(|| v.as_str()))
+            .unwrap_or(&payload);
+        STATE.with(|state| state.borrow_mut().input = text.into());
+    }
+    if matches!(event, ui::Event::Click) && !busy() {
+        match id.as_str() {
+            "load-link" => {
+                let input = STATE.with(|state| state.borrow().input.clone());
+                accept_link(&input);
+                load_devices().await;
+            }
+            "refresh" => load_devices().await,
+            "activate" => start_activation().await,
+            _ => {
+                if let Some(index) = id
+                    .strip_prefix("device:")
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    STATE.with(|state| {
+                        let mut s = state.borrow_mut();
+                        if s.pending.is_none() && index < s.devices.len() {
+                            s.selected = Some(index);
+                        }
+                    });
+                    render();
+                }
+            }
+        }
+    }
+}
+fn bind_root(id: String) {
+    STATE.with(|state| state.borrow_mut().root = Some(id));
+    render();
+}
+#[cfg(feature = "api4")]
+impl lifecycle::Guest for Kovela {
+    async fn on_load() {
+        startup().await;
+    }
+}
+#[cfg(feature = "api4")]
+impl event::Guest for Kovela {
+    async fn on_event(kind: EventType, payload: String) -> String {
+        dispatch_event(kind, payload).await;
+        String::new()
+    }
+    async fn on_ui_event(id: String, event: ui::Event, payload: String) -> String {
+        dispatch_ui(id, event, payload).await;
+        String::new()
+    }
+    async fn on_ui_render(id: String) {
+        bind_root(id);
+    }
+    async fn on_card_render(_id: String) {}
+}
+#[cfg(feature = "api4")]
+export!(Kovela);
+#[cfg(not(feature = "api4"))]
+impl lifecycle::Guest for Kovela {
+    fn on_load() {
+        astrobox_ng_wit::spawn(async { startup().await });
+    }
+}
+#[cfg(not(feature = "api4"))]
 impl event_v3::Guest for Kovela {
     fn on_event(kind: EventType, payload: String) -> FutureReader<String> {
         let (writer, reader) = astrobox_ng_wit::wit_future::new::<String>(String::new);
         astrobox_ng_wit::spawn(async move {
-            match kind {
-                EventType::DeeplinkAction => {
-                    accept_link(&payload);
-                    load_devices().await;
-                }
-                EventType::InterconnectMessage => on_device_message(&payload).await,
-                EventType::Timer => {
-                    if let Ok(value) = serde_json::from_str::<Value>(&payload) {
-                        if let Some(payload) = value.get("payload").and_then(Value::as_str) {
-                            let waiting = STATE.with(|state| {
-                                let s = state.borrow();
-                                s.pending.as_ref().is_some_and(|p| {
-                                    (p.phase == Phase::Hello
-                                        && payload == format!("hello:{}", p.id))
-                                        || (p.phase == Phase::Installing
-                                            && payload == format!("install:{}", p.id))
-                                })
-                            });
-                            if waiting {
-                                fail(
-                                    "等待设备回执超时。请保持手环应用打开并重试；尚未确认激活成功。",
-                                );
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+            dispatch_event(kind, payload).await;
             let _ = writer.write(String::new()).await;
         });
         reader
@@ -686,55 +850,14 @@ impl event_v3::Guest for Kovela {
     fn on_ui_event_v3(id: String, event: ui::Event, payload: String) -> FutureReader<String> {
         let (writer, reader) = astrobox_ng_wit::wit_future::new::<String>(String::new);
         astrobox_ng_wit::spawn(async move {
-            if matches!(event, ui::Event::Input)
-                && id == "handoff-input"
-                && !busy()
-                && payload.len() <= 8192
-            {
-                let parsed = serde_json::from_str::<Value>(&payload).ok();
-                let text = parsed
-                    .as_ref()
-                    .and_then(|v| {
-                        v.get("value")
-                            .and_then(Value::as_str)
-                            .or_else(|| v.as_str())
-                    })
-                    .unwrap_or(&payload);
-                STATE.with(|state| state.borrow_mut().input = text.into());
-            }
-            if matches!(event, ui::Event::Click) && !busy() {
-                match id.as_str() {
-                    "load-link" => {
-                        let input = STATE.with(|state| state.borrow().input.clone());
-                        accept_link(&input);
-                        load_devices().await;
-                    }
-                    "refresh" => load_devices().await,
-                    "activate" => start_activation().await,
-                    _ => {
-                        if let Some(index) = id
-                            .strip_prefix("device:")
-                            .and_then(|s| s.parse::<usize>().ok())
-                        {
-                            STATE.with(|state| {
-                                let mut s = state.borrow_mut();
-                                if s.pending.is_none() && index < s.devices.len() {
-                                    s.selected = Some(index);
-                                }
-                            });
-                            render();
-                        }
-                    }
-                }
-            }
+            dispatch_ui(id, event, payload).await;
             let _ = writer.write(String::new()).await;
         });
         reader
     }
     fn on_ui_render(id: String) -> FutureReader<()> {
         let (writer, reader) = astrobox_ng_wit::wit_future::new::<()>(|| ());
-        STATE.with(|state| state.borrow_mut().root = Some(id));
-        render();
+        bind_root(id);
         astrobox_ng_wit::spawn(async move {
             let _ = writer.write(()).await;
         });
@@ -748,6 +871,7 @@ impl event_v3::Guest for Kovela {
         reader
     }
 }
+#[cfg(not(feature = "api4"))]
 astrobox_ng_wit::export!(Kovela);
 
 #[cfg(test)]

@@ -68,11 +68,9 @@ let copyTimer: ReturnType<typeof setTimeout> | undefined;
 let disposed = false;
 const deeplink = computed(() =>
   verified.value && config.value
-    ? // AstroBox 2.1 only opens a plugin for source=plugdata&name=&payload=.
-      // source=openPlugin launches the app and then drops the route.
-      "astrobox://open?source=plugdata&name=" +
+    ? "astrobox://open?source=openPlugin&pluginName=" +
       encodeURIComponent(config.value.pluginName) +
-      "&payload=" +
+      "&data=" +
       encodeURIComponent(
         JSON.stringify({
           v: 2,
