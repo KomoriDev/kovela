@@ -58,6 +58,17 @@ pnpm --filter @kovela/worker deploy
 
 更换签发私钥会使已安装应用无法验证旧许可证，必须同时更新 `packages/vela/src/public-key.js` 并重新发布手环应用。
 
+## AstroBox 插件
+
+本地打包需要 Rust stable 和 `wasm32-wasip2` 目标：
+
+```bash
+rustup target add wasm32-wasip2
+pnpm build:plugin
+```
+
+产物是 `plugins/astrobox/dist/Kovela.abp`。推送插件源码，或手动运行 [`.github/workflows/plugin.yml`](.github/workflows/plugin.yml)，Actions 会执行同一条命令并上传这个包。
+
 ## 订单与私信
 
 已完成的付费订单和零元兑换订单都可以验证，但必须匹配对应应用的爱发电方案或 SKU。验证成功后向买家发送激活引导；手环保存许可证并回执后，再发送激活结果。同一订单的每个应用只绑定第一台设备。

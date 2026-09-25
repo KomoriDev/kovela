@@ -1,0 +1,45 @@
+name: Package AstroBox plugin
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - plugins/astrobox/**
+      - assets/kovela.png
+      - scripts/prepare-brand.mjs
+      - .github/workflows/plugin.yml
+
+concurrency:
+  group: astrobox-plugin-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins/astrobox
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:plugin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kovela-astrobox
+          path: plugins/astrobox/dist/Kovela.abp
+          if-no-files-found: error
