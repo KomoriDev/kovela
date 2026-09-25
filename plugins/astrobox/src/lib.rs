@@ -24,13 +24,11 @@ use astrobox_ng_wit::exports::astrobox::psys_plugin::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{cell::RefCell, time::Duration};
-use url::Url;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Handoff {
-    v: u8,
     server_origin: String,
     handoff_token: String,
     product_id: String,
@@ -65,30 +63,28 @@ struct Pending {
     reported: bool,
     phase: Phase,
 }
+#[derive(Clone)]
+struct Offer {
+    product_id: String,
+    product_name: String,
+    handoff_token: String,
+    bound_device_id: Option<String>,
+}
 #[derive(Default)]
 struct State {
     root: Option<String>,
-    input: String,
+    order_no: String,
+    offers: Vec<Offer>,
+    verifying: bool,
     handoff: Option<Handoff>,
     devices: Vec<(String, String)>,
     selected: Option<usize>,
     pending: Option<Pending>,
     message: String,
+    device_note: String,
 }
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
 struct Kovela;
-async fn host_register_deeplink() -> Result<(), String> {
-    #[cfg(feature = "api4")]
-    {
-        register::register_deeplink_action().await
-    }
-    #[cfg(not(feature = "api4"))]
-    {
-        register::register_deeplink_action()
-            .await
-            .map_err(|()| "权限被拒绝".into())
-    }
-}
 async fn host_register_recv(addr: &str, package: &str) -> Result<(), String> {
     #[cfg(feature = "api4")]
     {
@@ -142,6 +138,83 @@ fn usable_label(value: &str) -> Option<String> {
         None
     }
 }
+fn server_origin() -> &'static str {
+    match option_env!("KOVELA_ORIGIN") {
+        Some(origin) if !origin.is_empty() => origin,
+        _ => "https://kovela.komoridevs.icu",
+    }
+}
+fn valid_product_id(value: &str) -> bool {
+    value.len() <= 128
+        && value.contains('.')
+        && value.split('.').all(|part| {
+            part.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                && part
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+        })
+}
+fn normalize_order(input: &str) -> Result<String, String> {
+    let order: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    if (16..=32).contains(&order.len()) && order.bytes().all(|c| c.is_ascii_digit()) {
+        Ok(order)
+    } else {
+        Err("请输入 16～32 位数字的爱发电订单号。".into())
+    }
+}
+fn event_text(payload: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return payload.to_string();
+    };
+    let field = value
+        .get("value")
+        .or_else(|| value.get("text"))
+        .or_else(|| value.get("data"));
+    if let Some(text) = field.and_then(Value::as_str) {
+        return text.to_string();
+    }
+    if let Some(number) = field.and_then(Value::as_u64) {
+        return number.to_string();
+    }
+    if let Some(number) = field.and_then(Value::as_f64) {
+        if number.is_finite() && number >= 0.0 {
+            return format!("{number:.0}");
+        }
+    }
+    value.as_str().unwrap_or(payload).to_string()
+}
+fn remember_order(payload: &str) {
+    if payload.is_empty() || payload.len() > 4096 {
+        return;
+    }
+    let text = event_text(payload);
+    let digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
+    let stored = if (16..=32).contains(&digits.len()) {
+        digits
+    } else {
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed.chars().count() > 64 {
+            return;
+        }
+        trimmed.to_string()
+    };
+    STATE.with(|state| state.borrow_mut().order_no = stored);
+}
+fn timer_body(payload: &str) -> String {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("payload")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| payload.to_string())
+}
+fn locked() -> bool {
+    busy() || STATE.with(|state| state.borrow().verifying)
+}
+
 
 fn connected_name(addr: &str) -> Option<String> {
     STATE.with(|state| {
@@ -154,59 +227,37 @@ fn connected_name(addr: &str) -> Option<String> {
     })
 }
 
-fn parse_handoff(input: &str) -> Result<Handoff, String> {
-    if input.len() > 4096 {
-        return Err("激活链接过长。".into());
-    }
-    let owned;
-    let source = if input.trim().starts_with("astrobox://") {
-        let url = Url::parse(input.trim()).map_err(|_| "激活链接格式错误。")?;
-        if url.host_str() != Some("open") {
-            return Err("这不是 Kovela 激活链接。".into());
-        }
-        let mut named = false;
-        let mut payload = None;
-        let mut legacy = None;
-        for (key, value) in url.query_pairs() {
-            match key.as_ref() {
-                "name" | "pluginName" if value == "Kovela" => named = true,
-                "payload" => payload = Some(value.into_owned()),
-                "data" => legacy = Some(value.into_owned()),
-                _ => {}
-            }
-        }
-        if !named {
-            return Err("这不是 Kovela 激活链接。".into());
-        }
-        owned = payload.or(legacy).ok_or("激活链接缺少凭证。")?;
-        owned.as_str()
-    } else {
-        input.trim()
+fn parse_offers(value: &Value) -> Result<Vec<Offer>, String> {
+    let Some(items) = value.get("items").and_then(Value::as_array) else {
+        return Err("订单响应格式错误。".into());
     };
-    let handoff: Handoff =
-        serde_json::from_str(source).map_err(|_| "请粘贴网页提供的完整激活链接。")?;
-    let origin = Url::parse(&handoff.server_origin).map_err(|_| "服务地址无效。")?;
-    let local = cfg!(debug_assertions)
-        && origin.scheme() == "http"
-        && matches!(origin.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    if handoff.v != 2
-        || handoff.product_id.len() > 128
-        || !handoff.product_id.contains('.')
-        || !handoff.product_id.split('.').all(|part| {
-            part.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-                && part
-                    .bytes()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
-        })
-        || handoff.product_name.trim().is_empty()
-        || handoff.product_name.chars().count() > 80
-        || !is_hex(&handoff.handoff_token)
-        || (!local && origin.scheme() != "https")
-        || origin.origin().ascii_serialization() != handoff.server_origin
-    {
-        return Err("仅接受可信 HTTPS 服务的有效激活链接，请在网页重新验证订单。".into());
+    if items.is_empty() || items.len() > 8 {
+        return Err("订单响应格式错误。".into());
     }
-    Ok(handoff)
+    let mut offers: Vec<Offer> = Vec::new();
+    for item in items {
+        let product_id = item.get("productId").and_then(Value::as_str).unwrap_or("");
+        let product_name = item.get("productName").and_then(Value::as_str).unwrap_or("");
+        let token = item.get("handoffToken").and_then(Value::as_str).unwrap_or("");
+        let name = usable_label(product_name);
+        if !valid_product_id(product_id) || name.is_none() || !is_hex(token) {
+            return Err("订单响应与授权服务不匹配。".into());
+        }
+        if offers.iter().any(|offer| offer.product_id == product_id) {
+            return Err("订单响应与授权服务不匹配。".into());
+        }
+        offers.push(Offer {
+            product_id: product_id.to_string(),
+            product_name: name.unwrap(),
+            handoff_token: token.to_string(),
+            bound_device_id: item
+                .get("boundDeviceId")
+                .and_then(Value::as_str)
+                .filter(|id| is_hex(id))
+                .map(str::to_string),
+        });
+    }
+    Ok(offers)
 }
 
 fn busy() -> bool {
@@ -241,158 +292,218 @@ fn set_phase(id: &str, phase: Phase, message: &str) -> bool {
         false
     })
 }
-
+fn gate(element: ui::Element, locked: bool) -> ui::Element {
+    if locked { element.disabled() } else { element }
+}
 fn render() {
-    let (root, message, server, product, devices, selected, active, has_pending, complete) = STATE
-        .with(|state| {
+    let (root, message, offers, verifying, handoff, devices, selected, phase, device_note) =
+        STATE.with(|state| {
             let s = state.borrow();
             (
                 s.root.clone(),
                 s.message.clone(),
-                s.handoff.as_ref().map(|h| h.server_origin.clone()),
-                s.handoff
-                    .as_ref()
-                    .map(|h| format!("{} · 设备授权", h.product_name)),
+                s.offers.clone(),
+                s.verifying,
+                s.handoff.clone(),
                 s.devices.clone(),
                 s.selected,
-                s.pending
-                    .as_ref()
-                    .is_some_and(|p| !matches!(p.phase, Phase::Retry | Phase::Complete)),
-                s.pending.is_some(),
-                s.pending
-                    .as_ref()
-                    .is_some_and(|p| p.phase == Phase::Complete),
+                s.pending.as_ref().map(|pending| pending.phase),
+                s.device_note.clone(),
             )
         });
-    let Some(root) = root else {
-        return;
+    let Some(root) = root else { return };
+    let active = phase.is_some_and(|phase| !matches!(phase, Phase::Retry | Phase::Complete));
+    let complete = phase == Some(Phase::Complete);
+    let has_pending = phase.is_some();
+    let ui_locked = verifying || active;
+    let progress = match phase {
+        Some(Phase::Hello) => Some(35),
+        Some(Phase::Issuing) => Some(55),
+        Some(Phase::Installing) | Some(Phase::Retry) => Some(75),
+        Some(Phase::Reporting) => Some(90),
+        Some(Phase::Complete) => Some(100),
+        None => None,
+    };
+    let heading = if complete {
+        "激活完成".to_string()
+    } else if let Some(item) = &handoff {
+        item.product_name.clone()
+    } else if verifying {
+        "正在查询".to_string()
+    } else {
+        "输入订单号".to_string()
     };
     let mut page = ui::Element::new(ui::ElementType::Div, None)
         .flex()
         .flex_direction(ui::FlexDirection::Column)
-        .gap(14)
-        .padding(20)
+        .gap(12)
+        .padding(4)
         .width_full();
-    page = page.child(
-        ui::Element::new(ui::ElementType::P, Some("Kovela"))
-            .size(28)
-            .text_color("#8b5cf6"),
-    );
-    page = page.child(
-        ui::Element::new(
-            ui::ElementType::P,
-            Some(product.as_deref().unwrap_or("MI-VELA 应用授权")),
-        )
-        .size(18),
-    );
-    page = page.child(ui::Element::new(
-        ui::ElementType::P,
-        Some("先在网页验证订单，再点击一键激活，或在下面粘贴完整链接。请保持手环应用打开。"),
-    ));
-    if let Some(server) = server {
+    page = page.child(ui::Element::new(ui::ElementType::P, Some(&heading)).size(22));
+    if !message.is_empty() {
+        page = page.child(ui::Element::new(ui::ElementType::P, Some(&message)).size(16));
+    } else if handoff.is_none() && offers.is_empty() {
         page = page.child(
+            ui::Element::new(ui::ElementType::P, Some("填写爱发电订单号，点查询。")).size(14),
+        );
+    }
+    if let Some(value) = progress {
+        let label = value.to_string();
+        page = page.child(
+            ui::Element::new(ui::ElementType::Progress, None)
+                .width_full()
+                .prop("max", "100")
+                .prop("value", &label),
+        );
+    }
+    page = page
+        .child(gate(
+            ui::Element::new(ui::ElementType::Textarea, None)
+                .height(48)
+                .width_full()
+                .prop("placeholder", "爱发电订单号")
+                .on(ui::Event::Input, "order-input"),
+            ui_locked,
+        ))
+        .child(gate(
             ui::Element::new(
-                ui::ElementType::P,
-                Some(&format!(
-                    "授权服务：{server}\n请核对域名。点击激活将向此服务提交设备标识。"
-                )),
+                ui::ElementType::Button,
+                Some(if verifying { "查询中…" } else { "查询订单" }),
             )
-            .text_color("#8b5cf6"),
-        );
-    }
-    let mut input = ui::Element::new(ui::ElementType::Textarea, None)
-        .height(80)
-        .width_full()
-        .on(ui::Event::Input, "handoff-input");
-    if active {
-        input = input.disabled();
-    }
-    page = page.child(input);
-    let mut load = ui::Element::new(ui::ElementType::Button, Some("读取激活链接"))
-        .on(ui::Event::Click, "load-link");
-    let mut refresh = ui::Element::new(ui::ElementType::Button, Some("刷新已连接设备"))
-        .on(ui::Event::Click, "refresh");
-    if active {
-        load = load.disabled();
-        refresh = refresh.disabled();
-    }
-    page = page.child(load).child(refresh);
-    if devices.is_empty() {
-        page = page.child(ui::Element::new(
-            ui::ElementType::P,
-            Some("尚未找到已连接设备。请先在 AstroBox 连接手环，并允许设备权限。"),
+            .bg("#7c3aed")
+            .text_color("#ffffff")
+            .width_full()
+            .on(ui::Event::Click, "verify"),
+            ui_locked,
         ));
-    }
-    for (index, (addr, name)) in devices.iter().enumerate() {
-        let title = format!(
-            "{} {} · {}",
-            if selected == Some(index) {
-                "已选择"
-            } else {
-                "选择"
-            },
-            name,
-            addr
-        );
-        let mut button = ui::Element::new(ui::ElementType::Button, Some(&title))
-            .on(ui::Event::Click, &format!("device:{index}"));
-        if selected == Some(index) {
+    for (index, offer) in offers.iter().enumerate() {
+        let chosen = handoff
+            .as_ref()
+            .is_some_and(|item| item.product_id == offer.product_id);
+        let label = match offer.bound_device_id.as_deref() {
+            Some(id) => format!(
+                "{} {} · {}…",
+                if chosen { "已确认" } else { "确认" },
+                offer.product_name,
+                &id[..12]
+            ),
+            None => format!(
+                "{} {}",
+                if chosen { "已确认" } else { "确认" },
+                offer.product_name
+            ),
+        };
+        let mut button = ui::Element::new(ui::ElementType::Button, Some(&label))
+            .width_full()
+            .on(ui::Event::Click, &format!("offer:{index}"));
+        if chosen {
             button = button.bg("#7c3aed").text_color("#ffffff");
         }
-        if has_pending {
-            button = button.disabled();
+        page = page.child(gate(button, ui_locked));
+    }
+    if handoff.is_some() {
+        page = page
+            .child(ui::Element::new(ui::ElementType::Separator, None).width_full())
+            .child(ui::Element::new(ui::ElementType::P, Some("选择手环")).size(16));
+        if devices.is_empty() {
+            let note = if device_note.is_empty() {
+                "还没有已连接的手环。请先在 AstroBox 里连接设备。"
+            } else {
+                device_note.as_str()
+            };
+            page = page.child(ui::Element::new(ui::ElementType::P, Some(note)).size(14));
         }
-        page = page.child(button);
+        for (index, (addr, name)) in devices.iter().enumerate() {
+            let label = if name.trim().is_empty() {
+                addr.clone()
+            } else if selected == Some(index) {
+                format!("已选择 {name}")
+            } else {
+                name.clone()
+            };
+            let mut button = ui::Element::new(ui::ElementType::Button, Some(&label))
+                .width_full()
+                .on(ui::Event::Click, &format!("device:{index}"));
+            if selected == Some(index) {
+                button = button.bg("#7c3aed").text_color("#ffffff");
+            }
+            if has_pending {
+                button = button.disabled();
+            }
+            page = page.child(button);
+        }
+        let action = if complete {
+            "已激活"
+        } else if has_pending {
+            "重试"
+        } else {
+            "激活"
+        };
+        page = page
+            .child(gate(
+                ui::Element::new(ui::ElementType::Button, Some("刷新设备"))
+                    .width_full()
+                    .on(ui::Event::Click, "refresh"),
+                ui_locked,
+            ))
+            .child(gate(
+                ui::Element::new(ui::ElementType::Button, Some(action))
+                    .bg("#7c3aed")
+                    .text_color("#ffffff")
+                    .width_full()
+                    .on(ui::Event::Click, "activate"),
+                ui_locked || complete || selected.is_none(),
+            ));
     }
-    let title = if complete {
-        "设备已激活"
-    } else if has_pending {
-        "重试当前激活"
-    } else {
-        "信任此服务，激活所选设备"
-    };
-    let mut activate = ui::Element::new(ui::ElementType::Button, Some(title))
-        .bg("#7c3aed")
-        .text_color("#ffffff")
-        .on(ui::Event::Click, "activate");
-    if active || complete || selected.is_none() {
-        activate = activate.disabled();
-    }
-    page = page.child(activate);
-    if !message.is_empty() {
-        page = page.child(ui::Element::new(ui::ElementType::P, Some(&message)));
-    }
-    page=page.child(ui::Element::new(ui::ElementType::P,Some("许可证由服务器签发，手环独立验签。插件不持有签发私钥，消息发送完成不代表设备已激活。"))).size(12);
     ui::render(&root, page);
 }
 
 async fn load_devices() {
-    let devices = device::get_connected_device_list().await;
+    let connected = device::get_connected_device_list()
+        .await
+        .into_iter()
+        .map(|device| (device.addr, device.name))
+        .collect::<Vec<_>>();
+    let note = if connected.is_empty() {
+        let known = device::get_device_list()
+            .await
+            .into_iter()
+            .map(|device| {
+                let name = device.name.trim();
+                if name.is_empty() {
+                    device.addr
+                } else {
+                    format!("{name} · {}", device.addr)
+                }
+            })
+            .take(3)
+            .collect::<Vec<_>>();
+        if known.is_empty() {
+            "已刷新。没有已连接设备，也没有历史记录。请在 AstroBox 设备列表里连接手环，并在手环上确认。".into()
+        } else {
+            format!(
+                "已刷新。没有已连接设备。历史记录：{}。请在 AstroBox 设备页点连接，而不是只打开手环激活页。",
+                known.join("；")
+            )
+        }
+    } else {
+        format!(
+            "已刷新，找到 {} 台已连接设备。选择一台后再激活。",
+            connected.len()
+        )
+    };
     STATE.with(|state| {
         let mut s = state.borrow_mut();
-        if s.pending.is_none() {
+        let replace = s
+            .pending
+            .as_ref()
+            .is_none_or(|pending| matches!(pending.phase, Phase::Retry | Phase::Complete));
+        if replace {
             s.selected = None;
-            s.devices = devices.into_iter().map(|d| (d.addr, d.name)).collect();
+            s.devices = connected;
+            s.device_note = note;
         }
     });
-    render();
-}
-fn accept_link(input: &str) {
-    if busy() {
-        return;
-    }
-    match parse_handoff(input) {
-        Ok(handoff) => STATE.with(|state| {
-            let mut s = state.borrow_mut();
-            s.handoff = Some(handoff);
-            s.pending = None;
-            s.message = "请核对授权服务域名，并选择需要激活的设备。".into();
-        }),
-        Err(error) => {
-            fail(error);
-            return;
-        }
-    }
     render();
 }
 
@@ -425,6 +536,102 @@ fn post<T: serde::de::DeserializeOwned>(
             .into());
     }
     serde_json::from_slice(&bytes).map_err(|_| "授权服务响应格式错误。".into())
+}
+fn show(message: impl Into<String>) {
+    STATE.with(|state| state.borrow_mut().message = message.into());
+    render();
+}
+fn confirm_offer(index: usize) {
+    if locked() {
+        return;
+    }
+    let offer = STATE.with(|state| state.borrow().offers.get(index).cloned());
+    let Some(offer) = offer else {
+        return;
+    };
+    let note = match offer.bound_device_id.as_deref() {
+        Some(id) => format!(
+            "已确认 {}。此应用已绑定设备 {}…，只能为同一设备重新传输。",
+            offer.product_name,
+            &id[..12]
+        ),
+        None => format!("已确认 {}。请选择手环并激活。", offer.product_name),
+    };
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.pending = None;
+        s.handoff = Some(Handoff {
+            server_origin: server_origin().into(),
+            handoff_token: offer.handoff_token,
+            product_id: offer.product_id,
+            product_name: offer.product_name,
+        });
+        s.message = note;
+    });
+    render();
+}
+fn queue_lookup() {
+    let order = STATE.with(|state| state.borrow().order_no.clone());
+    match normalize_order(&order) {
+        Ok(order) => STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            s.order_no = order;
+            s.verifying = true;
+            s.message = "正在查询订单…".into();
+        }),
+        Err(error) => STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            s.verifying = false;
+            s.message = error;
+        }),
+    }
+}
+fn finish_lookup() {
+    let order = STATE.with(|state| {
+        let state = state.borrow();
+        if state.verifying {
+            Some(state.order_no.clone())
+        } else {
+            None
+        }
+    });
+    let Some(order) = order else {
+        render();
+        return;
+    };
+    match post::<Value>(
+        server_origin(),
+        "/api/orders/lookup",
+        json!({"orderNo": order}),
+    ) {
+        Ok(value) => match parse_offers(&value) {
+            Ok(offers) => {
+                let count = offers.len();
+                STATE.with(|state| {
+                    let mut s = state.borrow_mut();
+                    s.verifying = false;
+                    s.pending = None;
+                    s.handoff = None;
+                    s.offers = offers;
+                    s.message = format!("查到 {count} 个应用。请点确认。");
+                });
+                render();
+            }
+            Err(error) => {
+                STATE.with(|state| state.borrow_mut().verifying = false);
+                show(error);
+            }
+        },
+        Err(error) => {
+            let error = if error.contains("接口不存在") {
+                "授权服务还没有订单查询接口。插件已更新，需要先部署新的 Worker。".into()
+            } else {
+                error
+            };
+            STATE.with(|state| state.borrow_mut().verifying = false);
+            show(error);
+        }
+    }
 }
 
 async fn send_install(pending: Pending) {
@@ -497,7 +704,7 @@ async fn start_activation() {
         Some((handoff, addr, id))
     });
     let Some((handoff, addr, id)) = selection else {
-        fail("请先读取有效激活链接，并选择设备。");
+        fail("请先查询并确认订单，并选择设备。");
         return;
     };
     render();
@@ -734,75 +941,102 @@ async fn on_device_message(raw: &str) {
 }
 
 async fn startup() {
-    if let Err(reason) = host_register_deeplink().await {
-        fail(format!(
-            "无法注册网页唤起（{reason}）。请允许 Deeplink 权限，或手动粘贴激活链接。"
-        ));
-    }
     load_devices().await;
 }
 async fn dispatch_event(kind: EventType, payload: String) {
     match kind {
-        EventType::DeeplinkAction => {
-            accept_link(&payload);
-            load_devices().await;
-        }
         EventType::InterconnectMessage => on_device_message(&payload).await,
         EventType::Timer => {
-            if let Ok(value) = serde_json::from_str::<Value>(&payload) {
-                if let Some(payload) = value.get("payload").and_then(Value::as_str) {
-                    let waiting = STATE.with(|state| {
-                        let s = state.borrow();
-                        s.pending.as_ref().is_some_and(|p| {
-                            (p.phase == Phase::Hello && payload == format!("hello:{}", p.id))
-                                || (p.phase == Phase::Installing
-                                    && payload == format!("install:{}", p.id))
-                        })
-                    });
-                    if waiting {
-                        fail("等待设备回执超时。请保持手环应用打开并重试；尚未确认激活成功。");
-                    }
-                }
+            let body = timer_body(&payload);
+            let waiting = STATE.with(|state| {
+                let s = state.borrow();
+                s.pending.as_ref().is_some_and(|p| {
+                    (p.phase == Phase::Hello && body == format!("hello:{}", p.id))
+                        || (p.phase == Phase::Installing && body == format!("install:{}", p.id))
+                })
+            });
+            if waiting {
+                fail("等待设备回执超时。请保持手环应用打开并重试；尚未确认激活成功。");
             }
         }
         _ => {}
     }
 }
-async fn dispatch_ui(id: String, event: ui::Event, payload: String) {
-    if matches!(event, ui::Event::Input) && id == "handoff-input" && !busy() && payload.len() <= 8192
-    {
-        let parsed = serde_json::from_str::<Value>(&payload).ok();
-        let text = parsed
-            .as_ref()
-            .and_then(|v| v.get("value").and_then(Value::as_str).or_else(|| v.as_str()))
-            .unwrap_or(&payload);
-        STATE.with(|state| state.borrow_mut().input = text.into());
+enum UiFollow {
+    None,
+    Refresh,
+    Activate,
+}
+fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
+    if matches!(
+        event,
+        ui::Event::Input | ui::Event::Change | ui::Event::Blur
+    ) {
+        remember_order(payload);
+        return UiFollow::None;
     }
-    if matches!(event, ui::Event::Click) && !busy() {
-        match id.as_str() {
-            "load-link" => {
-                let input = STATE.with(|state| state.borrow().input.clone());
-                accept_link(&input);
-                load_devices().await;
-            }
-            "refresh" => load_devices().await,
-            "activate" => start_activation().await,
-            _ => {
-                if let Some(index) = id
-                    .strip_prefix("device:")
-                    .and_then(|s| s.parse::<usize>().ok())
-                {
-                    STATE.with(|state| {
-                        let mut s = state.borrow_mut();
-                        if s.pending.is_none() && index < s.devices.len() {
-                            s.selected = Some(index);
-                        }
-                    });
-                    render();
-                }
-            }
+    if !matches!(event, ui::Event::Click) || locked() {
+        return UiFollow::None;
+    }
+    remember_order(payload);
+    let first_step = STATE.with(|state| {
+        let state = state.borrow();
+        state.offers.is_empty() && state.handoff.is_none()
+    });
+    let known = id == "verify"
+        || id == "refresh"
+        || id == "activate"
+        || id.starts_with("offer:")
+        || id.starts_with("device:");
+    if id == "verify" || id == "查询订单" || (first_step && !known) {
+        queue_lookup();
+        if STATE.with(|state| state.borrow().verifying) {
+            finish_lookup();
+        } else {
+            render();
         }
+        return UiFollow::None;
     }
+    if id == "refresh" {
+        return UiFollow::Refresh;
+    }
+    if id == "activate" {
+        return UiFollow::Activate;
+    }
+    if let Some(index) = id
+        .strip_prefix("offer:")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        confirm_offer(index);
+        return UiFollow::None;
+    }
+    if let Some(index) = id
+        .strip_prefix("device:")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            if s.pending.is_none() && index < s.devices.len() {
+                s.selected = Some(index);
+            }
+        });
+        render();
+        return UiFollow::None;
+    }
+    if first_step {
+        queue_lookup();
+        if STATE.with(|state| state.borrow().verifying) {
+            finish_lookup();
+        } else {
+            render();
+        }
+        return UiFollow::None;
+    }
+    STATE.with(|state| {
+        state.borrow_mut().message = format!("收到点击，但没有对应操作：{id}");
+    });
+    render();
+    UiFollow::None
 }
 fn bind_root(id: String) {
     STATE.with(|state| state.borrow_mut().root = Some(id));
@@ -821,7 +1055,11 @@ impl event::Guest for Kovela {
         String::new()
     }
     async fn on_ui_event(id: String, event: ui::Event, payload: String) -> String {
-        dispatch_ui(id, event, payload).await;
+        match dispatch_ui(&id, event, &payload) {
+            UiFollow::Refresh => load_devices().await,
+            UiFollow::Activate => start_activation().await,
+            UiFollow::None => {}
+        }
         String::new()
     }
     async fn on_ui_render(id: String) {
@@ -848,9 +1086,14 @@ impl event_v3::Guest for Kovela {
         reader
     }
     fn on_ui_event_v3(id: String, event: ui::Event, payload: String) -> FutureReader<String> {
+        let follow = dispatch_ui(&id, event, &payload);
         let (writer, reader) = astrobox_ng_wit::wit_future::new::<String>(String::new);
         astrobox_ng_wit::spawn(async move {
-            dispatch_ui(id, event, payload).await;
+            match follow {
+                UiFollow::Refresh => load_devices().await,
+                UiFollow::Activate => start_activation().await,
+                UiFollow::None => {}
+            }
             let _ = writer.write(String::new()).await;
         });
         reader
@@ -876,54 +1119,36 @@ astrobox_ng_wit::export!(Kovela);
 
 #[cfg(test)]
 mod tests {
-    use super::parse_handoff;
+    use super::{normalize_order, parse_offers, remember_order};
+    use serde_json::json;
 
-    const BODY: &str = r#"{"v":2,"serverOrigin":"https://kovela.komoridevs.icu","handoffToken":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","productId":"com.komoridev.billiard","productName":"口袋台球"}"#;
-
-    fn link(pairs: &[(&str, &str)]) -> String {
-        let query = url::form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(pairs)
-            .finish();
-        format!("astrobox://open?{query}")
+    #[test]
+    fn reads_products_returned_for_an_order() {
+        let offers = parse_offers(&json!({"items":[{"productId":"com.komoridev.billiard","productName":"口袋台球","handoffToken":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","boundDeviceId":null}]})).unwrap();
+        assert_eq!(offers[0].product_name, "口袋台球");
+        assert!(offers[0].bound_device_id.is_none());
     }
 
     #[test]
-    fn accepts_payload_json_from_the_host_event() {
-        let handoff = parse_handoff(BODY).unwrap();
-        assert_eq!(handoff.product_id, "com.komoridev.billiard");
-        assert_eq!(handoff.product_name, "口袋台球");
+    fn rejects_a_lookup_without_products() {
+        assert!(parse_offers(&json!({"items":[]})).is_err());
+    }
+    #[test]
+    fn keeps_an_order_number_embedded_in_an_input_event() {
+        remember_order(r#"{"value":"订单 202609131234567890123456789"}"#);
+        let stored = super::STATE.with(|state| state.borrow().order_no.clone());
+        assert_eq!(stored, "202609131234567890123456789");
     }
 
-    #[test]
-    fn accepts_plugdata_link() {
-        let handoff = parse_handoff(&link(&[
-            ("source", "plugdata"),
-            ("name", "Kovela"),
-            ("payload", BODY),
-        ]))
-        .unwrap();
-        assert_eq!(handoff.server_origin, "https://kovela.komoridevs.icu");
-    }
+
 
     #[test]
-    fn still_accepts_legacy_open_plugin_link() {
-        let handoff = parse_handoff(&link(&[
-            ("source", "openPlugin"),
-            ("pluginName", "Kovela"),
-            ("data", BODY),
-        ]))
-        .unwrap();
-        assert_eq!(handoff.handoff_token.len(), 64);
+    fn normalizes_an_order_number() {
+        assert_eq!(
+            normalize_order(" 202609131234567890123456789 ").unwrap(),
+            "202609131234567890123456789"
+        );
+        assert!(normalize_order("123").is_err());
     }
 
-    #[test]
-    fn rejects_a_different_plugin_name() {
-        let error = parse_handoff(&link(&[
-            ("source", "plugdata"),
-            ("name", "Other"),
-            ("payload", BODY),
-        ]))
-        .unwrap_err();
-        assert!(error.contains("Kovela"));
-    }
 }

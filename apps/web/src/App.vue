@@ -3,10 +3,8 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import {
   ArrowRight,
   ArrowUpRight,
-  Check,
   CheckCheck,
   CircleHelp,
-  Copy,
   ExternalLink,
   Fingerprint,
   KeyRound,
@@ -19,12 +17,7 @@ import {
   Sun,
   Watch,
 } from "@lucide/vue";
-import type {
-  ActivationStatus,
-  Handoff,
-  PublicConfig,
-  VerifiedOrder,
-} from "@kovela/protocol";
+import type { ActivationStatus, PublicConfig, VerifiedOrder } from "@kovela/protocol";
 import { useContext } from "./context";
 import Button from "./components/ui/Button.vue";
 import Input from "./components/ui/Input.vue";
@@ -60,28 +53,10 @@ const statusError = ref("");
 const configError = ref("");
 const turnstileToken = ref("");
 const resetKey = ref(0);
-const copied = ref(false);
 const dark = ref(false);
 let request = new AbortController();
 let poll: ReturnType<typeof setTimeout> | undefined;
-let copyTimer: ReturnType<typeof setTimeout> | undefined;
 let disposed = false;
-const deeplink = computed(() =>
-  verified.value && config.value
-    ? "astrobox://open?source=openPlugin&pluginName=" +
-      encodeURIComponent(config.value.pluginName) +
-      "&data=" +
-      encodeURIComponent(
-        JSON.stringify({
-          v: 2,
-          serverOrigin: config.value.publicOrigin,
-          handoffToken: verified.value.handoffToken,
-          productId: verified.value.productId,
-          productName: verified.value.productName,
-        } satisfies Handoff),
-      )
-    : "",
-);
 const finished = computed(() => status.value?.state === "activated");
 const statusTitle = computed(
   () =>
@@ -91,14 +66,6 @@ const statusTitle = computed(
       activated: "设备已确认激活",
       failed: "设备未能完成激活",
     })[status.value?.state ?? "ready"],
-);
-const expiry = computed(() =>
-  verified.value
-    ? new Date(verified.value.expiresAt * 1000).toLocaleTimeString("zh-CN", {
-        hour: "2-digit",
-        minute: "2-digit",
-      })
-    : "",
 );
 
 async function loadConfig() {
@@ -134,11 +101,9 @@ function resetSession() {
   request.abort();
   request = new AbortController();
   clearTimeout(poll);
-  clearTimeout(copyTimer);
   verified.value = undefined;
   status.value = undefined;
   statusError.value = "";
-  copied.value = false;
   error.value = "";
 }
 async function verify() {
@@ -204,19 +169,6 @@ async function refreshStatus() {
   )
     poll = setTimeout(refreshStatus, 4000);
 }
-async function copyLink() {
-  try {
-    await navigator.clipboard.writeText(deeplink.value);
-    copied.value = true;
-    clearTimeout(copyTimer);
-    copyTimer = setTimeout(() => {
-      copied.value = false;
-    }, 2000);
-  } catch {
-    statusError.value =
-      "浏览器无法复制。请使用「打开 AstroBox」按钮，或长按按钮复制链接。";
-  }
-}
 onMounted(() => {
   try {
     dark.value = localStorage.getItem("kovela.theme") === "dark";
@@ -230,7 +182,6 @@ onBeforeUnmount(() => {
   disposed = true;
   request.abort();
   clearTimeout(poll);
-  clearTimeout(copyTimer);
 });
 </script>
 
@@ -501,26 +452,11 @@ onBeforeUnmount(() => {
                 verified.boundDeviceId.slice(0, 12)
               }}…，只能为同一设备重新传输许可证。
             </p>
-            <template v-if="!finished"
-              ><Button as="a" :href="deeplink" class="w-full"
-                ><Smartphone />打开 AstroBox 激活<ArrowUpRight class="ml-auto"
-              /></Button>
-              <div
-                class="flex flex-wrap items-center justify-between gap-2 text-xs"
-              >
-                <span class="text-muted-foreground"
-                  >激活链接有效至 {{ expiry }}</span
-                ><Button
-                  variant="ghost"
-                  size="sm"
-                  type="button"
-                  @click="copyLink"
-                  ><Check v-if="copied" /><Copy v-else />{{
-                    copied ? "已复制" : "复制激活链接"
-                  }}</Button
-                >
-              </div></template
-            >
+            <template v-if="!finished">
+              <p class="text-xs leading-6 text-muted-foreground">
+                打开 AstroBox 的 Kovela，输入同一订单号。插件会查出对应应用，确认后即可选择手环激活。
+              </p>
+            </template>
             <div aria-live="polite" class="rounded-xl border border-border p-4">
               <p class="flex items-center gap-2 text-sm font-medium">
                 <CheckCheck
@@ -539,7 +475,7 @@ onBeforeUnmount(() => {
                     ? status?.notification === "sent"
                       ? "激活结果已通过爱发电私信发送。现在可以离线使用应用。"
                       : "设备已解锁。爱发电私信正在发送，不影响正常使用。"
-                    : "请保持手环应用打开。只有设备验签并保存许可证后，这里才会显示激活完成。"
+                    : "请在 AstroBox 的 Kovela 中输入同一订单号并确认。只有设备验签并保存许可证后，这里才会显示激活完成。"
                 }}
               </p>
             </div>
@@ -611,7 +547,7 @@ onBeforeUnmount(() => {
             v-for="(step, index) in [
               {
                 title: '验证爱发电订单',
-                text: '选择订单对应的应用，复制爱发电订单号，确认领取资格。',
+                text: '打开 AstroBox 的 Kovela，选择应用并输入订单号。本页也可以验证，再把凭证传给插件。',
                 icon: ShieldCheck,
               },
               {

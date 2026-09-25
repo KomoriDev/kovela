@@ -92,10 +92,7 @@ function chinaTime(unix: number) {
     .format(new Date(unix * 1000))
     .replace("T", " ");
 }
-function portal(origin: string) {
-  return origin.endsWith("/") ? origin : origin + "/";
-}
-function purchaseGuide(origin: string, names: string[], orderNo: string) {
+function purchaseGuide(names: string[], orderNo: string) {
   const labels = names.map((name) => oneLine(name)).filter(Boolean);
   const list = labels
     .map((name, index) => `${index + 1}. 【${name}】\n👉 ${orderNo}`)
@@ -106,7 +103,7 @@ function purchaseGuide(origin: string, names: string[], orderNo: string) {
     "为你分配商品激活订单号：",
     list,
     "",
-    `您可以前往 Kovela 激活系统完成激活，传送门：${portal(origin)}`,
+    "请打开 AstroBox 的 Kovela 插件，选择对应应用并输入订单号完成激活。",
     "",
     "--------",
     "",
@@ -358,7 +355,6 @@ export function createWorker(
         "guide:" + order.out_trade_no,
         order.user_id,
         purchaseGuide(
-          env.PUBLIC_ORIGIN,
           purchased.map((product) => product.productName),
           order.out_trade_no,
         ),
@@ -464,7 +460,6 @@ export function createWorker(
       env.AFDIAN_TOKEN &&
       /^[a-f0-9]{32}$/i.test(env.AFDIAN_USER_ID ?? "") &&
       signingReady &&
-      (local || (env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET_KEY)) &&
       products.some((product) => product.planIds.length > 0)
     );
     if (request.method === "GET" && url.pathname === "/api/config")
@@ -481,7 +476,9 @@ export function createWorker(
         pluginName: PLUGIN_NAME,
         publicOrigin: env.PUBLIC_ORIGIN,
         turnstileSiteKey:
-          local || !verificationEnabled ? "" : env.TURNSTILE_SITE_KEY,
+          local || !env.TURNSTILE_SITE_KEY || !env.TURNSTILE_SECRET_KEY
+            ? ""
+            : env.TURNSTILE_SITE_KEY,
       };
     if (request.method !== "POST")
       throw new HttpError(405, "METHOD_NOT_ALLOWED", "不支持此请求方式。");
@@ -571,14 +568,14 @@ export function createWorker(
     }
     const ip = request.headers.get("CF-Connecting-IP") ?? "local";
     await limit(env, "ip:" + (await digest(ip)), 90, 60);
-    if (url.pathname === "/api/orders/verify") {
+    if (
+      url.pathname === "/api/orders/verify" ||
+      url.pathname === "/api/orders/lookup"
+    ) {
       const orderNo = requireString(body, "orderNo", /^\d{16,32}$/);
-      const product = availableProduct(
-        products,
-        requireString(body, "productId", productIdPattern),
-      );
-      await limit(env, "verify:" + (await digest(ip)), 10, 60);
-      if (!local) {
+      await limit(env, "verify:" + (await digest(ip)), 6, 60);
+      await limit(env, "order:" + (await digest(orderNo)), 4, 600);
+      if (url.pathname === "/api/orders/verify" && !local) {
         if (!env.TURNSTILE_SECRET_KEY || !env.TURNSTILE_SITE_KEY)
           throw new HttpError(503, "NOT_CONFIGURED", "人机验证服务尚未配置。");
         const token = requireString(body, "turnstileToken", /^.{1,2048}$/);
@@ -609,54 +606,68 @@ export function createWorker(
           check.hostname !== origin.hostname ||
           check.action !== "verify-order"
         )
-          throw new HttpError(
-            403,
-            "CHALLENGE_FAILED",
-            "人机验证未通过，请重试。",
-          );
+          throw new HttpError(403, "CHALLENGE_FAILED", "人机验证未通过，请重试。");
       }
       const paidOrder = await eligible(api, orderNo);
-      if (!matchesProduct(paidOrder, product))
+      const matched =
+        url.pathname === "/api/orders/lookup"
+          ? products.filter(
+              (product) =>
+                product.planIds.length > 0 && matchesProduct(paidOrder, product),
+            )
+          : [
+              availableProduct(
+                products,
+                requireString(body, "productId", productIdPattern),
+              ),
+            ].filter((product) => matchesProduct(paidOrder, product));
+      if (!matched.length)
         throw new HttpError(
           404,
           "ORDER_NOT_ELIGIBLE",
-          "此订单不包含所选应用，请核对购买商品。",
+          url.pathname === "/api/orders/lookup"
+            ? "此订单没有可激活的应用，请核对订单号。"
+            : "此订单不包含所选应用，请核对购买商品。",
         );
-      await deliverPurchaseGuide(env, api, paidOrder, [product]);
-      const entitlement = await env.DB.prepare(
-        "SELECT * FROM entitlements WHERE order_no=? AND product_id=?",
-      )
-        .bind(orderNo, product.productId)
-        .first<Entitlement>();
-      if (!entitlement)
-        throw new HttpError(
-          503,
-          "SERVICE_UNAVAILABLE",
-          "暂时无法读取授权订单。",
-        );
-      const handoffToken = randomToken();
-      const statusToken = randomToken();
+      await deliverPurchaseGuide(env, api, paidOrder, matched);
       const expiresAt = now() + 600;
-      await env.DB.prepare(
-        "INSERT INTO sessions(handoff_hash,status_hash,license_id,expires_at,status_expires_at) VALUES(?,?,?,?,?)",
-      )
-        .bind(
-          await digest(handoffToken),
-          await digest(statusToken),
-          entitlement.license_id,
-          expiresAt,
-          expiresAt + 3600,
+      const items = [];
+      for (const product of matched) {
+        const entitlement = await env.DB.prepare(
+          "SELECT * FROM entitlements WHERE order_no=? AND product_id=?",
         )
-        .run();
-      return {
-        orderNo,
-        productId: product.productId,
-        productName: product.productName,
-        handoffToken,
-        statusToken,
-        expiresAt,
-        boundDeviceId: entitlement.device_id,
-      };
+          .bind(orderNo, product.productId)
+          .first<Entitlement>();
+        if (!entitlement)
+          throw new HttpError(
+            503,
+            "SERVICE_UNAVAILABLE",
+            "暂时无法读取授权订单。",
+          );
+        const handoffToken = randomToken();
+        const statusToken = randomToken();
+        await env.DB.prepare(
+          "INSERT INTO sessions(handoff_hash,status_hash,license_id,expires_at,status_expires_at) VALUES(?,?,?,?,?)",
+        )
+          .bind(
+            await digest(handoffToken),
+            await digest(statusToken),
+            entitlement.license_id,
+            expiresAt,
+            expiresAt + 3600,
+          )
+          .run();
+        items.push({
+          productId: product.productId,
+          productName: product.productName,
+          handoffToken,
+          statusToken,
+          expiresAt,
+          boundDeviceId: entitlement.device_id,
+        });
+      }
+      if (url.pathname === "/api/orders/lookup") return { orderNo, items };
+      return { orderNo, ...items[0] };
     }
     if (url.pathname === "/api/activate") {
       const token = requireString(body, "handoffToken", /^[a-f0-9]{64}$/);
@@ -677,7 +688,7 @@ export function createWorker(
         throw new HttpError(
           410,
           "HANDOFF_EXPIRED",
-          "激活链接已过期，请在网页重新验证订单。",
+          "激活凭证已过期，请重新查询订单号。",
         );
       if (
         session.device_id &&

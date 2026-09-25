@@ -152,24 +152,34 @@ async function fixture(
   return { db, env, worker, post, ok, messages };
 }
 
-test("first deployment serves its catalogue but cannot bypass missing Turnstile on a public origin", async (t) => {
-  const { env, worker, post } = await fixture(t);
+test("public origin verifies an order without Turnstile and then rate-limits that order", async (t) => {
+  const { db, env, worker, post, ok } = await fixture(t);
   env.PUBLIC_ORIGIN = origin;
-  // Even DEV_MODE=true cannot exempt a public hostname from Turnstile.
-  for (const siteKey of ["", "configured-site-key"]) {
-    env.TURNSTILE_SITE_KEY = siteKey;
-    const response = await worker.fetch(
-      new Request(origin + "/api/config"),
-      env,
-    );
-    assert.equal(response.status, 200);
-    const config = await response.json();
-    assert.deepEqual(
-      config.products.map((p: { productId: string }) => p.productId),
-      products.map((p) => p.productId),
-    );
-    assert.equal(config.verificationEnabled, false);
-    assert.equal(config.turnstileSiteKey, "");
+  env.DEV_MODE = "false";
+  await migrate(db, "0001_initial.sql");
+  await migrate(db, "0002_products.sql");
+  await migrate(db, "0003_guides.sql");
+  const response = await worker.fetch(new Request(origin + "/api/config"), env);
+  assert.equal(response.status, 200);
+  const config = await response.json();
+  assert.deepEqual(
+    config.products.map((p: { productId: string }) => p.productId),
+    products.map((p) => p.productId),
+  );
+  assert.equal(config.verificationEnabled, true);
+  assert.equal(config.turnstileSiteKey, "");
+  const found = await ok("/api/orders/lookup", { orderNo });
+  assert.equal(found.orderNo, orderNo);
+  assert.equal(found.items.length, 1);
+  assert.equal(found.items[0].productId, products[0].productId);
+  assert.equal(found.items[0].productName, products[0].productName);
+  assert.match(found.items[0].handoffToken, /^[a-f0-9]{64}$/);
+  const bundle = await ok("/api/orders/lookup", { orderNo: bundleNo });
+  assert.deepEqual(
+    bundle.items.map((item: { productId: string }) => item.productId).sort(),
+    products.map((product) => product.productId).sort(),
+  );
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     const blocked = await post("/api/orders/verify", {
       orderNo,
       productId: products[0].productId,
@@ -177,6 +187,9 @@ test("first deployment serves its catalogue but cannot bypass missing Turnstile 
     assert.equal(blocked.status, 503);
     assert.equal((await blocked.json()).error.code, "NOT_CONFIGURED");
   }
+  const limited = await post("/api/orders/lookup", { orderNo });
+  assert.equal(limited.status, 429);
+  assert.equal((await limited.json()).error.code, "RATE_LIMITED");
 });
 
 test("completed zero-price redemptions can activate and notify without admitting unpaid orders", async (t) => {
@@ -235,7 +248,8 @@ test("completed zero-price redemptions can activate and notify without admitting
   );
   assert.match(messages[0], /感谢您购买 坦克动荡/);
   assert.match(messages[0], new RegExp(redeemedNo));
-  assert.match(messages[0], /传送门：http:\/\/127\.0\.0\.1:5173\//);
+  assert.match(messages[0], /请打开 AstroBox 的 Kovela 插件/);
+  assert.doesNotMatch(messages[0], /传送门/);
   assert.match(messages[0], /售后群：993666186/);
   const reportedResponse = await worker.fetch(
     new Request(env.PUBLIC_ORIGIN + "/api/activation/report", {
