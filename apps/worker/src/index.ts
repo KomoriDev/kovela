@@ -329,16 +329,8 @@ export function createWorker(
     order: AfdianOrder,
     purchased: ProductConfig[],
   ) {
-    if (!purchased.length) return;
-    await saveOrder(env, order, purchased);
-    await queuePurchaseGuide(env, order, purchased);
-    await flushOutbox(env, api);
-  }
-  async function saveOrder(
-    env: Env,
-    order: AfdianOrder,
-    products: ProductConfig[],
-  ) {
+    const anchor = purchased[0];
+    if (!anchor) return;
     await env.DB.batch([
       env.DB.prepare(
         "INSERT INTO purchases(order_no,buyer_id,plan_id,payment_status,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(order_no) DO UPDATE SET payment_status=excluded.payment_status, updated_at=excluded.updated_at",
@@ -349,7 +341,7 @@ export function createWorker(
         order.status,
         now(),
       ),
-      ...products.map((product) =>
+      ...purchased.map((product) =>
         env.DB.prepare(
           "INSERT INTO entitlements(license_id,order_no,product_id,product_name,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(order_no,product_id) DO UPDATE SET product_name=excluded.product_name",
         ).bind(
@@ -360,37 +352,22 @@ export function createWorker(
           now(),
         ),
       ),
-    ]);
-  }
-  async function queuePurchaseGuide(
-    env: Env,
-    order: AfdianOrder,
-    products: ProductConfig[],
-  ) {
-    const anchor = products[0];
-    if (!anchor) return;
-    const row = await env.DB.prepare(
-      "SELECT license_id FROM entitlements WHERE order_no=? AND product_id=?",
-    )
-      .bind(order.out_trade_no, anchor.productId)
-      .first<{ license_id: string }>();
-    if (!row) return;
-    await env.DB.prepare(
-      "INSERT OR IGNORE INTO outbox(id,license_id,result,recipient,content,next_attempt) VALUES(?,?,?,?,?,?)",
-    )
-      .bind(
+      env.DB.prepare(
+        "INSERT OR IGNORE INTO outbox(id,license_id,result,recipient,content,next_attempt) SELECT ?,license_id,'guide',?,?,? FROM entitlements WHERE order_no=? AND product_id=?",
+      ).bind(
         "guide:" + order.out_trade_no,
-        row.license_id,
-        "guide",
         order.user_id,
         purchaseGuide(
           env.PUBLIC_ORIGIN,
-          products.map((product) => product.productName),
+          purchased.map((product) => product.productName),
           order.out_trade_no,
         ),
         now(),
-      )
-      .run();
+        order.out_trade_no,
+        anchor.productId,
+      ),
+    ]);
+    await flushOutbox(env, api);
   }
   async function receiptFor(
     env: Env,
@@ -645,9 +622,7 @@ export function createWorker(
           "ORDER_NOT_ELIGIBLE",
           "此订单不包含所选应用，请核对购买商品。",
         );
-      await saveOrder(env, paidOrder, [product]);
-      await queuePurchaseGuide(env, paidOrder, [product]);
-      await flushOutbox(env, api);
+      await deliverPurchaseGuide(env, api, paidOrder, [product]);
       const entitlement = await env.DB.prepare(
         "SELECT * FROM entitlements WHERE order_no=? AND product_id=?",
       )
