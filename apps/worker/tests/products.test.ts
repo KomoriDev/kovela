@@ -97,7 +97,10 @@ async function migrate(db: D1Database, name: string) {
   );
 }
 
-async function fixture(t: TestContext) {
+async function fixture(
+  t: TestContext,
+  queryOrder: (orderNo: string) => unknown = (orderNo) => orders[orderNo],
+) {
   const platform = await getPlatformProxy<Env>({
     configPath: fileURLToPath(new URL("./wrangler.jsonc", import.meta.url)),
     persist: false,
@@ -123,7 +126,7 @@ async function fixture(t: TestContext) {
   const worker = createWorker(async (input, init) => {
     const params = JSON.parse(JSON.parse(String(init?.body)).params);
     if (String(input).endsWith("/query-order")) {
-      const order = orders[params.out_trade_no];
+      const order = queryOrder(params.out_trade_no);
       return Response.json({ ec: 200, data: { list: order ? [order] : [] } });
     }
     assert.ok(String(input).endsWith("/send-msg"));
@@ -265,6 +268,62 @@ test("completed zero-price redemptions can activate and notify without admitting
   assert.match(messages[1], /温馨提示：若本次操作非本人执行/);
 });
 
+test("purchase webhook still sends the guide when query-order is loose or not indexed yet", async (t) => {
+  const paid = orders[orderNo];
+  const hook = {
+    ec: 200,
+    data: {
+      type: "order",
+      order: paid,
+      sign: sign(
+        "sha256",
+        Buffer.from(orderNo + buyer + plan + paid.total_amount),
+        providerKey.privateKey,
+      ).toString("base64"),
+    },
+  };
+  const loose = await fixture(t, () => ({
+    ...paid,
+    status: "2",
+    total_amount: 5,
+  }));
+  await migrate(loose.db, "0001_initial.sql");
+  await migrate(loose.db, "0002_products.sql");
+  await migrate(loose.db, "0003_guides.sql");
+  await loose.ok("/api/webhooks/afdian?token=" + loose.env.WEBHOOK_TOKEN, hook);
+  assert.match(loose.messages[0], /感谢您购买 坦克动荡/);
+  assert.match(loose.messages[0], new RegExp(orderNo));
+
+  const delayed = await fixture(t, () => null);
+  await migrate(delayed.db, "0001_initial.sql");
+  await migrate(delayed.db, "0002_products.sql");
+  await migrate(delayed.db, "0003_guides.sql");
+  delayed.env.PRODUCTS = [{ ...products[0], skuIds: [] }];
+  const bare = await delayed.worker.fetch(
+    new Request(
+      delayed.env.PUBLIC_ORIGIN +
+        "/api/webhooks/afdian?token=" +
+        delayed.env.WEBHOOK_TOKEN,
+      { method: "POST", body: JSON.stringify(hook) },
+    ),
+    delayed.env,
+  );
+  assert.equal(bare.status, 200, await bare.clone().text());
+  assert.match(delayed.messages[0], new RegExp(orderNo));
+
+  const waiting = await fixture(t, () => null);
+  await migrate(waiting.db, "0001_initial.sql");
+  await migrate(waiting.db, "0002_products.sql");
+  await migrate(waiting.db, "0003_guides.sql");
+  const held = await waiting.post(
+    "/api/webhooks/afdian?token=" + waiting.env.WEBHOOK_TOKEN,
+    hook,
+  );
+  assert.equal(held.status, 503);
+  assert.equal((await held.json()).error.code, "ORDER_NOT_FOUND");
+  assert.equal(waiting.messages.length, 0);
+});
+
 test("SKUs, handoffs, signatures, bindings and reports remain isolated for products sharing an order", async (t) => {
   const { db, env, post, ok, messages } = await fixture(t);
   await migrate(db, "0001_initial.sql");
@@ -393,9 +452,13 @@ test("SKUs, handoffs, signatures, bindings and reports remain isolated for produ
     states.map((state) => state.deviceId),
     requests.map((request) => request.deviceId),
   );
-  const notices = messages.filter((message) => message.includes("为你分配商品激活订单号"));
+  const notices = messages.filter((message) =>
+    message.includes("为你分配商品激活订单号"),
+  );
   const results = messages.filter((message) => !notices.includes(message));
-  assert.ok(notices.some((message) => message.includes("感谢您购买 坦克动荡、阅读器")));
+  assert.ok(
+    notices.some((message) => message.includes("感谢您购买 坦克动荡、阅读器")),
+  );
   assert.ok(results[0].includes(a.productName));
   assert.ok(results[1].includes(b.productName));
   const rebound = await ok("/api/orders/verify", {

@@ -227,8 +227,12 @@ function requireString(
     throw new HttpError(400, "INVALID_INPUT", "请求参数不正确，请重新操作。");
   return value;
 }
-async function bodyOf(request: Request): Promise<Record<string, unknown>> {
+async function bodyOf(
+  request: Request,
+  acceptAnyContentType = false,
+): Promise<Record<string, unknown>> {
   if (
+    !acceptAnyContentType &&
     !request.headers
       .get("content-type")
       ?.toLowerCase()
@@ -300,19 +304,35 @@ export function createWorker(
   async function eligible(
     api: AfdianService,
     orderNo: string,
+    pending?: "pending",
   ): Promise<AfdianOrder> {
     const order = await api.getOrder(orderNo);
-    if (
-      !order ||
-      order.status !== 2 ||
-      !/^\d+(?:\.\d{1,2})?$/.test(order.total_amount)
-    )
+    if (!order)
+      throw new HttpError(
+        pending ? 503 : 404,
+        pending ? "ORDER_NOT_FOUND" : "ORDER_NOT_ELIGIBLE",
+        pending
+          ? "订单尚未同步，请稍后重试。"
+          : "未找到符合条件的有效订单，请核对订单号和购买商品。",
+      );
+    if (order.status !== 2 || !/^\d+(?:\.\d{1,2})?$/.test(order.total_amount))
       throw new HttpError(
         404,
         "ORDER_NOT_ELIGIBLE",
         "未找到符合条件的有效订单，请核对订单号和购买商品。",
       );
     return order;
+  }
+  async function deliverPurchaseGuide(
+    env: Env,
+    api: AfdianService,
+    order: AfdianOrder,
+    purchased: ProductConfig[],
+  ) {
+    if (!purchased.length) return;
+    await saveOrder(env, order, purchased);
+    await queuePurchaseGuide(env, order, purchased);
+    await flushOutbox(env, api);
   }
   async function saveOrder(
     env: Env,
@@ -488,7 +508,7 @@ export function createWorker(
       };
     if (request.method !== "POST")
       throw new HttpError(405, "METHOD_NOT_ALLOWED", "不支持此请求方式。");
-    const body = await bodyOf(request);
+    const body = await bodyOf(request, url.pathname === "/api/webhooks/afdian");
     if (url.pathname === "/api/orders/verify" && !verificationEnabled)
       throw new HttpError(
         503,
@@ -530,17 +550,42 @@ export function createWorker(
       )
         throw new HttpError(401, "WEBHOOK_SIGNATURE", "Webhook 签名验证失败。");
       try {
-        const order = await eligible(api, data.order.out_trade_no);
-        const purchased = products.filter((product) =>
-          matchesProduct(order, product),
+        const order = await eligible(api, data.order.out_trade_no, "pending");
+        await deliverPurchaseGuide(
+          env,
+          api,
+          order,
+          products.filter((product) => matchesProduct(order, product)),
         );
-        if (purchased.length) {
-          await saveOrder(env, order, purchased);
-          await queuePurchaseGuide(env, order, purchased);
-          await flushOutbox(env, api);
-        }
       } catch (error) {
-        if (!(
+        if (error instanceof HttpError && error.code === "ORDER_NOT_FOUND") {
+          const status = Number(data.order.status);
+          const fallback =
+            status === 2 && /^\d+(?:\.\d{1,2})?$/.test(data.order.total_amount)
+              ? { ...data.order, status }
+              : null;
+          const waitsForSku =
+            !!fallback &&
+            products.some(
+              (product) =>
+                product.planIds.includes(fallback.plan_id) &&
+                product.skuIds.length > 0,
+            );
+          if (!fallback) {
+            // Unpaid or malformed notices are not purchase replies.
+          } else if (waitsForSku) throw error;
+          else
+            await deliverPurchaseGuide(
+              env,
+              api,
+              fallback,
+              products.filter(
+                (product) =>
+                  product.skuIds.length === 0 &&
+                  matchesProduct(fallback, product),
+              ),
+            );
+        } else if (!(
           error instanceof HttpError && error.code === "ORDER_NOT_ELIGIBLE"
         ))
           throw error;

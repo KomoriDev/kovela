@@ -106,10 +106,7 @@ export default class AfdianService extends Service {
   }
 
   async getOrder(orderNo: string): Promise<AfdianOrder | null> {
-    const data = await this.call("query-order", {
-      out_trade_no: orderNo,
-      per_page: 1,
-    });
+    const data = await this.call("query-order", { out_trade_no: orderNo });
     if (
       !data ||
       typeof data !== "object" ||
@@ -125,15 +122,21 @@ export default class AfdianService extends Service {
         item.out_trade_no === orderNo,
     );
     if (!order) return null;
+    const status = Number(order.status);
+    const totalAmount =
+      typeof order.total_amount === "number" &&
+      Number.isFinite(order.total_amount)
+        ? order.total_amount.toFixed(2)
+        : order.total_amount;
     if (
       typeof order.user_id !== "string" ||
       !/^[a-f0-9]{32}$/i.test(order.user_id) ||
       typeof order.plan_id !== "string" ||
-      typeof order.status !== "number" ||
-      typeof order.total_amount !== "string"
+      !Number.isInteger(status) ||
+      typeof totalAmount !== "string"
     )
       throw new AfdianError("UPSTREAM_SCHEMA");
-    return order;
+    return { ...order, status, total_amount: totalAmount };
   }
 
   async sendMessage(recipient: string, content: string): Promise<void> {
