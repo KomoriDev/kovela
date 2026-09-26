@@ -6,7 +6,9 @@ wit_bindgen::generate!({
 });
 
 #[cfg(feature = "api4")]
-use astrobox::psys_host_v4::{device, interconnect, notification, register, timer, ui};
+use astrobox::psys_host_v4::{
+    device, interconnect, notification, register, thirdpartyapp, timer, ui,
+};
 #[cfg(feature = "api4")]
 use exports::astrobox::psys_plugin_v4::{
     event::{self, EventType},
@@ -15,7 +17,9 @@ use exports::astrobox::psys_plugin_v4::{
 #[cfg(not(feature = "api4"))]
 use astrobox_ng_wit::FutureReader;
 #[cfg(not(feature = "api4"))]
-use astrobox_ng_wit::astrobox::psys_host::{device, interconnect, register, timer, ui_v3 as ui};
+use astrobox_ng_wit::astrobox::psys_host::{
+    device, interconnect, register, thirdpartyapp, timer, ui_v3 as ui,
+};
 #[cfg(not(feature = "api4"))]
 use astrobox_ng_wit::exports::astrobox::psys_plugin::{
     event_v3::{self, EventType},
@@ -62,6 +66,8 @@ struct Pending {
     ack: Option<bool>,
     reported: bool,
     phase: Phase,
+    hello_tries: u32,
+    install_retries: u32,
 }
 #[derive(Clone)]
 struct Offer {
@@ -82,6 +88,9 @@ struct State {
     pending: Option<Pending>,
     message: String,
     device_note: String,
+    scan_gen: u32,
+    scan_tries: u32,
+    scanning: bool,
 }
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
 struct Kovela;
@@ -118,6 +127,44 @@ async fn host_timeout(delay_ms: u64, payload: &str) {
     #[cfg(not(feature = "api4"))]
     {
         timer::set_timeout(delay_ms, payload).await;
+    }
+}
+
+// 快应用必须先在前台运行并建立 interconnect 通道，插件才能收发消息。
+// 设备端应用列表读不到时继续尝试发送，避免宿主版本差异导致整条链路不可用。
+async fn open_app(addr: &str, package: &str) -> Result<(), String> {
+    #[cfg(feature = "api4")]
+    {
+        let Ok(apps) = thirdpartyapp::get_thirdparty_app_list(addr.to_string()).await else {
+            return Ok(());
+        };
+        let Some(app) = apps.into_iter().find(|app| app.package_name == package) else {
+            return Err("手环上未安装该应用，请先在 AstroBox 中安装".into());
+        };
+        for page in ["pages/activation", "/pages/activation", "pages/index"] {
+            if thirdpartyapp::launch_qa(addr.to_string(), app.clone(), page.to_string())
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "api4"))]
+    {
+        let Ok(apps) = thirdpartyapp::get_thirdparty_app_list(addr).await else {
+            return Ok(());
+        };
+        let Some(app) = apps.into_iter().find(|app| app.package_name == package) else {
+            return Err("手环上未安装该应用，请先在 AstroBox 中安装".into());
+        };
+        for page in ["pages/activation", "/pages/activation", "pages/index"] {
+            if thirdpartyapp::launch_qa(addr, &app, page).await.is_ok() {
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -159,7 +206,7 @@ fn normalize_order(input: &str) -> Result<String, String> {
     if (16..=32).contains(&order.len()) && order.bytes().all(|c| c.is_ascii_digit()) {
         Ok(order)
     } else {
-        Err("请输入 16～32 位数字的爱发电订单号。".into())
+        Err("请输入 16～32 位爱发电订单号".into())
     }
 }
 fn event_text(payload: &str) -> String {
@@ -211,6 +258,28 @@ fn timer_body(payload: &str) -> String {
         })
         .unwrap_or_else(|| payload.to_string())
 }
+// 设备端快应用可能还在启动，hello 每条 tick 重发一次，约 20 秒后放弃。
+fn hello_tick(id: &str) -> Option<Option<(String, String)>> {
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        let (phase, pending_id, tries) = match s.pending.as_ref() {
+            Some(p) => (p.phase, p.id.clone(), p.hello_tries),
+            None => return None,
+        };
+        if phase != Phase::Hello || pending_id != id {
+            return None;
+        }
+        if tries >= 10 {
+            return Some(None);
+        }
+        if let Some(p) = s.pending.as_mut() {
+            p.hello_tries += 1;
+        }
+        let package = s.handoff.as_ref()?.product_id.clone();
+        let addr = s.pending.as_ref()?.addr.clone();
+        Some(Some((addr, package)))
+    })
+}
 fn locked() -> bool {
     busy() || STATE.with(|state| state.borrow().verifying)
 }
@@ -229,10 +298,10 @@ fn connected_name(addr: &str) -> Option<String> {
 
 fn parse_offers(value: &Value) -> Result<Vec<Offer>, String> {
     let Some(items) = value.get("items").and_then(Value::as_array) else {
-        return Err("订单响应格式错误。".into());
+        return Err("查询结果异常，请重试".into());
     };
     if items.is_empty() || items.len() > 8 {
-        return Err("订单响应格式错误。".into());
+        return Err("查询结果异常，请重试".into());
     }
     let mut offers: Vec<Offer> = Vec::new();
     for item in items {
@@ -241,10 +310,10 @@ fn parse_offers(value: &Value) -> Result<Vec<Offer>, String> {
         let token = item.get("handoffToken").and_then(Value::as_str).unwrap_or("");
         let name = usable_label(product_name);
         if !valid_product_id(product_id) || name.is_none() || !is_hex(token) {
-            return Err("订单响应与授权服务不匹配。".into());
+            return Err("查询结果不匹配，请重试".into());
         }
         if offers.iter().any(|offer| offer.product_id == product_id) {
-            return Err("订单响应与授权服务不匹配。".into());
+            return Err("查询结果不匹配，请重试".into());
         }
         offers.push(Offer {
             product_id: product_id.to_string(),
@@ -296,21 +365,36 @@ fn gate(element: ui::Element, locked: bool) -> ui::Element {
     if locked { element.disabled() } else { element }
 }
 fn render() {
-    let (root, message, offers, verifying, handoff, devices, selected, phase, device_note) =
-        STATE.with(|state| {
-            let s = state.borrow();
-            (
-                s.root.clone(),
-                s.message.clone(),
-                s.offers.clone(),
-                s.verifying,
-                s.handoff.clone(),
-                s.devices.clone(),
-                s.selected,
-                s.pending.as_ref().map(|pending| pending.phase),
-                s.device_note.clone(),
-            )
-        });
+    let (
+        root,
+        message,
+        order_no,
+        offers,
+        verifying,
+        handoff,
+        devices,
+        selected,
+        phase,
+        device_note,
+        scanning,
+        scan_tries,
+    ) = STATE.with(|state| {
+        let s = state.borrow();
+        (
+            s.root.clone(),
+            s.message.clone(),
+            s.order_no.clone(),
+            s.offers.clone(),
+            s.verifying,
+            s.handoff.clone(),
+            s.devices.clone(),
+            s.selected,
+            s.pending.as_ref().map(|pending| pending.phase),
+            s.device_note.clone(),
+            s.scanning,
+            s.scan_tries,
+        )
+    });
     let Some(root) = root else { return };
     let active = phase.is_some_and(|phase| !matches!(phase, Phase::Retry | Phase::Complete));
     let complete = phase == Some(Phase::Complete);
@@ -328,6 +412,8 @@ fn render() {
         "激活完成".to_string()
     } else if let Some(item) = &handoff {
         item.product_name.clone()
+    } else if !offers.is_empty() {
+        "查询结果".to_string()
     } else if verifying {
         "正在查询".to_string()
     } else {
@@ -344,7 +430,7 @@ fn render() {
         page = page.child(ui::Element::new(ui::ElementType::P, Some(&message)).size(16));
     } else if handoff.is_none() && offers.is_empty() {
         page = page.child(
-            ui::Element::new(ui::ElementType::P, Some("填写爱发电订单号，点查询。")).size(14),
+            ui::Element::new(ui::ElementType::P, Some("请输入爱发电订单号")).size(14),
         );
     }
     if let Some(value) = progress {
@@ -376,6 +462,61 @@ fn render() {
             .on(ui::Event::Click, "verify"),
             ui_locked,
         ));
+    // 设备信息贴在订单号下方：进插件就能看到宿主是否已识别到手环。
+    // 读取只由用户动作触发，没读过时给出中性提示，不显示假的进行中文案。
+    let device_status = if !device_note.is_empty() {
+        device_note.clone()
+    } else if scanning {
+        format!("正在读取设备列表…（第 {} 次）", scan_tries)
+    } else {
+        "点「刷新设备」读取手环列表".to_string()
+    };
+    page = page.child(ui::Element::new(ui::ElementType::P, Some(&device_status)).size(14));
+    if devices.len() == 1 {
+        let (addr, name) = &devices[0];
+        let label = if name.trim().is_empty() {
+            format!("设备：{addr}")
+        } else {
+            format!("设备：{name}")
+        };
+        page = page.child(ui::Element::new(ui::ElementType::P, Some(&label)).size(16));
+    }
+    for (index, (addr, name)) in devices.iter().enumerate() {
+        if devices.len() < 2 {
+            break;
+        }
+        let label = if name.trim().is_empty() {
+            addr.clone()
+        } else if selected == Some(index) {
+            format!("已选择 {name}")
+        } else {
+            name.clone()
+        };
+        let mut button = ui::Element::new(ui::ElementType::Button, Some(&label))
+            .width_full()
+            .on(ui::Event::Click, &format!("device:{index}"));
+        if selected == Some(index) {
+            button = button.bg("#7c3aed").text_color("#ffffff");
+        }
+        page = page.child(gate(button, ui_locked));
+    }
+    page = page.child(gate(
+        ui::Element::new(ui::ElementType::Button, Some("刷新设备"))
+            .width_full()
+            .on(ui::Event::Click, "refresh"),
+        ui_locked,
+    ));
+    if !offers.is_empty() {
+        let summary = format!("订单 {order_no}");
+        page = page.child(ui::Element::new(ui::ElementType::P, Some(&summary)).size(16));
+        for offer in &offers {
+            let line = match offer.bound_device_id.as_deref() {
+                Some(id) => format!("{} · 已绑定 {}", offer.product_name, &id[..12]),
+                None => format!("{} · 尚未绑定", offer.product_name),
+            };
+            page = page.child(ui::Element::new(ui::ElementType::P, Some(&line)).size(14));
+        }
+    }
     for (index, offer) in offers.iter().enumerate() {
         let chosen = handoff
             .as_ref()
@@ -402,36 +543,6 @@ fn render() {
         page = page.child(gate(button, ui_locked));
     }
     if handoff.is_some() {
-        page = page
-            .child(ui::Element::new(ui::ElementType::Separator, None).width_full())
-            .child(ui::Element::new(ui::ElementType::P, Some("选择手环")).size(16));
-        if devices.is_empty() {
-            let note = if device_note.is_empty() {
-                "还没有已连接的手环。请先在 AstroBox 里连接设备。"
-            } else {
-                device_note.as_str()
-            };
-            page = page.child(ui::Element::new(ui::ElementType::P, Some(note)).size(14));
-        }
-        for (index, (addr, name)) in devices.iter().enumerate() {
-            let label = if name.trim().is_empty() {
-                addr.clone()
-            } else if selected == Some(index) {
-                format!("已选择 {name}")
-            } else {
-                name.clone()
-            };
-            let mut button = ui::Element::new(ui::ElementType::Button, Some(&label))
-                .width_full()
-                .on(ui::Event::Click, &format!("device:{index}"));
-            if selected == Some(index) {
-                button = button.bg("#7c3aed").text_color("#ffffff");
-            }
-            if has_pending {
-                button = button.disabled();
-            }
-            page = page.child(button);
-        }
         let action = if complete {
             "已激活"
         } else if has_pending {
@@ -440,12 +551,7 @@ fn render() {
             "激活"
         };
         page = page
-            .child(gate(
-                ui::Element::new(ui::ElementType::Button, Some("刷新设备"))
-                    .width_full()
-                    .on(ui::Event::Click, "refresh"),
-                ui_locked,
-            ))
+            .child(ui::Element::new(ui::ElementType::Separator, None).width_full())
             .child(gate(
                 ui::Element::new(ui::ElementType::Button, Some(action))
                     .bg("#7c3aed")
@@ -455,56 +561,113 @@ fn render() {
                 ui_locked || complete || selected.is_none(),
             ));
     }
+    if !offers.is_empty() || handoff.is_some() {
+        page = page.child(gate(
+            ui::Element::new(ui::ElementType::Button, Some("取消"))
+                .width_full()
+                .on(ui::Event::Click, "cancel"),
+            ui_locked,
+        ));
+    }
     ui::render(&root, page);
 }
 
+// 宿主读取设备列表会先请求前端授权，可能失败或长时间不返回；
+// 所以每次扫描都先排一个定时器，超时或空结果都会自动重扫。
 async fn load_devices() {
+    let (generation, tries) = STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.scan_gen = s.scan_gen.wrapping_add(1);
+        s.scan_tries = s.scan_tries.saturating_add(1);
+        s.scanning = true;
+        (s.scan_gen, s.scan_tries)
+    });
+    render();
+    if tries < 6 {
+        host_timeout(2_500, &format!("scan:{generation}")).await;
+    }
     let connected = device::get_connected_device_list()
         .await
         .into_iter()
         .map(|device| (device.addr, device.name))
         .collect::<Vec<_>>();
-    let note = if connected.is_empty() {
+    let mut history = 0;
+    let mut devices = connected.clone();
+    if connected.is_empty() {
         let known = device::get_device_list()
             .await
             .into_iter()
-            .map(|device| {
-                let name = device.name.trim();
-                if name.is_empty() {
-                    device.addr
-                } else {
-                    format!("{name} · {}", device.addr)
-                }
-            })
-            .take(3)
+            .map(|device| (device.addr, device.name))
             .collect::<Vec<_>>();
-        if known.is_empty() {
-            "已刷新。没有已连接设备，也没有历史记录。请在 AstroBox 设备列表里连接手环，并在手环上确认。".into()
-        } else {
-            format!(
-                "已刷新。没有已连接设备。历史记录：{}。请在 AstroBox 设备页点连接，而不是只打开手环激活页。",
-                known.join("；")
-            )
+        history = known.len();
+        // 已连接的设备优先；宿主没能标记为已连接时，历史记录仍可尝试，
+        // 失败会在发送阶段给出明确提示。
+        for (addr, name) in known {
+            if devices.iter().any(|(item, _)| item == &addr) {
+                continue;
+            }
+            let label = name.trim();
+            devices.push((
+                addr.clone(),
+                if label.is_empty() {
+                    format!("{addr} · 历史")
+                } else {
+                    format!("{label} · 历史")
+                },
+            ));
         }
+    }
+    let note = if connected.len() == 1 {
+        "已找到 1 台手环".to_string()
+    } else if !connected.is_empty() {
+        format!("已找到 {} 台手环，默认第一台，可点选其它", connected.len())
+    } else if history > 0 {
+        format!("未检测到已连接手环（历史 {history} 台），请在 AstroBox 中连接后点「刷新设备」")
     } else {
-        format!(
-            "已刷新，找到 {} 台已连接设备。选择一台后再激活。",
-            connected.len()
-        )
+        "未检测到手环：请确认 AstroBox 已连接，并允许 Kovela 访问设备后点「刷新设备」".into()
     };
-    STATE.with(|state| {
+    let applied = STATE.with(|state| {
         let mut s = state.borrow_mut();
+        if s.scan_gen != generation {
+            return false;
+        }
+        s.scanning = false;
         let replace = s
             .pending
             .as_ref()
             .is_none_or(|pending| matches!(pending.phase, Phase::Retry | Phase::Complete));
         if replace {
-            s.selected = None;
-            s.devices = connected;
+            s.selected = if devices.is_empty() { None } else { Some(0) };
+            s.devices = devices.clone();
             s.device_note = note;
         }
+        true
     });
+    if !applied {
+        return;
+    }
     render();
+}
+
+// 用户主动刷新或刚确认应用时重置重试次数，重新开始扫描。
+async fn begin_scan() {
+    STATE.with(|state| {
+        state.borrow_mut().scan_tries = 0;
+    });
+    load_devices().await;
+}
+
+async fn scan_tick(id: &str) {
+    let Some(generation) = id.parse::<u32>().ok() else {
+        return;
+    };
+    let retry = STATE.with(|state| {
+        let s = state.borrow();
+        s.scan_gen == generation && s.devices.is_empty() && s.scan_tries < 6
+    });
+    if retry {
+        load_devices().await;
+    }
 }
 
 fn post<T: serde::de::DeserializeOwned>(
@@ -516,15 +679,15 @@ fn post<T: serde::de::DeserializeOwned>(
         .post(&format!("{origin}{path}"))
         .header("Content-Type", "application/json")
         .connect_timeout(Duration::from_secs(12))
-        .body(serde_json::to_vec(&body).map_err(|_| "请求编码失败。")?)
+        .body(serde_json::to_vec(&body).map_err(|_| "请求发送失败")?)
         .send()
-        .map_err(|_| "无法连接授权服务，请检查网络并重试。")?;
+        .map_err(|_| "无法连接服务器，请检查网络后重试")?;
     let status = response.status_code();
     let bytes = response
         .body()
-        .map_err(|_| "授权服务响应不完整，请重试。")?;
+        .map_err(|_| "服务器响应不完整，请重试")?;
     if bytes.len() > 16384 {
-        return Err("授权服务响应过长。".into());
+        return Err("服务器响应过长".into());
     }
     if !(200..300).contains(&status) {
         let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
@@ -532,13 +695,25 @@ fn post<T: serde::de::DeserializeOwned>(
             .pointer("/error/message")
             .and_then(Value::as_str)
             .filter(|s| s.len() < 512)
-            .unwrap_or("授权请求失败，请重新验证订单。")
+            .unwrap_or("查询失败，请重试")
             .into());
     }
-    serde_json::from_slice(&bytes).map_err(|_| "授权服务响应格式错误。".into())
+    serde_json::from_slice(&bytes).map_err(|_| "服务器响应无法识别".into())
 }
 fn show(message: impl Into<String>) {
     STATE.with(|state| state.borrow_mut().message = message.into());
+    render();
+}
+fn reset_order() {
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.offers.clear();
+        s.handoff = None;
+        s.pending = None;
+        s.selected = None;
+        s.verifying = false;
+        s.message = "请输入爱发电订单号".into();
+    });
     render();
 }
 fn confirm_offer(index: usize) {
@@ -551,11 +726,11 @@ fn confirm_offer(index: usize) {
     };
     let note = match offer.bound_device_id.as_deref() {
         Some(id) => format!(
-            "已确认 {}。此应用已绑定设备 {}…，只能为同一设备重新传输。",
+            "已确认 {}，已绑定 {}，仅可在该设备上重新传输",
             offer.product_name,
             &id[..12]
         ),
-        None => format!("已确认 {}。请选择手环并激活。", offer.product_name),
+        None => format!("已确认 {}，请选择手环后激活", offer.product_name),
     };
     STATE.with(|state| {
         let mut s = state.borrow_mut();
@@ -606,14 +781,13 @@ fn finish_lookup() {
     ) {
         Ok(value) => match parse_offers(&value) {
             Ok(offers) => {
-                let count = offers.len();
                 STATE.with(|state| {
                     let mut s = state.borrow_mut();
                     s.verifying = false;
                     s.pending = None;
                     s.handoff = None;
                     s.offers = offers;
-                    s.message = format!("查到 {count} 个应用。请点确认。");
+                    s.message = "请点击下方应用完成激活，已绑定的应用仅可在原设备上重新传输".into();
                 });
                 render();
             }
@@ -624,7 +798,7 @@ fn finish_lookup() {
         },
         Err(error) => {
             let error = if error.contains("接口不存在") {
-                "授权服务还没有订单查询接口。插件已更新，需要先部署新的 Worker。".into()
+                "查询暂不可用，请稍后再试".into()
             } else {
                 error
             };
@@ -641,7 +815,7 @@ async fn send_install(pending: Pending) {
     if !set_phase(
         &pending.id,
         Phase::Installing,
-        "许可证已签发，正在等待设备验签并保存…",
+        "许可证已签发，正在写入设备…",
     ) {
         return;
     }
@@ -651,13 +825,26 @@ async fn send_install(pending: Pending) {
         .await
         .is_err()
     {
-        fail("许可证传输失败。请打开手环应用、检查连接，然后重试当前激活。");
+        fail("传输失败，请打开手环应用并保持连接后重试");
         return;
     }
-    host_timeout(30_000, &format!("install:{}", pending.id)).await;
+    // 宿主对快应用回包的路由可能只认最近一次注册（Daymatter 每次发送前都
+    // 重新注册；回执是 install-license 之后的第二条入站消息），发送完补注
+    // 册一次再等回执，手环端回执才不会因无路由被传输层拒收（202）。
+    let _ = host_register_recv(&pending.addr, &issued.product_id).await;
+    // 短窗口重发：手环收到重发的安装包且已激活时会同步立即回执——
+    // "紧跟下行消息的发送"是实测唯一可靠的回执时机。
+    host_timeout(12_000, &format!("install:{}", pending.id)).await;
 }
 
 async fn start_activation() {
+    let needs_scan = STATE.with(|state| {
+        let s = state.borrow();
+        s.handoff.is_some() && s.devices.is_empty()
+    });
+    if needs_scan {
+        load_devices().await;
+    }
     if busy() {
         return;
     }
@@ -684,7 +871,11 @@ async fn start_activation() {
     let selection = STATE.with(|state| {
         let mut s = state.borrow_mut();
         let handoff = s.handoff.clone()?;
-        let (addr, _) = s.devices.get(s.selected?)?.clone();
+        let index = match s.selected {
+            Some(index) if index < s.devices.len() => index,
+            _ => 0,
+        };
+        let (addr, _) = s.devices.get(index)?.clone();
         let id = s
             .pending
             .as_ref()
@@ -699,20 +890,26 @@ async fn start_activation() {
             ack: None,
             reported: false,
             phase: Phase::Hello,
+            hello_tries: 0,
+            install_retries: 0,
         });
-        s.message = "正在读取手环应用的设备标识…".into();
+        s.message = "正在获取设备信息…".into();
         Some((handoff, addr, id))
     });
     let Some((handoff, addr, id)) = selection else {
-        fail("请先查询并确认订单，并选择设备。");
+        fail("未检测到设备：请在 AstroBox 中连接手环，然后点「刷新设备」");
         return;
     };
     render();
+    if let Err(error) = open_app(&addr, &handoff.product_id).await {
+        fail(error);
+        return;
+    }
     if host_register_recv(&addr, &handoff.product_id)
         .await
         .is_err()
     {
-        fail("无法订阅设备回执，请授予消息接收权限后重试。");
+        fail("无法接收设备消息，请授予权限后重试");
         return;
     }
     let message = json!({"v":1,"id":id,"type":"hello"}).to_string();
@@ -721,12 +918,12 @@ async fn start_activation() {
         .is_err()
     {
         fail(format!(
-            "无法连接{}。请确认已安装新版应用并在手环上打开。",
+            "无法连接{}，请在手环上打开应用",
             handoff.product_name
         ));
         return;
     }
-    host_timeout(20_000, &format!("hello:{id}")).await;
+    host_timeout(2_000, &format!("tick:{id}")).await;
 }
 
 async fn notify_activated(addr: String, product: String) {
@@ -741,7 +938,7 @@ async fn notify_activated(addr: String, product: String) {
             app_name: "Kovela".into(),
             title: format!("{product}已激活"),
             sub_title: String::new(),
-            body: "许可证已保存在手环上，现在可以离线使用。".into(),
+            body: "许可证已保存在手环上，可离线使用".into(),
             timestamp_ms: None,
             live_activity: None,
         };
@@ -757,9 +954,9 @@ async fn report(pending: Pending) {
         &pending.id,
         Phase::Reporting,
         if success {
-            "设备已确认激活，正在提交回执…"
+            "手环已激活，正在同步结果…"
         } else {
-            "设备激活失败，正在提交结果…"
+            "激活未完成，正在记录结果…"
         },
     ) {
         return;
@@ -819,21 +1016,21 @@ async fn report(pending: Pending) {
                 }
                 s.message = if success {
                     if value["notification"] == "sent" {
-                        "激活成功，爱发电私信已发送。现在可离线使用应用。"
+                        "激活成功！感谢您的支持 ❤️"
                     } else {
-                        "激活成功，爱发电私信已进入发送队列。不影响离线使用。"
+                        "激活成功！感谢您的支持 ❤️"
                     }
                 } else {
-                    "手环未能完成激活。请检查设备提示，修复后重试。"
+                    "激活未完成，请查看手环提示后重试"
                 }
                 .into();
             });
             render();
         }
         _ => fail(if success {
-            "设备已激活，但回执未能提交。请保持插件打开并点击重试，不需要重新购买。"
+            "设备已激活，但通知未能发送，请保持页面打开并重试，无需重新购买"
         } else {
-            "设备激活失败，回执尚未提交，请重试。"
+            "激活未完成，结果尚未提交，请重试"
         }),
     }
 }
@@ -844,6 +1041,15 @@ async fn on_device_message(raw: &str) {
     }
     let Ok(message) = serde_json::from_str::<Value>(raw) else {
         return;
+    };
+    // 官方 connect.send 契约要求数据参数是对象；固件会把对象序列化后包进
+    // payloadText 信封再传输（Daymatter 插件同款解包）。裸 JSON 载荷也兼容。
+    let message = match message.get("payloadText").and_then(Value::as_str) {
+        Some(inner) => match serde_json::from_str::<Value>(inner) {
+            Ok(value) => value,
+            Err(_) => return,
+        },
+        None => message,
     };
     let Some(pending) = STATE.with(|state| state.borrow().pending.clone()) else {
         return;
@@ -857,7 +1063,7 @@ async fn on_device_message(raw: &str) {
             .and_then(Value::as_str)
             .filter(|id| is_hex(id))
         else {
-            fail("设备没有提供有效标识，请检查权限。");
+            fail("设备未提供有效标识，请检查权限");
             return;
         };
         let handoff = STATE.with(|state| {
@@ -874,13 +1080,13 @@ async fn on_device_message(raw: &str) {
             return;
         };
         if message["productId"] != handoff.product_id {
-            fail("连接到了不匹配的应用。");
+            fail("连接到的应用不匹配");
             return;
         }
         set_phase(
             &pending.id,
             Phase::Issuing,
-            "正在向授权服务申请设备绑定许可证…",
+            "正在为该设备签发许可证…",
         );
         render();
         match post::<Issued>(
@@ -909,7 +1115,7 @@ async fn on_device_message(raw: &str) {
                     send_install(p).await;
                 }
             }
-            Ok(_) => fail("许可证响应与所选设备不匹配。"),
+            Ok(_) => fail("许可证与所选设备不匹配"),
             Err(error) => fail(error),
         }
     } else if message["type"] == "activation-result"
@@ -940,23 +1146,53 @@ async fn on_device_message(raw: &str) {
     }
 }
 
-async fn startup() {
-    load_devices().await;
-}
 async fn dispatch_event(kind: EventType, payload: String) {
     match kind {
         EventType::InterconnectMessage => on_device_message(&payload).await,
         EventType::Timer => {
             let body = timer_body(&payload);
-            let waiting = STATE.with(|state| {
-                let s = state.borrow();
-                s.pending.as_ref().is_some_and(|p| {
-                    (p.phase == Phase::Hello && body == format!("hello:{}", p.id))
-                        || (p.phase == Phase::Installing && body == format!("install:{}", p.id))
-                })
-            });
-            if waiting {
-                fail("等待设备回执超时。请保持手环应用打开并重试；尚未确认激活成功。");
+            if let Some(id) = body.strip_prefix("tick:") {
+                match hello_tick(id) {
+                Some(Some((addr, package))) => {
+                    // 每次重发 hello 前补注册：宿主对回包的路由若只认最近
+                    // 一次注册，前一条回复会把路由消耗掉。
+                    let _ = host_register_recv(&addr, &package).await;
+                    let message = json!({"v":1,"id":id,"type":"hello"}).to_string();
+                    let _ = host_send(&addr, &package, &message).await;
+                    host_timeout(2_000, &format!("tick:{id}")).await;
+                }
+                    Some(None) => {
+                        fail("连接超时，请在手环应用里点重试，或重新打开应用后再试")
+                    }
+                    None => {}
+                }
+            } else if let Some(id) = body.strip_prefix("scan:") {
+                scan_tick(id).await;
+            } else if let Some(pending) = STATE.with(|state| {
+                let mut s = state.borrow_mut();
+                let p = s.pending.as_mut()?;
+                if p.phase != Phase::Installing || body != format!("install:{}", p.id) {
+                    return None;
+                }
+                if p.install_retries >= 2 {
+                    return None;
+                }
+                p.install_retries += 1;
+                Some(p.clone())
+            }) {
+                // 回执丢一次先自动重发安装包（发送后会补注册路由），
+                // 手环端收到重发会立即同步回执；两轮都失败才要求手动重试。
+                send_install(pending).await;
+            } else {
+                let waiting = STATE.with(|state| {
+                    let s = state.borrow();
+                    s.pending.as_ref().is_some_and(|p| {
+                        p.phase == Phase::Installing && body == format!("install:{}", p.id)
+                    })
+                });
+                if waiting {
+                    fail("等待设备响应超时，请保持应用打开后重试，本次尚未激活成功");
+                }
             }
         }
         _ => {}
@@ -965,6 +1201,7 @@ async fn dispatch_event(kind: EventType, payload: String) {
 enum UiFollow {
     None,
     Refresh,
+    Scan,
     Activate,
 }
 fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
@@ -973,9 +1210,23 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         ui::Event::Input | ui::Event::Change | ui::Event::Blur
     ) {
         remember_order(payload);
-        return UiFollow::None;
+        // 渲染时不做设备调用；用户开始输入订单号时顺带读一次设备列表，
+        // 省得必须去点「刷新设备」。
+        let unscanned = STATE.with(|state| {
+            let s = state.borrow();
+            s.scan_tries == 0 && s.device_note.is_empty() && !s.scanning
+        });
+        return if unscanned {
+            UiFollow::Scan
+        } else {
+            UiFollow::None
+        };
     }
     if !matches!(event, ui::Event::Click) || locked() {
+        return UiFollow::None;
+    }
+    if id == "cancel" {
+        reset_order();
         return UiFollow::None;
     }
     remember_order(payload);
@@ -984,6 +1235,7 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         state.offers.is_empty() && state.handoff.is_none()
     });
     let known = id == "verify"
+        || id == "cancel"
         || id == "refresh"
         || id == "activate"
         || id.starts_with("offer:")
@@ -1008,7 +1260,7 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         .and_then(|value| value.parse::<usize>().ok())
     {
         confirm_offer(index);
-        return UiFollow::None;
+        return UiFollow::Refresh;
     }
     if let Some(index) = id
         .strip_prefix("device:")
@@ -1044,9 +1296,8 @@ fn bind_root(id: String) {
 }
 #[cfg(feature = "api4")]
 impl lifecycle::Guest for Kovela {
-    async fn on_load() {
-        startup().await;
-    }
+    // 设备列表只在用户动作后读取，加载时不做任何宿主调用。
+    async fn on_load() {}
 }
 #[cfg(feature = "api4")]
 impl event::Guest for Kovela {
@@ -1056,12 +1307,15 @@ impl event::Guest for Kovela {
     }
     async fn on_ui_event(id: String, event: ui::Event, payload: String) -> String {
         match dispatch_ui(&id, event, &payload) {
-            UiFollow::Refresh => load_devices().await,
+            UiFollow::Refresh => begin_scan().await,
+            UiFollow::Scan => load_devices().await,
             UiFollow::Activate => start_activation().await,
             UiFollow::None => {}
         }
         String::new()
     }
+    // 渲染回调里不做任何宿主调用，也不依赖"导出返回后继续运行"的
+    // 后台任务：设备列表一律由用户动作（刷新/输入/激活）触发读取。
     async fn on_ui_render(id: String) {
         bind_root(id);
     }
@@ -1069,48 +1323,54 @@ impl event::Guest for Kovela {
 }
 #[cfg(feature = "api4")]
 export!(Kovela);
+// Level 2/3 的导出都是同步函数，宿主不会驱动 `spawn` 出来的后台任务
+// （wit-bindgen 的 spawn 只在导出调用自身的执行期间被轮询），因此所有
+// 异步工作必须在导出内用 block_on 跑完。
+//
+// 返回的 future 只能"永不写入"（mem::forget 写端）：
+// - 在导出内 block_on 写它必然死锁——write 要等宿主读，宿主要等导出返回
+//   才拿到读端，宿主事件循环会报 "deadlock detected"；
+// - 直接 drop 写端也不行——wit-bindgen 的 Drop 会调度用默认值补写，
+//   唤醒时在无任务上下文里 panic。
+// 宿主并不读取这些返回值，未写入（挂起）正是参考项目在真机上的实际行为。
 #[cfg(not(feature = "api4"))]
 impl lifecycle::Guest for Kovela {
-    fn on_load() {
-        astrobox_ng_wit::spawn(async { startup().await });
-    }
+    // 设备列表只在用户动作后读取，加载时不做任何宿主调用。
+    fn on_load() {}
 }
 #[cfg(not(feature = "api4"))]
 impl event_v3::Guest for Kovela {
     fn on_event(kind: EventType, payload: String) -> FutureReader<String> {
         let (writer, reader) = astrobox_ng_wit::wit_future::new::<String>(String::new);
-        astrobox_ng_wit::spawn(async move {
+        astrobox_ng_wit::block_on(async move {
             dispatch_event(kind, payload).await;
-            let _ = writer.write(String::new()).await;
         });
+        std::mem::forget(writer);
         reader
     }
     fn on_ui_event_v3(id: String, event: ui::Event, payload: String) -> FutureReader<String> {
         let follow = dispatch_ui(&id, event, &payload);
         let (writer, reader) = astrobox_ng_wit::wit_future::new::<String>(String::new);
-        astrobox_ng_wit::spawn(async move {
+        astrobox_ng_wit::block_on(async move {
             match follow {
-                UiFollow::Refresh => load_devices().await,
+                UiFollow::Refresh => begin_scan().await,
+                UiFollow::Scan => load_devices().await,
                 UiFollow::Activate => start_activation().await,
                 UiFollow::None => {}
             }
-            let _ = writer.write(String::new()).await;
         });
+        std::mem::forget(writer);
         reader
     }
     fn on_ui_render(id: String) -> FutureReader<()> {
         let (writer, reader) = astrobox_ng_wit::wit_future::new::<()>(|| ());
         bind_root(id);
-        astrobox_ng_wit::spawn(async move {
-            let _ = writer.write(()).await;
-        });
+        std::mem::forget(writer);
         reader
     }
     fn on_card_render(_id: String) -> FutureReader<()> {
         let (writer, reader) = astrobox_ng_wit::wit_future::new::<()>(|| ());
-        astrobox_ng_wit::spawn(async move {
-            let _ = writer.write(()).await;
-        });
+        std::mem::forget(writer);
         reader
     }
 }
@@ -1151,4 +1411,70 @@ mod tests {
         assert!(normalize_order("123").is_err());
     }
 
+    #[test]
+    fn retries_hello_ten_times_before_giving_up() {
+        super::STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            s.handoff = Some(super::Handoff {
+                server_origin: "https://kovela.komoridevs.icu".into(),
+                handoff_token: "a".repeat(64),
+                product_id: "com.komoridev.billiard".into(),
+                product_name: "口袋台球".into(),
+            });
+            s.pending = Some(super::Pending {
+                id: "tick-target".into(),
+                addr: "AA:BB:CC:DD".into(),
+                device_id: None,
+                device_model: None,
+                issued: None,
+                ack: None,
+                reported: false,
+                phase: super::Phase::Hello,
+                hello_tries: 0,
+                install_retries: 0,
+            });
+        });
+        assert!(super::hello_tick("other-pending").is_none());
+        for _ in 0..10 {
+            let plan = super::hello_tick("tick-target");
+            assert!(matches!(plan, Some(Some(_))));
+        }
+        assert!(matches!(super::hello_tick("tick-target"), Some(None)));
+        super::STATE.with(|state| {
+            state.borrow_mut().pending.as_mut().unwrap().phase = super::Phase::Complete;
+        });
+        assert!(super::hello_tick("tick-target").is_none());
+    }
+
+    // 回归守卫：Level 2/3 的导出是同步函数，宿主不会轮询 `spawn` 出来的
+    // 后台任务（wit-bindgen 的 spawn 只在孕育它的 async 计算被 crank 期间
+    // 运行）。曾因此导致设备扫描从未执行、界面永远停在"正在读取设备列表"。
+    // v3 路径的一切异步工作必须走 block_on，这里直接扫源码防止回退。
+    #[test]
+    fn v3_path_never_spawns_background_tasks() {
+        let source = match std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return; // 发布打包环境里源码不可得时跳过
+            }
+            Err(error) => panic!("{error}"),
+        };
+        // 运行时拼装 needle，避免测试源码里的字面量自匹配。
+        let runtime = ["astrobox_ng_wit", "wit_bindgen"];
+        for crate_name in runtime {
+            let call = format!("{crate_name}::spawn(");
+            assert!(
+                !source.contains(&call),
+                "导出里禁止用 spawn 起后台任务：Level 2/3 的同步导出没人轮询这些任务（v4 也不要依赖返回后继续运行的任务），必须 block_on 或内联 await"
+            );
+        }
+        // 返回的 future 绝不能在导出内写入：write 要等宿主读、宿主要等导出
+        // 返回，循环等待会触发宿主 "deadlock detected" trap；drop 写端也会
+        // 因 wit-bindgen 的补写 panic。只能 mem::forget 让它保持挂起。
+        let write_call = format!("writer.{}", "write(");
+        assert!(
+            !source.contains(&write_call),
+            "禁止在导出内 block_on 写返回的 future（死锁），也不能 drop 写端（panic），只能 mem::forget"
+        );
+    }
 }

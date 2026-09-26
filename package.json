@@ -9,10 +9,10 @@
     "dev:worker": "pnpm --filter @kovela/worker dev",
     "build": "pnpm brand:build && pnpm --filter @kovela/web build && pnpm --filter @kovela/worker build",
     "build:plugin": "pnpm brand:build && python plugins/astrobox/package.py",
-    "build:vela": "pnpm prepare:vela && npm --prefix ../billiard run build && npm --prefix ../breakout run build && npm --prefix ../tank-turmoil run build",
+    "build:vela": "pnpm prepare:vela && npm --prefix ../billiard run build && npm --prefix ../tank-turmoil run build",
     "brand:build": "node scripts/prepare-brand.mjs",
     "typecheck": "pnpm -r --if-present typecheck",
-    "test": "node --import tsx --test apps/worker/tests/*.test.ts",
+    "test": "node --import tsx --test apps/worker/tests/*.test.ts packages/vela/tests/*.test.mjs",
     "format": "prettier --write apps packages scripts package.json pnpm-workspace.yaml tsconfig.base.json",
     "keys:create": "node scripts/generate-keys.mjs",
     "prepare:vela": "node scripts/prepare-vela.mjs"
