@@ -67,7 +67,24 @@ rustup target add wasm32-wasip2
 pnpm build:plugin
 ```
 
-产物是 `plugins/astrobox/dist/Kovela.abp`。推送插件源码，或手动运行 [`.github/workflows/plugin.yml`](.github/workflows/plugin.yml)，Actions 会执行同一条命令并上传这个包。
+产物是两套：
+
+| 路径 | 用途 |
+| --- | --- |
+| `plugins/astrobox/dist/kovela/` | **上架用**：AstroBox 2.0.0+（wasi 2 / api_level 3），含 `manifest.json`、`kovela_astrobox.wasm`、`icon.png`、`Kovela.abp` |
+| `plugins/astrobox/dist/kovela-v4/` | AstroBox 2.2.0+（wasi 3 / api_level 4），2.2.0 未发布前不上架 |
+
+每个目录里的 `.abp` 是给用户本地导入的完整包（不在 `additional_files` 里，商店不会下载它）；其余 `.abp` 仍被 `.gitignore` 排除。
+
+推送插件源码，或手动运行 [`.github/workflows/plugin.yml`](.github/workflows/plugin.yml)，Actions 会执行同一条命令，把两套产物提交回 `main` 并上传 `.abp`。
+
+### 上架 AstroBox 官方插件源
+
+聚合脚本（[`AstroBox-NG-Plugin-Repo`](https://github.com/AstralSightStudios/AstroBox-NG-Plugin-Repo) 的 `generate-index`）每 4 小时按**匿名 raw URL** 抓一次产物，因此仓库必须是公开的，且产物必须提交进 Git：
+
+- 仓库根目录的 [`index.txt`](index.txt) 列出存放 `manifest.json` 的文件夹（当前是 `plugins/astrobox/dist/kovela`）；空行和 `#` 行会被忽略，所以 v4 那行先注释着，2.2.0 发布后再放开。
+- 上架入口写在上游仓库的 `index.txt` 里：`https://raw.githubusercontent.com/KomoriDev/kovela/refs/heads/main/`。
+- 发版本时只改 `plugins/astrobox/manifest.json` 的 `version`（api4 那份由 `package.py` 覆盖 `wasi_version`/`api_level`），推上去等 Action 生效即可。
 
 ## 订单与私信
 

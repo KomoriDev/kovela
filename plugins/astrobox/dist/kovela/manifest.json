@@ -1,0 +1,20 @@
+{
+  "name": "Kovela",
+  "icon": "icon.png",
+  "version": "1.4.3",
+  "description": "验证购买并为 mi-vela 应用安全激活",
+  "author": "Komorebi",
+  "website": "https://kovela.komoridevs.icu",
+  "entry": "kovela_astrobox.wasm",
+  "wasi_version": 2,
+  "api_level": 3,
+  "permissions": [
+    "network",
+    "device",
+    "interconnect",
+    "thirdpartyapp",
+    "register_interconnect_recv",
+    "timer"
+  ],
+  "additional_files": []
+}

@@ -1,5 +1,11 @@
 node_modules/
 dist/
+# AstroBox 插件源按 raw URL 匿名抓取产物，上架目录必须入库；
+# 下面三行把 plugins/astrobox/dist 的两个变体目录重新放行（dist 根目录的产物仍忽略）。
+!plugins/astrobox/dist/
+plugins/astrobox/dist/*
+!plugins/astrobox/dist/kovela/
+!plugins/astrobox/dist/kovela-v4/
 .wrangler/
 .dev.vars
 .env
@@ -14,3 +20,6 @@ target/
 *.abp
 *.pem
 *.key
+# 上架目录里的 .abp 供别人本地导入，跟着仓库一起提交（其余 .abp 仍忽略）。
+!plugins/astrobox/dist/kovela/Kovela.abp
+!plugins/astrobox/dist/kovela-v4/Kovela-v4.abp

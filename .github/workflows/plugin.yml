@@ -8,11 +8,15 @@ on:
       - plugins/astrobox/**
       - assets/kovela.png
       - scripts/prepare-brand.mjs
+      - index.txt
       - .github/workflows/plugin.yml
 
 concurrency:
   group: astrobox-plugin-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: write
 
 jobs:
   package:
@@ -38,10 +42,21 @@ jobs:
           workspaces: plugins/astrobox
       - run: pnpm install --frozen-lockfile
       - run: pnpm build:plugin
+      - name: Commit store payload
+        run: |
+          git add --all plugins/astrobox/dist index.txt
+          if git diff --cached --quiet --exit-code; then
+            echo "AstroBox payload already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: publish AstroBox plugin artifacts"
+          git push
       - uses: actions/upload-artifact@v4
         with:
           name: Kovela-astrobox
           path: |
-            plugins/astrobox/dist/Kovela.abp
-            plugins/astrobox/dist/Kovela-v4.abp
+            plugins/astrobox/dist/kovela/Kovela.abp
+            plugins/astrobox/dist/kovela-v4/Kovela-v4.abp
           if-no-files-found: error
