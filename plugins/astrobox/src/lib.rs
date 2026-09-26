@@ -7,7 +7,7 @@ wit_bindgen::generate!({
 
 #[cfg(feature = "api4")]
 use astrobox::psys_host_v4::{
-    device, interconnect, notification, register, thirdpartyapp, timer, ui,
+    device, dialog, interconnect, notification, register, thirdpartyapp, timer, ui,
 };
 #[cfg(feature = "api4")]
 use exports::astrobox::psys_plugin_v4::{
@@ -18,7 +18,7 @@ use exports::astrobox::psys_plugin_v4::{
 use astrobox_ng_wit::FutureReader;
 #[cfg(not(feature = "api4"))]
 use astrobox_ng_wit::astrobox::psys_host::{
-    device, interconnect, register, thirdpartyapp, timer, ui_v3 as ui,
+    device, dialog, interconnect, register, thirdpartyapp, timer, ui_v3 as ui,
 };
 #[cfg(not(feature = "api4"))]
 use astrobox_ng_wit::exports::astrobox::psys_plugin::{
@@ -29,6 +29,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{cell::RefCell, time::Duration};
 use uuid::Uuid;
+
+mod theme;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,6 +96,12 @@ struct State {
 }
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
 struct Kovela;
+
+/// 官方群（QQ）加群链接，页脚的「加入官群」用它打开系统浏览器。
+const COMMUNITY_URL: &str = "https://qm.qq.com/q/JQRdtQcPIc";
+/// 页脚链接的点击事件 id。
+const COMMUNITY_EVENT: &str = "community";
+
 async fn host_register_recv(addr: &str, package: &str) -> Result<(), String> {
     #[cfg(feature = "api4")]
     {
@@ -364,6 +372,68 @@ fn set_phase(id: &str, phase: Phase, message: &str) -> bool {
 fn gate(element: ui::Element, locked: bool) -> ui::Element {
     if locked { element.disabled() } else { element }
 }
+
+/// 绑定回执里的设备标识前缀，用来在卡片上区分设备。
+/// 手环标识理应是十六进制串，但服务端给多短就显示多短，不在切片上 panic。
+fn short_device_id(id: &str) -> String {
+    id.chars().take(12).collect()
+}
+
+/// 绑定状态文案：查询结果里带设备标识就是已绑定。
+fn binding_text(bound_device_id: Option<&str>) -> String {
+    match bound_device_id {
+        Some(id) => format!("已绑定 {}", short_device_id(id)),
+        None => "尚未绑定".to_string(),
+    }
+}
+
+/// 所选商品的绑定状态：订单查询结果里就有，不用再问服务端。
+fn binding_note(offers: &[Offer], product_id: &str) -> String {
+    binding_text(
+        offers
+            .iter()
+            .find(|offer| offer.product_id == product_id)
+            .and_then(|offer| offer.bound_device_id.as_deref()),
+    )
+}
+
+/// 激活过程的四段动作，和 `Phase` 一一对应。
+const ACTIVATION_STEPS: [&str; 4] = ["连接设备", "签发许可证", "写入设备", "提交回执"];
+
+/// 商品卡片：标题 + 绑定状态 chip + 确认按钮。
+///
+/// 只有订单里含多个应用时才需要这张卡片——单个商品在查询成功时就自动接管了。
+fn offer_card(offer: &Offer, index: usize) -> ui::Element {
+    theme::card()
+        .child(
+            theme::row(theme::space::TWO)
+                .child(theme::section(&offer.product_name))
+                .child(theme::chip(&binding_text(offer.bound_device_id.as_deref()))),
+        )
+        .child(theme::outlined_button("确认", &format!("offer:{index}")))
+}
+
+/// 激活已经走到第几段（0 起算，等于段数表示全部走完）。
+fn activation_step(pending: Option<&Pending>) -> usize {
+    match pending.map(|item| item.phase) {
+        Some(Phase::Hello) => 0,
+        Some(Phase::Issuing) => 1,
+        Some(Phase::Installing) => 2,
+        Some(Phase::Reporting) => 3,
+        // 重试只是回到最近失败的那一段，不能把没走过的段落标成已完成。
+        Some(Phase::Retry) => {
+            if pending.is_some_and(|item| item.ack.is_some() && !item.reported) {
+                3 // 回执还没上报，重试会再上报一次
+            } else if pending.is_some_and(|item| item.issued.is_some()) {
+                2 // 许可证已拿到，重试是重发写入
+            } else {
+                0 // 还没连上设备，重试要从头握手
+            }
+        }
+        Some(Phase::Complete) | None => ACTIVATION_STEPS.len(),
+    }
+}
+
 fn render() {
     let (
         root,
@@ -374,7 +444,7 @@ fn render() {
         handoff,
         devices,
         selected,
-        phase,
+        pending,
         device_note,
         scanning,
         scan_tries,
@@ -389,16 +459,16 @@ fn render() {
             s.handoff.clone(),
             s.devices.clone(),
             s.selected,
-            s.pending.as_ref().map(|pending| pending.phase),
+            s.pending.clone(),
             s.device_note.clone(),
             s.scanning,
             s.scan_tries,
         )
     });
     let Some(root) = root else { return };
+    let phase = pending.as_ref().map(|item| item.phase);
     let active = phase.is_some_and(|phase| !matches!(phase, Phase::Retry | Phase::Complete));
     let complete = phase == Some(Phase::Complete);
-    let has_pending = phase.is_some();
     let ui_locked = verifying || active;
     let progress = match phase {
         Some(Phase::Hello) => Some(35),
@@ -413,162 +483,141 @@ fn render() {
     } else if let Some(item) = &handoff {
         item.product_name.clone()
     } else if !offers.is_empty() {
-        "查询结果".to_string()
+        "选择要激活的应用".to_string()
     } else if verifying {
         "正在查询".to_string()
     } else {
         "输入订单号".to_string()
     };
-    let mut page = ui::Element::new(ui::ElementType::Div, None)
-        .flex()
-        .flex_direction(ui::FlexDirection::Column)
-        .gap(12)
-        .padding(4)
-        .width_full();
-    page = page.child(ui::Element::new(ui::ElementType::P, Some(&heading)).size(22));
-    if !message.is_empty() {
-        page = page.child(ui::Element::new(ui::ElementType::P, Some(&message)).size(16));
-    } else if handoff.is_none() && offers.is_empty() {
-        page = page.child(
-            ui::Element::new(ui::ElementType::P, Some("请输入爱发电订单号")).size(14),
-        );
-    }
-    if let Some(value) = progress {
-        let label = value.to_string();
-        page = page.child(
-            ui::Element::new(ui::ElementType::Progress, None)
-                .width_full()
-                .prop("max", "100")
-                .prop("value", &label),
-        );
-    }
-    page = page
-        .child(gate(
-            ui::Element::new(ui::ElementType::Textarea, None)
-                .height(48)
-                .width_full()
-                .prop("placeholder", "爱发电订单号")
-                .on(ui::Event::Input, "order-input"),
-            ui_locked,
-        ))
-        .child(gate(
-            ui::Element::new(
-                ui::ElementType::Button,
-                Some(if verifying { "查询中…" } else { "查询订单" }),
-            )
-            .bg("#7c3aed")
-            .text_color("#ffffff")
-            .width_full()
-            .on(ui::Event::Click, "verify"),
-            ui_locked,
-        ));
-    // 设备信息贴在订单号下方：进插件就能看到宿主是否已识别到手环。
-    // 读取只由用户动作触发，没读过时给出中性提示，不显示假的进行中文案。
-    let device_status = if !device_note.is_empty() {
-        device_note.clone()
-    } else if scanning {
-        format!("正在读取设备列表…（第 {} 次）", scan_tries)
+    // 两步走：查到订单结果就进第二步（选设备 + 激活），商品由订单号带出来。
+    let step = if offers.is_empty() && handoff.is_none() && pending.is_none() {
+        1
     } else {
-        "点「刷新设备」读取手环列表".to_string()
+        2
     };
-    page = page.child(ui::Element::new(ui::ElementType::P, Some(&device_status)).size(14));
-    if devices.len() == 1 {
-        let (addr, name) = &devices[0];
-        let label = if name.trim().is_empty() {
-            format!("设备：{addr}")
-        } else {
-            format!("设备：{name}")
-        };
-        page = page.child(ui::Element::new(ui::ElementType::P, Some(&label)).size(16));
-    }
-    for (index, (addr, name)) in devices.iter().enumerate() {
-        if devices.len() < 2 {
-            break;
-        }
-        let label = if name.trim().is_empty() {
-            addr.clone()
-        } else if selected == Some(index) {
-            format!("已选择 {name}")
-        } else {
-            name.clone()
-        };
-        let mut button = ui::Element::new(ui::ElementType::Button, Some(&label))
-            .width_full()
-            .on(ui::Event::Click, &format!("device:{index}"));
-        if selected == Some(index) {
-            button = button.bg("#7c3aed").text_color("#ffffff");
-        }
-        page = page.child(gate(button, ui_locked));
-    }
-    page = page.child(gate(
-        ui::Element::new(ui::ElementType::Button, Some("刷新设备"))
-            .width_full()
-            .on(ui::Event::Click, "refresh"),
-        ui_locked,
-    ));
-    if !offers.is_empty() {
-        let summary = format!("订单 {order_no}");
-        page = page.child(ui::Element::new(ui::ElementType::P, Some(&summary)).size(16));
-        for offer in &offers {
-            let line = match offer.bound_device_id.as_deref() {
-                Some(id) => format!("{} · 已绑定 {}", offer.product_name, &id[..12]),
-                None => format!("{} · 尚未绑定", offer.product_name),
+    let mut page = theme::page()
+        .child(theme::steps(step))
+        .child(theme::headline(&heading));
+    match step {
+        1 => {
+            page = page.child(if message.is_empty() {
+                theme::label("请输入爱发电订单号")
+            } else {
+                theme::body(&message)
+            });
+            let verify_label = if verifying {
+                "查询中…"
+            } else {
+                "查询订单"
             };
-            page = page.child(ui::Element::new(ui::ElementType::P, Some(&line)).size(14));
+            let verify = gate(theme::filled_button(verify_label, "verify"), ui_locked);
+            page = page
+                .child(gate(theme::field("爱发电订单号", "order-input"), ui_locked))
+                .child(verify);
+        }
+        _ => {
+            if !message.is_empty() {
+                page = page.child(theme::body(&message));
+            }
+            match &handoff {
+                // 只有订单里含多个应用时才需要挑一个，单个商品查询成功就自动接管了。
+                None => {
+                    page = page.child(theme::label(&format!("订单 {order_no}")));
+                    for (index, offer) in offers.iter().enumerate() {
+                        page = page.child(gate(offer_card(offer, index), ui_locked));
+                    }
+                }
+                Some(item) => {
+                    page = page.child(
+                        theme::row(theme::space::TWO)
+                            .child(theme::section(&item.product_name))
+                            .child(theme::chip(&binding_note(&offers, &item.product_id))),
+                    );
+                    if pending.is_some() {
+                        // 激活进行中：进度条 + 四段动作逐段点亮。
+                        if let Some(value) = progress {
+                            page = page.child(theme::progress(value));
+                        }
+                        let reached = activation_step(pending.as_ref());
+                        for (index, label) in ACTIVATION_STEPS.iter().enumerate() {
+                            let state = match index.cmp(&reached) {
+                                std::cmp::Ordering::Less => theme::StepState::Done,
+                                std::cmp::Ordering::Equal => theme::StepState::Current,
+                                std::cmp::Ordering::Greater => theme::StepState::Upcoming,
+                            };
+                            page = page.child(theme::substep(label, state));
+                        }
+                    } else {
+                        // 设备信息只在选设备时占版面。
+                        let device_status = if !device_note.is_empty() {
+                            device_note.clone()
+                        } else if scanning {
+                            format!("正在读取设备列表…（第 {} 次）", scan_tries)
+                        } else {
+                            "点「刷新设备」读取手环列表".to_string()
+                        };
+                        page = page.child(theme::status(&device_status));
+                        if devices.len() == 1 {
+                            let (addr, name) = &devices[0];
+                            let label = if name.trim().is_empty() {
+                                format!("设备：{addr}")
+                            } else {
+                                format!("设备：{name}")
+                            };
+                            page = page.child(theme::body(&label));
+                        }
+                        for (index, (addr, name)) in devices.iter().enumerate() {
+                            if devices.len() < 2 {
+                                break;
+                            }
+                            let label = if name.trim().is_empty() {
+                                addr.clone()
+                            } else if selected == Some(index) {
+                                format!("已选择 {name}")
+                            } else {
+                                name.clone()
+                            };
+                            let event = format!("device:{index}");
+                            let button = if selected == Some(index) {
+                                theme::tonal_button(&label, &event)
+                            } else {
+                                theme::outlined_button(&label, &event)
+                            };
+                            page = page.child(gate(button, ui_locked));
+                        }
+                        page = page.child(gate(
+                            theme::outlined_button("刷新设备", "refresh"),
+                            ui_locked,
+                        ));
+                    }
+                    let action = if complete {
+                        "已激活"
+                    } else if phase == Some(Phase::Retry) {
+                        "重试"
+                    } else if active {
+                        "激活中…"
+                    } else {
+                        "激活"
+                    };
+                    page = page.child(gate(
+                        theme::filled_button(action, "activate"),
+                        ui_locked || complete || selected.is_none(),
+                    ));
+                }
+            }
+            let cancel = if complete {
+                "重新开始"
+            } else {
+                "重新输入"
+            };
+            page = page.child(gate(theme::text_button(cancel, "cancel"), ui_locked));
         }
     }
-    for (index, offer) in offers.iter().enumerate() {
-        let chosen = handoff
-            .as_ref()
-            .is_some_and(|item| item.product_id == offer.product_id);
-        let label = match offer.bound_device_id.as_deref() {
-            Some(id) => format!(
-                "{} {} · {}…",
-                if chosen { "已确认" } else { "确认" },
-                offer.product_name,
-                &id[..12]
-            ),
-            None => format!(
-                "{} {}",
-                if chosen { "已确认" } else { "确认" },
-                offer.product_name
-            ),
-        };
-        let mut button = ui::Element::new(ui::ElementType::Button, Some(&label))
-            .width_full()
-            .on(ui::Event::Click, &format!("offer:{index}"));
-        if chosen {
-            button = button.bg("#7c3aed").text_color("#ffffff");
-        }
-        page = page.child(gate(button, ui_locked));
-    }
-    if handoff.is_some() {
-        let action = if complete {
-            "已激活"
-        } else if has_pending {
-            "重试"
-        } else {
-            "激活"
-        };
-        page = page
-            .child(ui::Element::new(ui::ElementType::Separator, None).width_full())
-            .child(gate(
-                ui::Element::new(ui::ElementType::Button, Some(action))
-                    .bg("#7c3aed")
-                    .text_color("#ffffff")
-                    .width_full()
-                    .on(ui::Event::Click, "activate"),
-                ui_locked || complete || selected.is_none(),
-            ));
-    }
-    if !offers.is_empty() || handoff.is_some() {
-        page = page.child(gate(
-            ui::Element::new(ui::ElementType::Button, Some("取消"))
-                .width_full()
-                .on(ui::Event::Click, "cancel"),
-            ui_locked,
-        ));
-    }
+    page = page.child(theme::divider()).child(theme::footer(
+        "对应用有疑问？",
+        "加入官群",
+        COMMUNITY_EVENT,
+    ));
     ui::render(&root, page);
 }
 
@@ -781,15 +830,25 @@ fn finish_lookup() {
     ) {
         Ok(value) => match parse_offers(&value) {
             Ok(offers) => {
+                // 订单号本身就决定了商品：只有一个就直接接管，多于一个才让用户挑。
+                let single = offers.len() == 1;
                 STATE.with(|state| {
                     let mut s = state.borrow_mut();
                     s.verifying = false;
                     s.pending = None;
                     s.handoff = None;
                     s.offers = offers;
-                    s.message = "请点击下方应用完成激活，已绑定的应用仅可在原设备上重新传输".into();
+                    s.message = if single {
+                        String::new()
+                    } else {
+                        "这个订单包含多个应用，请选择要激活的那个".into()
+                    };
                 });
-                render();
+                if single {
+                    confirm_offer(0);
+                } else {
+                    render();
+                }
             }
             Err(error) => {
                 STATE.with(|state| state.borrow_mut().verifying = false);
@@ -1222,6 +1281,11 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
             UiFollow::None
         };
     }
+    // 页脚链接和订单流程无关，锁定时也要能点。
+    if matches!(event, ui::Event::Click) && id == COMMUNITY_EVENT {
+        dialog::open_url(COMMUNITY_URL);
+        return UiFollow::None;
+    }
     if !matches!(event, ui::Event::Click) || locked() {
         return UiFollow::None;
     }
@@ -1244,6 +1308,10 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         queue_lookup();
         if STATE.with(|state| state.borrow().verifying) {
             finish_lookup();
+            // 商品已由订单号确定，顺手把设备列表也读出来，下一步就能直接激活。
+            if STATE.with(|state| state.borrow().handoff.is_some()) {
+                return UiFollow::Refresh;
+            }
         } else {
             render();
         }
@@ -1444,6 +1512,81 @@ mod tests {
             state.borrow_mut().pending.as_mut().unwrap().phase = super::Phase::Complete;
         });
         assert!(super::hello_tick("tick-target").is_none());
+    }
+
+    fn pending_at(phase: super::Phase, ack: Option<bool>, reported: bool) -> super::Pending {
+        super::Pending {
+            id: "pending".into(),
+            addr: "addr".into(),
+            device_id: None,
+            device_model: None,
+            issued: Some(super::Issued {
+                license_id: "license".into(),
+                license_token: "KV1.token".into(),
+                receipt_token: "b".repeat(64),
+                product_id: "com.komoridev.billiard".into(),
+                device_id: "0816d5a8023c11".into(),
+            }),
+            ack,
+            reported,
+            phase,
+            hello_tries: 0,
+            install_retries: 0,
+        }
+    }
+
+    #[test]
+    fn shows_the_binding_state_of_the_chosen_product() {
+        let bound = super::Offer {
+            product_id: "com.komoridev.billiard".into(),
+            product_name: "口袋台球".into(),
+            handoff_token: "token".into(),
+            bound_device_id: Some("0816d5a8023c11".into()),
+        };
+        let unbound = super::Offer {
+            bound_device_id: None,
+            ..bound.clone()
+        };
+        // 商品由订单号带出，绑定状态也一并来自查询结果。
+        assert_eq!(
+            super::binding_note(std::slice::from_ref(&bound), "com.komoridev.billiard"),
+            "已绑定 0816d5a8023c"
+        );
+        assert_eq!(
+            super::binding_note(std::slice::from_ref(&unbound), "com.komoridev.billiard"),
+            "尚未绑定"
+        );
+        assert_eq!(
+            super::binding_note(std::slice::from_ref(&bound), "com.komoridev.other"),
+            "尚未绑定"
+        );
+    }
+
+    #[test]
+    fn activation_steps_follow_the_phase() {
+        let phases = [
+            (super::Phase::Hello, 0),
+            (super::Phase::Issuing, 1),
+            (super::Phase::Installing, 2),
+            (super::Phase::Reporting, 3),
+            (super::Phase::Complete, 4),
+        ];
+        for (phase, expected) in phases {
+            let pending = pending_at(phase, None, false);
+            assert_eq!(super::activation_step(Some(&pending)), expected);
+        }
+        assert_eq!(super::activation_step(None), 4);
+        // 重试回到最近失败的那一段：回执还没上报就重试上报，否则重发写入，
+        // 许可证都没拿到时要从头握手，不能把没走过的段落标成已完成。
+        let retry_report = pending_at(super::Phase::Retry, Some(true), false);
+        assert_eq!(super::activation_step(Some(&retry_report)), 3);
+        let retry_install = pending_at(super::Phase::Retry, Some(false), true);
+        assert_eq!(super::activation_step(Some(&retry_install)), 2);
+        let retry_connect = super::Pending {
+            issued: None,
+            ..pending_at(super::Phase::Retry, None, false)
+        };
+        assert_eq!(super::activation_step(Some(&retry_connect)), 0);
     }
 
     // 回归守卫：Level 2/3 的导出是同步函数，宿主不会轮询 `spawn` 出来的

@@ -60,6 +60,8 @@ pnpm --filter @kovela/worker deploy
 
 ## AstroBox 插件
 
+插件 UI 走 Material Design 3（深色）令牌，配色、圆角、间距与字号集中在 `plugins/astrobox/src/theme.rs`；宿主把插件页面固定在 `#191919` 深色容器里渲染，所以不跟随宿主应用级主题。
+
 本地打包需要 Rust stable 和 `wasm32-wasip2` 目标：
 
 ```bash
