@@ -1,8 +1,9 @@
-// 计时反馈回路：结论（ready）延迟受哪条腿支配。
+// 计时反馈回路：启动时授权结论（ready）的延迟。
 // 用法：node tests/latency.bench.mjs
-// 判据：本机存有有效授权且设备指纹缓存命中时，结论延迟应只取决于
-// storage.get，与 device.getDeviceId（真机上秒级的系统服务往返）无关。
-// 没有缓存的首启仍要等真实标识，属预期，仅打印参考。
+// 判据：无论本机有没有授权记录，启动结论都只取决于 storage.get（串行
+// 1–3 次）加纯 CPU 验签，与 device.getDeviceId 的响应速度完全无关——
+// 真机上它被拥堵拖到半分钟也不该影响启动。设备服务一旦在启动链路里
+// 被调用，这里的假端口会直接抛错。
 import { performance } from "node:perf_hooks";
 import { createPrivateKey, createPublicKey, sign } from "node:crypto";
 import { deviceFingerprint, verifyLicense } from "@kovela/license";
@@ -10,8 +11,9 @@ import { createActivation } from "../src/index.js";
 
 const PRODUCT = "com.example.game";
 const RAW_DEVICE = "raw-device-0001";
-const TOKEN_KEY = "kovela_license_v1";
-const DEVICE_KEY = "kovela_device_v1";
+const LICENSE_KEY = "kovela_license_v2";
+const LEGACY_TOKEN_KEY = "kovela_license_v1";
+const LEGACY_DEVICE_KEY = "kovela_device_v1";
 const seed = Buffer.alloc(32, 7);
 const signingKey = createPrivateKey({
   key: Buffer.concat([
@@ -63,27 +65,30 @@ const token = mint(fingerprint);
   );
 }
 
-// —— 状态机结论延迟（可调端口延迟） ——
-function runOnce(idDelayMs, storageDelayMs, cachedDevice) {
+function runOnce(storageDelayMs, files) {
   return new Promise((resolve) => {
     let readyAt = 0;
     let startedAt = 0;
+    let busy = false;
     const activation = createActivation(PRODUCT, publicKey, {
       device: {
-        getDeviceId(options) {
-          setTimeout(
-            () => options.success({ deviceId: RAW_DEVICE }),
-            idDelayMs,
-          );
+        getDeviceId() {
+          throw new Error("启动链路不允许调用 getDeviceId");
         },
-        getInfo(options) {
-          setTimeout(() => options.success({}), idDelayMs);
+        getInfo() {
+          throw new Error("启动链路不允许调用 getInfo");
         },
       },
       storage: {
         get(options) {
-          const value = options.key === DEVICE_KEY ? cachedDevice : token;
-          setTimeout(() => options.success(value), storageDelayMs);
+          if (busy) throw new Error("存储请求必须串行");
+          busy = true;
+          setTimeout(() => {
+            busy = false;
+            options.success(
+              files.has(options.key) ? files.get(options.key) : "",
+            );
+          }, storageDelayMs);
         },
         set() {},
       },
@@ -101,50 +106,44 @@ function runOnce(idDelayMs, storageDelayMs, cachedDevice) {
   });
 }
 
-console.log(
-  "首启（无缓存，预期陪 getDeviceId 等全程；storage=5ms）→ 结论延迟：",
-);
-for (const idDelay of [100, 3000]) {
-  const sample = await runOnce(idDelay, 5, "");
-  console.log(
-    "  getDeviceId " +
-      String(idDelay).padStart(5) +
-      "ms → 结论 " +
-      sample.activated +
-      "，延迟 " +
-      sample.verdictMs.toFixed(0) +
-      "ms",
-  );
-}
+const STORAGE = 5;
+const scenarios = [
+  ["本机无授权（未激活结论也应立即可得）", new Map(), false],
+  [
+    "旧版迁移（v1 授权串+指纹缓存，3 次串行读取）",
+    new Map([
+      [LEGACY_TOKEN_KEY, token],
+      [LEGACY_DEVICE_KEY, fingerprint],
+    ]),
+    true,
+  ],
+  [
+    // 启动路径：只读一次本机记录，不跑验签（签名只在激活握手验一次）。
+    "v2 记录命中（1 次读取，不验签）",
+    new Map([[LICENSE_KEY, JSON.stringify({ token, device: fingerprint })]]),
+    true,
+  ],
+];
 
-console.log(
-  "再次进入（指纹缓存命中，结论不该被 getDeviceId 拖住；storage=5ms）→ 结论延迟：",
-);
-const cacheHit = [];
-for (const idDelay of [5, 100, 300, 1000, 3000]) {
-  const sample = await runOnce(idDelay, 5, fingerprint);
-  cacheHit.push(sample.verdictMs);
-  console.log(
-    "  getDeviceId " +
-      String(idDelay).padStart(5) +
-      "ms → 结论 " +
-      sample.activated +
-      "，延迟 " +
-      sample.verdictMs.toFixed(0) +
-      "ms",
-  );
+let worst = 0;
+for (const [title, files, expectActivated] of scenarios) {
+  const samples = [];
+  for (let i = 0; i < 5; i += 1) {
+    const sample = await runOnce(STORAGE, files);
+    if (expectActivated !== null && sample.activated !== expectActivated) {
+      console.log("RED：" + title + " 结论 activated=" + sample.activated);
+      process.exit(1);
+    }
+    samples.push(sample.verdictMs);
+  }
+  const slowest = Math.max(...samples);
+  if (expectActivated) worst = Math.max(worst, slowest);
+  console.log(title + " → 结论延迟 " + slowest.toFixed(0) + "ms（5 次最差）");
 }
-const worst = Math.max(...cacheHit);
 if (worst < 200) {
-  console.log(
-    "GREEN：缓存命中时结论延迟 " +
-      worst.toFixed(0) +
-      "ms，与 getDeviceId 延迟无关",
-  );
+  console.log("GREEN：启动结论与设备服务无关，最差 " + worst.toFixed(0) + "ms");
   process.exit(0);
 } else {
-  console.log(
-    "RED：缓存命中后结论仍要等 getDeviceId（最差 " + worst.toFixed(0) + "ms）",
-  );
+  console.log("RED：启动结论被拖慢（最差 " + worst.toFixed(0) + "ms）");
   process.exit(1);
 }

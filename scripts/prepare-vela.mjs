@@ -11,8 +11,7 @@ if (!/^[a-f0-9]{64}$/i.test(publicKey)) {
   );
 }
 const targets = process.argv.slice(2);
-if (!targets.length)
-  targets.push("../billiard", "../tank-turmoil");
+if (!targets.length) targets.push("../billiard", "../tank-turmoil");
 for (const directory of targets) {
   const application = path.resolve(root, directory);
   const manifest = JSON.parse(
