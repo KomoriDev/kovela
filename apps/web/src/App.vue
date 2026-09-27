@@ -17,71 +17,42 @@ import {
   Sun,
   Watch,
 } from "@lucide/vue";
-import type { ActivationStatus, PublicConfig, VerifiedOrder } from "@kovela/protocol";
+import type { LookupOrderResult, PublicConfig } from "@kovela/protocol";
 import { useContext } from "./context";
 import Button from "./components/ui/Button.vue";
 import Input from "./components/ui/Input.vue";
 import Label from "./components/ui/Label.vue";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "./components/ui/select";
 import Faq from "./components/Faq.vue";
-import Turnstile from "./components/Turnstile.vue";
 
 const client = useContext().kovela;
 const config = ref<PublicConfig>();
-const productId = ref("");
-const selectedProduct = computed(() =>
-  config.value?.products.find(
-    (product) => product.productId === productId.value,
-  ),
+const availableProducts = computed(() =>
+  (config.value?.products ?? []).filter((product) => product.available),
 );
-const canVerify = computed(
+const supportedNames = computed(
   () =>
-    !!config.value?.verificationEnabled && !!selectedProduct.value?.available,
+    availableProducts.value.map((product) => product.productName).join(" · ") ||
+    "MI-VELA 应用",
 );
+const canVerify = computed(() => !!config.value?.verificationEnabled);
 const orderNo = ref("");
-const verified = ref<VerifiedOrder>();
-const status = ref<ActivationStatus>();
+const order = ref<LookupOrderResult>();
+const allBound = computed(
+  () =>
+    !!order.value &&
+    order.value.items.length > 0 &&
+    order.value.items.every((item) => item.boundDeviceId),
+);
 const loading = ref(false);
 const error = ref("");
-const statusError = ref("");
 const configError = ref("");
-const turnstileToken = ref("");
-const resetKey = ref(0);
 const dark = ref(false);
 let request = new AbortController();
-let poll: ReturnType<typeof setTimeout> | undefined;
-let disposed = false;
-const finished = computed(() => status.value?.state === "activated");
-const statusTitle = computed(
-  () =>
-    ({
-      ready: "等待 AstroBox 连接",
-      issued: "许可证已签发，等待设备确认",
-      activated: "设备已确认激活",
-      failed: "设备未能完成激活",
-    })[status.value?.state ?? "ready"],
-);
 
 async function loadConfig() {
   configError.value = "";
   try {
     config.value = await client.getConfig(request.signal);
-    if (
-      !config.value.products.some(
-        (product) => product.productId === productId.value,
-      )
-    )
-      productId.value =
-        (
-          config.value.products.find((product) => product.available) ??
-          config.value.products[0]
-        )?.productId ?? "";
   } catch (cause) {
     if (!request.signal.aborted)
       configError.value =
@@ -100,74 +71,32 @@ function changeTheme() {
 function resetSession() {
   request.abort();
   request = new AbortController();
-  clearTimeout(poll);
-  verified.value = undefined;
-  status.value = undefined;
-  statusError.value = "";
+  order.value = undefined;
   error.value = "";
 }
-async function verify() {
+async function lookup() {
   if (loading.value || !config.value || !canVerify.value) return;
-  resetSession();
-  const order = orderNo.value.trim();
-  if (!/^\d{16,32}$/.test(order)) {
+  const value = orderNo.value.trim();
+  if (!/^\d{16,32}$/.test(value)) {
     error.value = "请输入 16～32 位数字的爱发电订单号。";
     return;
   }
-  if (config.value.turnstileSiteKey && !turnstileToken.value) {
-    error.value = "请先完成人机验证。";
-    return;
-  }
+  request.abort();
+  request = new AbortController();
+  error.value = "";
   loading.value = true;
   try {
-    verified.value = await client.verifyOrder(
-      {
-        orderNo: order,
-        productId: productId.value,
-        turnstileToken: turnstileToken.value || undefined,
-      },
+    order.value = await client.lookupOrder(
+      { orderNo: value },
       request.signal,
     );
-    status.value = {
-      state: "ready",
-      deviceId: verified.value.boundDeviceId,
-      notification: "none",
-    };
-    void refreshStatus();
   } catch (cause) {
     if (!request.signal.aborted)
       error.value =
-        cause instanceof Error ? cause.message : "订单验证失败，请重试。";
+        cause instanceof Error ? cause.message : "订单查询失败，请重试。";
   } finally {
     loading.value = false;
-    resetKey.value += 1;
   }
-}
-async function refreshStatus() {
-  clearTimeout(poll);
-  const session = verified.value;
-  if (!session || disposed) return;
-  statusError.value = "";
-  const signal = request.signal;
-  try {
-    const current = await client.status(session.statusToken, signal);
-    if (disposed || signal.aborted || verified.value !== session) return;
-    status.value = current;
-  } catch (cause) {
-    if (signal.aborted || disposed || verified.value !== session) return;
-    statusError.value =
-      cause instanceof Error ? cause.message : "暂时无法获取状态。";
-  }
-  if (disposed || verified.value !== session) return;
-  if (Date.now() >= (session.expiresAt + 3600) * 1000) {
-    statusError.value = "本次状态查询已过期，请重新验证订单。";
-    return;
-  }
-  if (
-    status.value?.state !== "activated" ||
-    status.value.notification !== "sent"
-  )
-    poll = setTimeout(refreshStatus, 4000);
 }
 onMounted(() => {
   try {
@@ -179,9 +108,7 @@ onMounted(() => {
   void loadConfig();
 });
 onBeforeUnmount(() => {
-  disposed = true;
   request.abort();
-  clearTimeout(poll);
 });
 </script>
 
@@ -244,7 +171,7 @@ onBeforeUnmount(() => {
             每一份支持，<br />都值得<span class="text-primary">完整体验。</span>
           </h1>
           <p class="mt-6 max-w-sm text-[15px] leading-8 text-muted-foreground">
-            感谢你在爱发电的支持。验证订单，<br class="hidden sm:block" />通过
+            感谢你在爱发电的支持。查询订单信息，<br class="hidden sm:block" />通过
             AstroBox，为你的手环解锁完整应用。
           </p>
           <div
@@ -266,11 +193,9 @@ onBeforeUnmount(() => {
               <Sparkles class="size-6" />
             </div>
             <div>
-              <p class="text-sm font-medium">
-                {{ selectedProduct?.productName ?? "MI-VELA 应用" }}
-              </p>
+              <p class="text-sm font-medium">{{ supportedNames }}</p>
               <p class="mt-1 text-xs text-muted-foreground">
-                选择你购买或兑换的应用，领取专属设备授权。
+                购买后凭爱发电订单号即可激活。
               </p>
             </div>
           </div>
@@ -278,31 +203,25 @@ onBeforeUnmount(() => {
 
         <section
           class="card-shadow relative min-w-0 rounded-[24px] border border-border bg-card p-5 sm:p-8"
-          aria-label="订单验证"
+          aria-label="订单查询"
         >
           <div class="mb-7 flex items-start justify-between">
             <div>
               <div
                 class="mb-4 flex size-11 items-center justify-center rounded-2xl bg-violet-50 text-primary dark:bg-violet-400/10"
               >
-                <CheckCheck v-if="finished" /><KeyRound v-else />
+                <CheckCheck v-if="allBound" /><KeyRound v-else />
               </div>
               <h2 class="text-xl font-semibold">
-                {{
-                  finished
-                    ? "完整体验，已为你开启"
-                    : verified
-                      ? "订单已验证"
-                      : "验证你的订单"
-                }}
+                {{ order ? "订单信息" : "查询你的订单" }}
               </h2>
               <p class="mt-2 text-sm text-muted-foreground">
                 {{
-                  finished
-                    ? "本设备授权已保存，可离线使用。"
-                    : verified
-                      ? "接下来，把授权安全地传给设备。"
-                      : "选择订单对应的应用，再输入爱发电订单号。"
+                  order
+                    ? allBound
+                      ? "订单内的应用均已绑定设备。"
+                      : "本订单包含以下应用的授权。"
+                    : "输入爱发电订单号，查看包含的应用与绑定状态。"
                 }}
               </p>
             </div>
@@ -322,192 +241,141 @@ onBeforeUnmount(() => {
               >重新连接</Button
             >
           </div>
-          <form
-            v-else-if="!verified"
-            class="space-y-5"
-            @submit.prevent="verify"
-          >
-            <div v-if="config?.products.length" class="space-y-2.5">
-              <Label for="product">订单对应的应用</Label>
-              <Select
-                v-model="productId"
-                name="productId"
-                :disabled="loading"
-                @update:model-value="resetSession"
-              >
-                <SelectTrigger
-                  id="product"
-                  class="w-full min-w-0 rounded-xl text-base data-[size=default]:h-12 sm:text-sm"
-                >
-                  <SelectValue placeholder="选择订单对应的应用" />
-                </SelectTrigger>
-                <SelectContent
-                  class="w-[var(--reka-select-trigger-width)] max-w-[calc(100vw-2rem)]"
-                  :collision-padding="16"
-                >
-                  <SelectItem
-                    v-for="product in config.products"
-                    :key="product.productId"
-                    :value="product.productId"
-                  >
-                    {{ product.productName
-                    }}{{ product.available ? "" : "（尚未开放）" }}
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div
-              v-if="config && !canVerify"
-              role="status"
-              class="rounded-xl border border-violet-200/60 bg-violet-50/60 p-4 text-sm leading-7 text-violet-800 dark:border-violet-400/20 dark:bg-violet-400/5 dark:text-violet-200"
+          <template v-else>
+            <form
+              v-if="!order"
+              class="space-y-5"
+              @submit.prevent="lookup"
             >
-              网站已上线，{{
-                config.verificationEnabled
-                  ? "所选应用尚未开放订单验证。"
-                  : "订单验证暂未开放，正在完成服务配置。"
-              }}请稍后再来。
-            </div>
-            <div class="space-y-2.5">
-              <Label for="order-number">爱发电订单号</Label
-              ><Input
-                id="order-number"
-                v-model="orderNo"
-                class="text-base sm:text-sm"
-                name="orderNo"
-                inputmode="numeric"
-                autocomplete="off"
-                spellcheck="false"
-                maxlength="32"
-                placeholder="粘贴你的爱发电订单号"
-                :disabled="loading || !canVerify"
-                :aria-invalid="!!error"
-                aria-describedby="order-help order-error"
-              />
-              <p
-                id="order-help"
-                class="flex items-center gap-1.5 text-xs text-muted-foreground"
+              <div
+                v-if="config && !canVerify"
+                role="status"
+                class="rounded-xl border border-violet-200/60 bg-violet-50/60 p-4 text-sm leading-7 text-violet-800 dark:border-violet-400/20 dark:bg-violet-400/5 dark:text-violet-200"
               >
-                <CircleHelp class="size-3.5" /> 在「爱发电 → 我的订单 →
-                订单详情」中查看
+                网站已上线，订单查询暂未开放，正在完成服务配置。请稍后再来。
+              </div>
+              <div class="space-y-2.5">
+                <Label for="order-number">爱发电订单号</Label
+                ><Input
+                  id="order-number"
+                  v-model="orderNo"
+                  class="text-base sm:text-sm"
+                  name="orderNo"
+                  inputmode="numeric"
+                  autocomplete="off"
+                  spellcheck="false"
+                  maxlength="32"
+                  placeholder="粘贴你的爱发电订单号"
+                  :disabled="loading || !canVerify"
+                  :aria-invalid="!!error"
+                  aria-describedby="order-help order-error"
+                />
+                <p
+                  id="order-help"
+                  class="flex items-center gap-1.5 text-xs text-muted-foreground"
+                >
+                  <CircleHelp class="size-3.5" /> 在「爱发电 → 我的订单 →
+                  订单详情」中查看
+                </p>
+              </div>
+              <Button
+                type="submit"
+                class="w-full"
+                :disabled="loading || !canVerify"
+                ><LoaderCircle v-if="loading || !config" class="animate-spin" />{{
+                  loading
+                    ? "正在查询订单…"
+                    : !config
+                      ? "正在连接服务…"
+                      : !canVerify
+                        ? "订单查询尚未开放"
+                        : "查询订单"
+                }}<ArrowRight v-if="!loading && canVerify" class="ml-auto"
+              /></Button>
+              <p
+                class="flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground"
+              >
+                <LockKeyhole class="size-3" />
+                无需提供爱发电密码或支付密码
               </p>
+            </form>
+
+            <div v-else class="space-y-5">
+              <div
+                class="rounded-xl border border-violet-200/60 bg-violet-50/60 p-4 dark:border-violet-400/20 dark:bg-violet-400/5"
+              >
+                <p
+                  class="flex items-center gap-2 text-sm font-medium text-primary"
+                >
+                  <ShieldCheck class="size-4" />订单已确认
+                </p>
+                <p
+                  class="mt-2 truncate font-mono text-xs text-muted-foreground"
+                >
+                  {{ order.orderNo }}
+                </p>
+              </div>
+              <div
+                v-for="item in order.items"
+                :key="item.productId"
+                class="flex items-center justify-between gap-3 rounded-xl border border-border p-4"
+              >
+                <p class="min-w-0 truncate text-sm font-medium">
+                  {{ item.productName }}
+                </p>
+                <span
+                  class="shrink-0 rounded-full px-2.5 py-1 text-xs font-medium"
+                  :class="
+                    item.boundDeviceId
+                      ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300'
+                      : 'bg-muted text-muted-foreground'
+                  "
+                  >{{
+                    item.boundDeviceId
+                      ? `已绑定 ${item.boundDeviceId.slice(0, 12)}…`
+                      : "尚未绑定"
+                  }}</span
+                >
+              </div>
+              <p class="text-xs leading-6 text-muted-foreground">
+                {{
+                  allBound
+                    ? "如需重装应用或重新传输许可证，在插件中输入同一订单号即可。"
+                    : "打开 AstroBox 的 Kovela 插件，输入同一订单号，选择手环即可完成激活。"
+                }}
+              </p>
+              <Button
+                type="button"
+                variant="ghost"
+                class="w-full"
+                :disabled="loading"
+                @click="lookup"
+                ><LoaderCircle v-if="loading" class="animate-spin" />重新查询</Button
+              >
+              <button
+                type="button"
+                class="w-full text-center text-xs text-muted-foreground transition-colors hover:text-foreground"
+                @click="resetSession"
+              >
+                查询其他订单
+              </button>
             </div>
-            <Turnstile
-              v-if="canVerify && config?.turnstileSiteKey"
-              :site-key="config.turnstileSiteKey"
-              :reset-key="resetKey"
-              :theme="dark ? 'dark' : 'light'"
-              @token="turnstileToken = $event"
-              @error="error = $event"
-            />
             <p
               v-if="error"
               id="order-error"
               role="alert"
-              class="rounded-lg bg-red-50 px-3 py-2 text-sm leading-6 text-red-700 dark:bg-red-500/10 dark:text-red-300"
+              class="mt-5 rounded-lg bg-red-50 px-3 py-2 text-sm leading-6 text-red-700 dark:bg-red-500/10 dark:text-red-300"
             >
               {{ error }}
             </p>
-            <Button
-              type="submit"
-              class="w-full"
-              :disabled="loading || !canVerify"
-              ><LoaderCircle v-if="loading || !config" class="animate-spin" />{{
-                loading
-                  ? "正在验证订单…"
-                  : !config
-                    ? "正在连接服务…"
-                    : !canVerify
-                      ? "订单验证尚未开放"
-                      : "验证订单"
-              }}<ArrowRight v-if="!loading && canVerify" class="ml-auto"
-            /></Button>
-            <p
-              class="flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground"
-            >
-              <LockKeyhole class="size-3" />
-              无需提供爱发电密码或支付密码
-            </p>
-          </form>
-
-          <div v-else class="space-y-5">
-            <div
-              class="rounded-xl border border-violet-200/60 bg-violet-50/60 p-4 dark:border-violet-400/20 dark:bg-violet-400/5"
-            >
-              <p
-                class="flex items-center gap-2 text-sm font-medium text-primary"
-              >
-                <ShieldCheck class="size-4" />{{ verified.productName }} ·
-                订单已确认
-              </p>
-              <p class="mt-2 truncate font-mono text-xs text-muted-foreground">
-                {{ verified.orderNo }}
-              </p>
-            </div>
-            <p
-              v-if="verified.boundDeviceId"
-              class="text-xs leading-6 text-muted-foreground"
-            >
-              此订单的应用授权已绑定设备
-              {{
-                verified.boundDeviceId.slice(0, 12)
-              }}…，只能为同一设备重新传输许可证。
-            </p>
-            <template v-if="!finished">
-              <p class="text-xs leading-6 text-muted-foreground">
-                打开 AstroBox 的 Kovela，输入同一订单号。插件会查出对应应用，确认后即可选择手环激活。
-              </p>
-            </template>
-            <div aria-live="polite" class="rounded-xl border border-border p-4">
-              <p class="flex items-center gap-2 text-sm font-medium">
-                <CheckCheck
-                  v-if="finished"
-                  class="size-4 text-emerald-600"
-                /><LoaderCircle
-                  v-else-if="status?.state !== 'failed'"
-                  class="size-4 animate-spin text-primary"
-                /><CircleHelp v-else class="size-4 text-amber-600" />{{
-                  statusTitle
-                }}
-              </p>
-              <p class="mt-2 text-xs leading-6 text-muted-foreground">
-                {{
-                  finished
-                    ? status?.notification === "sent"
-                      ? "激活结果已通过爱发电私信发送。现在可以离线使用应用。"
-                      : "设备已解锁。爱发电私信正在发送，不影响正常使用。"
-                    : "请在 AstroBox 的 Kovela 中输入同一订单号并确认。只有设备验签并保存许可证后，这里才会显示激活完成。"
-                }}
-              </p>
-            </div>
-            <div
-              v-if="statusError"
-              role="alert"
-              class="text-xs leading-6 text-amber-700 dark:text-amber-300"
-            >
-              {{ statusError
-              }}<button
-                type="button"
-                class="ml-2 underline"
-                @click="refreshStatus"
-              >
-                刷新状态
-              </button>
-            </div>
-            <Button
-              type="button"
-              variant="ghost"
-              class="w-full"
-              @click="resetSession"
-              >{{ finished ? "验证其他订单" : "重新验证 / 更新链接" }}</Button
-            >
-          </div>
+          </template>
           <div
             class="mt-7 border-t border-border pt-5 text-center text-xs text-muted-foreground"
           >
             还没有购买？
             <a
-              v-if="selectedProduct?.purchaseUrl"
-              :href="selectedProduct.purchaseUrl"
+              v-if="availableProducts[0]?.purchaseUrl"
+              :href="availableProducts[0].purchaseUrl"
               target="_blank"
               rel="noopener noreferrer"
               class="inline-flex items-center gap-1 font-medium text-primary"
@@ -546,18 +414,18 @@ onBeforeUnmount(() => {
           <div
             v-for="(step, index) in [
               {
-                title: '验证爱发电订单',
-                text: '打开 AstroBox 的 Kovela，选择应用并输入订单号。本页也可以验证，再把凭证传给插件。',
-                icon: ShieldCheck,
+                title: '输入订单号',
+                text: '打开 AstroBox 的 Kovela 插件，输入爱发电订单号，应用由订单自动带出。',
+                icon: KeyRound,
               },
               {
-                title: '连接你的手环',
-                text: '打开 AstroBox v2 中的 Kovela 插件，选择已连接设备。',
+                title: '选择手环',
+                text: '插件会读取已连接的设备列表，选择你的手环并确认。',
                 icon: Smartphone,
               },
               {
                 title: '自动完成激活',
-                text: '许可证安全传入手环，保存成功后即可离线畅玩。',
+                text: '许可证自动签发并写入手环，保存成功后即可离线使用。',
                 icon: Fingerprint,
               },
             ]"

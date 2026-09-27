@@ -1,6 +1,8 @@
 import type { Context } from "cordis";
 import { Service } from "cordis";
 import type {
+  LookupOrderRequest,
+  LookupOrderResult,
   PublicConfig,
   VerifiedOrder,
   VerifyOrderRequest,
@@ -44,6 +46,12 @@ export default class KovelaClient extends Service {
     signal?: AbortSignal,
   ): Promise<VerifiedOrder> {
     return this.request("/api/orders/verify", input, signal);
+  }
+  lookupOrder(
+    input: LookupOrderRequest,
+    signal?: AbortSignal,
+  ): Promise<LookupOrderResult> {
+    return this.request("/api/orders/lookup", input, signal);
   }
   status(statusToken: string, signal?: AbortSignal): Promise<ActivationStatus> {
     return this.request("/api/activation/status", { statusToken }, signal);

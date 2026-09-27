@@ -36,6 +36,21 @@ export interface VerifiedOrder {
   expiresAt: number;
   boundDeviceId: string | null;
 }
+export interface LookupOrderRequest {
+  orderNo: string;
+}
+export interface LookupOrderItem {
+  productId: string;
+  productName: string;
+  handoffToken: string;
+  statusToken: string;
+  expiresAt: number;
+  boundDeviceId: string | null;
+}
+export interface LookupOrderResult {
+  orderNo: string;
+  items: LookupOrderItem[];
+}
 export interface ActivateRequest {
   handoffToken: string;
   productId: string;
