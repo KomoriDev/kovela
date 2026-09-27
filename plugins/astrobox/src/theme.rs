@@ -63,7 +63,16 @@ const FIELD_HEIGHT: u32 = 56;
 const PROGRESS_HEIGHT: u32 = 4;
 const LINK_HEIGHT: u32 = 32;
 
-/// 插件页面的根容器：M3 surface container（低）+ 描边。
+/// 插件页面的最外层容器：内容卡片 + 卡片下方的页脚，贴着宿主的深色底。
+pub(crate) fn shell() -> ui::Element {
+    ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Column)
+        .gap(space::TWO)
+        .width_full()
+}
+
+/// 内容卡片：M3 surface container（低）+ 描边。
 pub(crate) fn page() -> ui::Element {
     ui::Element::new(ui::ElementType::Div, None)
         .flex()
@@ -201,14 +210,6 @@ pub(crate) fn chip(text: &str) -> ui::Element {
         .radius(shape::SMALL)
 }
 
-/// M3 分割线。
-pub(crate) fn divider() -> ui::Element {
-    ui::Element::new(ui::ElementType::Div, None)
-        .width_full()
-        .height(1)
-        .bg(color::OUTLINE_VARIANT)
-}
-
 /// M3 filled text field：容器用 surface container（高），文字用 bodyLarge（16dp）。
 pub(crate) fn field(placeholder: &str, event: &str) -> ui::Element {
     ui::Element::new(ui::ElementType::Textarea, None)
@@ -263,10 +264,10 @@ pub(crate) fn text_button(label: &str, event: &str) -> ui::Element {
 }
 
 /// 行内文本链接。用按钮承载，才能拿到宿主的指针光标与悬停反馈。
-/// 左右内边距清零：它紧跟在正文后面，不能再多出一段空隙。
+/// 左右内边距清零，间距统一交给页脚的间隔点控制。
 pub(crate) fn link(label: &str, event: &str) -> ui::Element {
     ui::Element::new(ui::ElementType::Button, Some(label))
-        .size(type_scale::BODY_MEDIUM)
+        .size(type_scale::LABEL_MEDIUM)
         .height(LINK_HEIGHT)
         .padding_left(0)
         .padding_right(0)
@@ -277,15 +278,29 @@ pub(crate) fn link(label: &str, event: &str) -> ui::Element {
         .on(ui::Event::Click, event)
 }
 
-/// 页脚：说明文字紧跟链接，中间不留空隙。
-pub(crate) fn footer(text: &str, label: &str, event: &str) -> ui::Element {
-    ui::Element::new(ui::ElementType::Div, None)
+/// 页脚：一排链接，间距由间隔点统一控制。
+pub(crate) fn footer(links: &[(&str, &str)]) -> ui::Element {
+    let mut footer = ui::Element::new(ui::ElementType::Div, None)
         .flex()
         .justify_center()
         .align_center()
-        .width_full()
-        .child(body(text))
-        .child(link(label, event))
+        .width_full();
+    for (index, (label, event)) in links.iter().enumerate() {
+        if index > 0 {
+            footer = footer.child(link_separator());
+        }
+        footer = footer.child(link(label, event));
+    }
+    footer
+}
+
+/// 页脚链接之间的间隔点，纯展示、不可点。
+fn link_separator() -> ui::Element {
+    ui::Element::new(ui::ElementType::Span, Some("·"))
+        .size(type_scale::LABEL_MEDIUM)
+        .text_color(color::ON_SURFACE_VARIANT)
+        .padding_left(space::TWO)
+        .padding_right(space::TWO)
 }
 
 /// M3 线性进度条：轨道 + 按 flex-grow 分配比例的指示条。

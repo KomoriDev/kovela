@@ -97,10 +97,14 @@ struct State {
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
 struct Kovela;
 
-/// 官方群（QQ）加群链接，页脚的「加入官群」用它打开系统浏览器。
+/// 官方群（QQ）加群链接，页脚的「官群」用它打开系统浏览器。
 const COMMUNITY_URL: &str = "https://qm.qq.com/q/JQRdtQcPIc";
+/// 爱发电店铺页，页脚的「爱发电」用它打开系统浏览器。
+const PURCHASE_URL: &str = "https://afdian.com/a/komoridev";
 /// 页脚链接的点击事件 id。
 const COMMUNITY_EVENT: &str = "community";
+const PURCHASE_EVENT: &str = "purchase";
+const WEBSITE_EVENT: &str = "website";
 
 async fn host_register_recv(addr: &str, package: &str) -> Result<(), String> {
     #[cfg(feature = "api4")]
@@ -613,12 +617,13 @@ fn render() {
             page = page.child(gate(theme::text_button(cancel, "cancel"), ui_locked));
         }
     }
-    page = page.child(theme::divider()).child(theme::footer(
-        "对应用有疑问？",
-        "加入官群",
-        COMMUNITY_EVENT,
-    ));
-    ui::render(&root, page);
+    // 页脚在紫色卡片外面，靠卡片自身的描边和内容分隔。
+    let shell = theme::shell().child(page).child(theme::footer(&[
+        ("爱发电", PURCHASE_EVENT),
+        ("Kovela", WEBSITE_EVENT),
+        ("官群", COMMUNITY_EVENT),
+    ]));
+    ui::render(&root, shell);
 }
 
 // 宿主读取设备列表会先请求前端授权，可能失败或长时间不返回；
@@ -1282,9 +1287,17 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         };
     }
     // 页脚链接和订单流程无关，锁定时也要能点。
-    if matches!(event, ui::Event::Click) && id == COMMUNITY_EVENT {
-        dialog::open_url(COMMUNITY_URL);
-        return UiFollow::None;
+    if matches!(event, ui::Event::Click) {
+        let url = match id {
+            PURCHASE_EVENT => Some(PURCHASE_URL),
+            WEBSITE_EVENT => Some(server_origin()),
+            COMMUNITY_EVENT => Some(COMMUNITY_URL),
+            _ => None,
+        };
+        if let Some(url) = url {
+            dialog::open_url(url);
+            return UiFollow::None;
+        }
     }
     if !matches!(event, ui::Event::Click) || locked() {
         return UiFollow::None;
