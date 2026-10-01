@@ -10,7 +10,7 @@
 //! 都会变成行内样式，因此行内样式能压过组件默认样式；复合控件（TEXTAREA、
 //! PROGRESS 之类）的样式落在组件根节点上，不是内部的原生控件。
 
-use crate::{ServiceStatus, SERVICE_STATUS_EVENT, ui};
+use crate::{ServiceStatus, SERVICE_STATUS_EVENT, icons, ui};
 
 /// M3 深色配色角色，名称沿用 Material 3 的 token 名。
 pub(crate) mod color {
@@ -18,12 +18,10 @@ pub(crate) mod color {
     pub(crate) const ON_PRIMARY: &str = "#381e72";
     pub(crate) const SECONDARY_CONTAINER: &str = "#4a4458";
     pub(crate) const ON_SECONDARY_CONTAINER: &str = "#e8def8";
-    pub(crate) const SURFACE_CONTAINER_LOW: &str = "#1d1b20";
     pub(crate) const SURFACE_CONTAINER: &str = "#211f26";
     pub(crate) const SURFACE_CONTAINER_HIGH: &str = "#2b2930";
     pub(crate) const ON_SURFACE: &str = "#e6e0e9";
     pub(crate) const ON_SURFACE_VARIANT: &str = "#cac4d0";
-    pub(crate) const OUTLINE_VARIANT: &str = "#49454f";
     pub(crate) const TRANSPARENT: &str = "transparent";
     pub(crate) const SUCCESS_CONTAINER: &str = "#1f3b2a";
     pub(crate) const ON_SUCCESS_CONTAINER: &str = "#b7f7c8";
@@ -31,12 +29,11 @@ pub(crate) mod color {
     pub(crate) const ON_ERROR_CONTAINER: &str = "#ffdada";
 }
 
-/// M3 圆角等级（4 / 8 / 12 / 16 / 20 dp）。
+/// M3 圆角等级。
 pub(crate) mod shape {
     pub(crate) const EXTRA_SMALL: u32 = 4;
     pub(crate) const SMALL: u32 = 8;
     pub(crate) const MEDIUM: u32 = 12;
-    pub(crate) const LARGE: u32 = 16;
     /// M3 标准按钮是全圆角药丸形。
     pub(crate) const FULL: u32 = 20;
 }
@@ -67,16 +64,17 @@ const FIELD_HEIGHT: u32 = 56;
 const PROGRESS_HEIGHT: u32 = 4;
 const LINK_HEIGHT: u32 = 32;
 
-/// 插件页面的最外层容器：内容卡片 + 卡片下方的页脚，贴着宿主的深色底。
+/// 页面内容与页脚共享宿主的深色底。
 pub(crate) fn shell() -> ui::Element {
     ui::Element::new(ui::ElementType::Div, None)
         .flex()
         .flex_direction(ui::FlexDirection::Column)
+        .align_center()
         .gap(space::TWO)
         .width_full()
 }
 
-/// 内容卡片：M3 surface container（低）+ 描边。
+/// 无额外卡片边框的内容布局。
 pub(crate) fn page() -> ui::Element {
     ui::Element::new(ui::ElementType::Div, None)
         .flex()
@@ -84,9 +82,8 @@ pub(crate) fn page() -> ui::Element {
         .gap(space::THREE)
         .padding(space::FOUR)
         .width_full()
-        .bg(color::SURFACE_CONTAINER_LOW)
-        .radius(shape::LARGE)
-        .border(1, color::OUTLINE_VARIANT)
+        .max_width(640)
+        .min_width(0)
 }
 
 /// M3 titleLarge：页面标题。
@@ -117,14 +114,6 @@ pub(crate) fn label(text: &str) -> ui::Element {
         .text_color(color::ON_SURFACE_VARIANT)
 }
 
-/// 状态行：M3 surface container（高）底色的提示条。
-pub(crate) fn status(text: &str) -> ui::Element {
-    label(text)
-        .padding(space::TWO)
-        .width_full()
-        .bg(color::SURFACE_CONTAINER_HIGH)
-        .radius(shape::SMALL)
-}
 
 /// 横向排布的一行，用来让 chip 之类的元素按内容宽度收窄。
 pub(crate) fn row(gap: u32) -> ui::Element {
@@ -143,16 +132,22 @@ pub(crate) enum StepState {
     Upcoming,
 }
 
-const STEP_LABELS: [&str; 2] = ["订单", "激活"];
-
-/// 顶部步骤条：只表示流程位置，不承载交互。
 pub(crate) fn steps(current: u32) -> ui::Element {
+    flow_steps(&["订单", "激活"], current)
+}
+
+pub(crate) fn offline_steps(current: u32) -> ui::Element {
+    flow_steps(&["申请", "导入"], current)
+}
+
+fn flow_steps(labels: &[&str], current: u32) -> ui::Element {
     let mut row = ui::Element::new(ui::ElementType::Div, None)
         .flex()
         .gap(space::ONE)
         .align_center()
+        .min_width(0)
         .flex_grow(1.0);
-    for (index, label) in STEP_LABELS.iter().enumerate() {
+    for (index, label) in labels.iter().enumerate() {
         let state = match (index as u32 + 1).cmp(&current) {
             std::cmp::Ordering::Less => StepState::Done,
             std::cmp::Ordering::Equal => StepState::Current,
@@ -163,12 +158,6 @@ pub(crate) fn steps(current: u32) -> ui::Element {
     row
 }
 
-/// 顶栏：步骤靠左，服务状态徽标固定在右侧。
-pub(crate) fn top_bar(current: u32, service_badge: ui::Element) -> ui::Element {
-    row(space::TWO)
-        .child(steps(current).flex_grow(1.0))
-        .child(service_badge)
-}
 
 /// 步骤条上的一格：已完成的带 ✓，当前步骤是主色实底。
 fn step(text: &str, state: StepState) -> ui::Element {
@@ -270,13 +259,20 @@ pub(crate) fn service_badge(status: ServiceStatus) -> ui::Element {
         .child(badge)
 }
 
-pub(crate) fn service_reason(reason: &str) -> ui::Element {
-    label(&format!("原因：{reason}"))
+pub(crate) fn service_reason(reason: &str, disabled: bool) -> ui::Element {
+    let action = link("尝试离线激活", "offline-activate")
+        .text_color(color::ON_ERROR_CONTAINER);
+    ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Column)
+        .align_start()
+        .gap(space::ONE)
         .padding(space::TWO)
         .width_full()
         .bg(color::ERROR_CONTAINER)
-        .text_color(color::ON_ERROR_CONTAINER)
         .radius(shape::SMALL)
+        .child(label(&format!("原因：{reason}")).text_color(color::ON_ERROR_CONTAINER))
+        .child(if disabled { action.disabled() } else { action })
 }
 
 /// M3 filled text field：容器用 surface container（高），文字用 bodyLarge（16dp）。
@@ -291,6 +287,68 @@ pub(crate) fn field(placeholder: &str, event: &str) -> ui::Element {
         .prop("size", "3")
         .prop("placeholder", placeholder)
         .on(ui::Event::Input, event)
+}
+
+pub(crate) fn select(placeholder: &str, event: &str) -> ui::Element {
+    ui::Element::new(ui::ElementType::Select, None)
+        .width_full()
+        .min_width(0)
+        .height(BUTTON_HEIGHT)
+        .bg(color::SURFACE_CONTAINER_HIGH)
+        .radius(shape::EXTRA_SMALL)
+        .prop("size", "3")
+        .prop("placeholder", placeholder)
+        .prop("aria-label", placeholder)
+        .on(ui::Event::Change, event)
+}
+
+fn tool_button(icon: &str, label: &str) -> ui::Element {
+    ui::Element::new(ui::ElementType::Button, None)
+        .width(BUTTON_HEIGHT)
+        .height(BUTTON_HEIGHT)
+        .padding(0)
+        .margin(0)
+        .flex()
+        .align_center()
+        .justify_center()
+        .flex_shrink(0.0)
+        .bg(color::TRANSPARENT)
+        .text_color(color::ON_SURFACE_VARIANT)
+        .radius(shape::SMALL)
+        .prop("variant", "ghost")
+        .prop("aria-label", label)
+        .prop("title", label)
+        .child(ui::Element::new(ui::ElementType::Svg, Some(icon)).width(20).height(20))
+}
+
+pub(crate) fn icon_button(icon: &str, label: &str, event: &str, disabled: bool) -> ui::Element {
+    let button = tool_button(icon, label).on(ui::Event::Click, event);
+    let button = if disabled { button.disabled() } else { button };
+    ui::Element::new(ui::ElementType::Tooltip, None)
+        .prop("content", label)
+        .child(button)
+}
+
+pub(crate) fn more_menu(items: &[(&str, &str)], disabled: bool) -> ui::Element {
+    let trigger = tool_button(icons::MORE, "更多操作");
+    let mut content = ui::Element::new(ui::ElementType::DropdownMenuContent, None)
+        .prop("align", "end");
+    for (label, event) in items {
+        content = content.child(
+            if disabled {
+                ui::Element::new(ui::ElementType::DropdownMenuItem, Some(label)).disabled()
+            } else {
+                ui::Element::new(ui::ElementType::DropdownMenuItem, Some(label))
+                    .on(ui::Event::Click, event)
+            },
+        );
+    }
+    ui::Element::new(ui::ElementType::DropdownMenuRoot, None)
+        .child(ui::Element::new(ui::ElementType::DropdownMenuTrigger, None)
+            .child(ui::Element::new(ui::ElementType::Tooltip, None)
+                .prop("content", "更多操作")
+                .child(if disabled { trigger.disabled() } else { trigger })))
+        .child(content)
 }
 
 fn button(label: &str, event: &str) -> ui::Element {
@@ -318,19 +376,7 @@ pub(crate) fn outlined_button(label: &str, event: &str) -> ui::Element {
         .border(1, color::PRIMARY)
 }
 
-/// M3 tonal button：已选中的选项。
-pub(crate) fn tonal_button(label: &str, event: &str) -> ui::Element {
-    button(label, event)
-        .bg(color::SECONDARY_CONTAINER)
-        .text_color(color::ON_SECONDARY_CONTAINER)
-}
 
-/// M3 text button：低强调动作。
-pub(crate) fn text_button(label: &str, event: &str) -> ui::Element {
-    button(label, event)
-        .bg(color::TRANSPARENT)
-        .text_color(color::ON_SURFACE_VARIANT)
-}
 
 /// 行内文本链接。用按钮承载，才能拿到宿主的指针光标与悬停反馈。
 /// 左右内边距清零，间距统一交给页脚的间隔点控制。

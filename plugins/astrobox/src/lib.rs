@@ -31,6 +31,7 @@ use std::{cell::RefCell, time::{Duration, Instant}};
 use uuid::Uuid;
 
 mod theme;
+mod icons;
 mod offline;
 #[cfg(not(feature = "api4"))]
 mod file_picker;
@@ -97,12 +98,14 @@ struct Offer {
 struct OfflineState {
     product_id: String,
     license_input: String,
+    importing: bool,
 }
 impl Default for OfflineState {
     fn default() -> Self {
         Self {
             product_id: offline::PRODUCTS[0].0.into(),
             license_input: String::new(),
+            importing: false,
         }
     }
 }
@@ -128,8 +131,6 @@ struct State {
     service_reason: String,
     service_check_started: bool,
     service_reason_visible: bool,
-    offline_prompt: bool,
-    offline_prompt_dismissed: bool,
     status_clicks: u8,
     last_status_click: Option<Instant>,
 }
@@ -369,8 +370,8 @@ fn enter_offline() {
             s.pending = None;
         }
         s.verifying = false;
-        s.offline = Some(OfflineState { product_id, license_input });
-        s.offline_prompt = false;
+        let importing = !license_input.trim().is_empty();
+        s.offline = Some(OfflineState { product_id, license_input, importing });
         s.status_clicks = 0;
         s.last_status_click = None;
         s.service_reason_visible = false;
@@ -389,8 +390,7 @@ fn return_online() {
         s.handoff = None;
         s.offers.clear();
         s.message.clear();
-        s.offline_prompt = false;
-        s.offline_prompt_dismissed = false;
+        s.service_reason_visible = s.service_status == ServiceStatus::Unavailable;
     });
     render();
 }
@@ -501,54 +501,118 @@ async fn import_offline_license() {
     }
 }
 
+fn device_control(
+    devices: &[(String, String)],
+    selected: Option<usize>,
+    note: &str,
+    scanning: bool,
+    disabled: bool,
+) -> ui::Element {
+    let mut selector = theme::select("选择手环", "device-select")
+        .prop("value", &selected.map(|index| index.to_string()).unwrap_or_default())
+        .flex_grow(1.0)
+        .flex_shrink(1.0);
+    for (index, (addr, name)) in devices.iter().enumerate() {
+        let label = if name.trim().is_empty() { addr } else { name };
+        selector = selector.child(ui::Element::new(ui::ElementType::Option, Some(label))
+            .prop("value", &index.to_string()));
+    }
+    let mut control = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .flex_direction(ui::FlexDirection::Column)
+        .gap(theme::space::TWO)
+        .width_full()
+        .min_width(0)
+        .child(theme::label("手环"))
+        .child(theme::row(theme::space::TWO)
+            .child(gate(selector, disabled || devices.is_empty()))
+            .child(theme::icon_button(icons::REFRESH, "刷新设备", "refresh", disabled || scanning)));
+    if scanning {
+        control = control.child(theme::label("正在读取设备列表…"));
+    } else if !note.is_empty() {
+        control = control.child(theme::label(note));
+    }
+    control
+}
+
 fn render_offline(root: &str) {
     let page = STATE.with(|state| {
         let s = state.borrow();
         let Some(local) = s.offline.as_ref() else { return theme::page(); };
         let active = busy();
-        let complete = s.pending.as_ref().is_some_and(|p| p.phase == Phase::Complete);
+        #[cfg(not(feature = "api4"))]
+        let picking_file = s.file_picker.is_some();
+        #[cfg(feature = "api4")]
+        let picking_file = false;
+        let phase = s.pending.as_ref().map(|p| p.phase);
+        let complete = phase == Some(Phase::Complete);
+        let importing = local.importing;
+        let ready = s.pending.as_ref().and_then(|p| p.device_id.as_ref());
+        let current = if complete { 3 } else if importing { 2 } else { 1 };
         let mut page = theme::page()
-            .child(theme::top_bar(2, theme::chip("离线")))
-            .child(theme::headline(if complete { "激活完成" } else { "应用激活" }));
+            .child(theme::row(theme::space::TWO)
+                .child(theme::offline_steps(current))
+                .child(theme::chip("离线"))
+                .child(theme::more_menu(&[("返回在线", "return-online"), ("重新开始", "cancel")], active)))
+            .child(theme::headline(if complete { "激活完成" } else if importing { "导入许可证" } else { "离线申请" }));
         if !s.message.is_empty() { page = page.child(theme::body(&s.message)); }
-        page = page.child(gate(theme::field("爱发电订单号", "order-input").on(ui::Event::Blur, "order-input").prop("default-value", &s.order_no), active || complete));
-        let mut products = ui::Element::new(ui::ElementType::Select, None)
-            .prop("default-value", &local.product_id)
-            .on(ui::Event::Change, "offline-product");
+        if complete {
+            page = page.child(theme::body(offline::product_name(&local.product_id).unwrap_or(&local.product_id)));
+            return page.child(theme::filled_button("完成", "return-online"));
+        }
+        let mut products = theme::select("应用", "offline-product")
+            .prop("value", &local.product_id);
         for (id, name) in offline::PRODUCTS {
             products = products.child(ui::Element::new(ui::ElementType::Option, Some(name)).prop("value", id));
         }
-        page = page.child(gate(products, active || complete));
-        let ready = s.pending.as_ref().and_then(|p| p.device_id.as_ref());
+        if !importing {
+            page = page.child(theme::label("爱发电订单号"))
+                .child(gate(theme::field("爱发电订单号", "order-input")
+                    .on(ui::Event::Blur, "order-input").prop("default-value", &s.order_no), active));
+        }
+        page = page.child(theme::label("应用")).child(gate(products, active));
         if let Some(id) = ready {
-            page = page.child(theme::label("设备码"))
-                .child(theme::field("设备码", "device-code").height(80).prop("default-value", id).prop("read-only", "true"));
+            let device_name = s.pending.as_ref().and_then(|p| s.devices.iter().find(|(addr, _)| *addr == p.addr))
+                .map(|(addr, name)| if name.trim().is_empty() { addr.as_str() } else { name.as_str() });
+            if let Some(name) = device_name { page = page.child(theme::label(name)); }
+            if !importing {
+                page = page.child(theme::label("设备码"))
+                    .child(theme::field("设备码", "device-code").height(72)
+                        .prop("default-value", id).prop("read-only", "true"));
+            }
         } else {
-            if !s.device_note.is_empty() { page = page.child(theme::status(&s.device_note)); }
-            for (index, (addr, name)) in s.devices.iter().enumerate() {
-                let text = if name.trim().is_empty() { addr } else { name };
-                let event = format!("device:{index}");
-                let button = if s.selected == Some(index) { theme::tonal_button(text, &event) } else { theme::outlined_button(text, &event) };
-                page = page.child(gate(button, active));
-            }
-            page = page.child(gate(theme::outlined_button("刷新设备", "refresh"), active));
+            page = page.child(device_control(&s.devices, s.selected, &s.device_note, s.scanning, active));
         }
-        if !complete {
-            page = page.child(gate(theme::outlined_button(if active { "连接中…" } else { "获取设备码" }, "offline-device"), active || s.selected.is_none()));
-            if let Ok(request) = offline_request() {
-                page = page.child(theme::label("激活申请"))
-                    .child(theme::field("激活申请", "request-text").height(112).prop("default-value", &request).prop("read-only", "true"))
-                    .child(gate(theme::outlined_button("复制申请", "offline-copy"), active));
+        if importing {
+            page = page.child(theme::row(theme::space::ONE)
+                    .child(theme::section("许可证").flex_grow(1.0))
+                    .child(theme::icon_button(icons::PASTE, "粘贴许可证", "offline-paste", active))
+                    .child(theme::icon_button(icons::FILE, "选择许可证文件", "offline-file", active)))
+                .child(gate(theme::field("KV1 授权串或许可证 JSON", "license-input")
+                    .on(ui::Event::Blur, "license-input").height(128)
+                    .prop("default-value", &local.license_input), active))
+                .child(gate(theme::filled_button(
+                    if picking_file { "选择文件中…" } else if phase == Some(Phase::Hello) { "连接中…" } else if active { "写入中…" } else { "导入并激活" },
+                    "offline-import"), active || (ready.is_none() && s.selected.is_none())))
+                .child(gate(theme::link("返回申请", "offline-request"), active));
+        } else if ready.is_some() {
+            match offline_request() {
+                Ok(request) => {
+                    page = page.child(theme::row(theme::space::ONE)
+                            .child(theme::section("激活申请").flex_grow(1.0))
+                            .child(theme::icon_button(icons::COPY, "复制申请", "offline-copy", active)))
+                        .child(theme::field("激活申请", "request-text").height(112)
+                            .prop("default-value", &request).prop("read-only", "true"))
+                        .child(gate(theme::filled_button("导入许可证", "offline-next"), active));
+                }
+                Err(error) => page = page.child(theme::label(&error)),
             }
-            page = page.child(theme::section("许可证"))
-                .child(gate(theme::field("KV1 授权串或许可证 JSON", "license-input").on(ui::Event::Blur, "license-input").height(128).prop("default-value", &local.license_input), active))
-                .child(theme::row(theme::space::TWO)
-                    .child(gate(theme::outlined_button("粘贴", "offline-paste").flex_shrink(1.0).min_width(0), active))
-                    .child(gate(theme::outlined_button("选择文件", "offline-file").flex_shrink(1.0).min_width(0), active)))
-                .child(gate(theme::filled_button(if active { "写入中…" } else { "导入并激活" }, "offline-import"), active || s.selected.is_none()));
+        } else {
+            page = page.child(gate(theme::filled_button(if active { "连接中…" } else { "获取设备码" }, "offline-device"),
+                active || s.selected.is_none()));
         }
-        page.child(gate(theme::text_button("返回在线", "return-online"), active))
-            .child(gate(theme::text_button("重新开始", "cancel"), active))
+        if !importing && ready.is_none() { page = page.child(gate(theme::link("已有许可证", "offline-next"), active)); }
+        page
     });
     ui::render(root, theme::shell().child(page).child(theme::footer(&[("爱发电", PURCHASE_EVENT), ("官群", COMMUNITY_EVENT)])));
 }
@@ -707,7 +771,6 @@ fn render() {
         pending,
         device_note,
         scanning,
-        scan_tries,
         service_status,
         service_reason,
         service_reason_visible,
@@ -725,7 +788,6 @@ fn render() {
             s.pending.clone(),
             s.device_note.clone(),
             s.scanning,
-            s.scan_tries,
             s.service_status,
             s.service_reason.clone(),
             s.service_reason_visible,
@@ -766,18 +828,12 @@ fn render() {
         2
     };
     let service_error = service_status == ServiceStatus::Unavailable;
-    let mut page = theme::page().child(theme::top_bar(
-        step,
-        theme::service_badge(service_status),
-    ));
+    let mut page = theme::page().child(theme::row(theme::space::TWO)
+        .child(theme::steps(step))
+        .child(theme::service_badge(service_status))
+        .child(theme::more_menu(&[("重新输入订单", "cancel")], ui_locked)));
     if service_error && service_reason_visible {
-        page = page.child(theme::service_reason(&service_reason));
-    }
-    if !ui_locked && STATE.with(|state| state.borrow().offline_prompt) {
-        page = page.child(theme::section("服务暂时不可用，是否离线激活？"))
-            .child(theme::row(theme::space::TWO)
-                .child(theme::outlined_button("继续在线", "offline-decline").flex_shrink(1.0).min_width(0))
-                .child(theme::tonal_button("离线激活", "offline-accept").flex_shrink(1.0).min_width(0)));
+        page = page.child(theme::service_reason(&service_reason, ui_locked));
     }
     page = page.child(theme::headline(&heading));
     match step {
@@ -833,72 +889,29 @@ fn render() {
                             page = page.child(theme::substep(label, state));
                         }
                     } else {
-                        // 设备信息只在选设备时占版面。
-                        let device_status = if !device_note.is_empty() {
-                            device_note.clone()
-                        } else if scanning {
-                            format!("正在读取设备列表…（第 {} 次）", scan_tries)
+                        page = page.child(device_control(&devices, selected, &device_note, scanning, ui_locked));
+                    }
+                    if !complete {
+                        let action = if phase == Some(Phase::Retry) {
+                            "重试"
+                        } else if active {
+                            "激活中…"
                         } else {
-                            "点「刷新设备」读取手环列表".to_string()
+                            "激活"
                         };
-                        page = page.child(theme::status(&device_status));
-                        if devices.len() == 1 {
-                            let (addr, name) = &devices[0];
-                            let label = if name.trim().is_empty() {
-                                format!("设备：{addr}")
-                            } else {
-                                format!("设备：{name}")
-                            };
-                            page = page.child(theme::body(&label));
-                        }
-                        for (index, (addr, name)) in devices.iter().enumerate() {
-                            if devices.len() < 2 {
-                                break;
-                            }
-                            let label = if name.trim().is_empty() {
-                                addr.clone()
-                            } else if selected == Some(index) {
-                                format!("已选择 {name}")
-                            } else {
-                                name.clone()
-                            };
-                            let event = format!("device:{index}");
-                            let button = if selected == Some(index) {
-                                theme::tonal_button(&label, &event)
-                            } else {
-                                theme::outlined_button(&label, &event)
-                            };
-                            page = page.child(gate(button, ui_locked));
-                        }
                         page = page.child(gate(
-                            theme::outlined_button("刷新设备", "refresh"),
-                            ui_locked,
+                            theme::filled_button(action, "activate"),
+                            ui_locked || selected.is_none(),
                         ));
                     }
-                    let action = if complete {
-                        "已激活"
-                    } else if phase == Some(Phase::Retry) {
-                        "重试"
-                    } else if active {
-                        "激活中…"
-                    } else {
-                        "激活"
-                    };
-                    page = page.child(gate(
-                        theme::filled_button(action, "activate"),
-                        ui_locked || complete || selected.is_none(),
-                    ));
                 }
             }
-            let cancel = if complete {
-                "重新开始"
-            } else {
-                "重新输入"
-            };
-            page = page.child(gate(theme::text_button(cancel, "cancel"), ui_locked));
+            if complete {
+                page = page.child(theme::filled_button("完成", "cancel"));
+            }
         }
     }
-    // 页脚在紫色卡片外面，靠卡片自身的描边和内容分隔。
+    // 页脚与流程内容分开，不增加额外的容器边框。
     let shell = theme::shell().child(page).child(theme::footer(&[
         ("爱发电", PURCHASE_EVENT),
         ("Kovela", WEBSITE_EVENT),
@@ -952,14 +965,12 @@ async fn load_devices() {
             ));
         }
     }
-    let note = if connected.len() == 1 {
-        "已找到 1 台手环".to_string()
-    } else if !connected.is_empty() {
-        format!("已找到 {} 台手环，默认第一台，可点选其它", connected.len())
+    let note = if !connected.is_empty() {
+        format!("已连接 {} 台手环", connected.len())
     } else if history > 0 {
-        format!("未检测到已连接手环（历史 {history} 台），请在 AstroBox 中连接后点「刷新设备」")
+        format!("仅找到 {history} 台历史设备，当前没有已连接手环")
     } else {
-        "未检测到手环：请确认 AstroBox 已连接，并允许 Kovela 访问设备后点「刷新设备」".into()
+        "未检测到已连接手环".into()
     };
     let applied = STATE.with(|state| {
         let mut s = state.borrow_mut();
@@ -1090,16 +1101,16 @@ fn update_service(result: Result<(), String>) -> bool {
                 s.service_status = ServiceStatus::Healthy;
                 s.service_reason.clear();
                 s.service_reason_visible = false;
-                s.offline_prompt = false;
-                s.offline_prompt_dismissed = false;
                 changed
             }
             Err(reason) => {
                 let changed = s.service_status != ServiceStatus::Unavailable
                     || s.service_reason != reason;
+                if s.service_status != ServiceStatus::Unavailable && s.offline.is_none() {
+                    s.service_reason_visible = true;
+                }
                 s.service_status = ServiceStatus::Unavailable;
                 s.service_reason = reason;
-                if s.offline.is_none() && !s.offline_prompt_dismissed { s.offline_prompt = true; }
                 changed
             }
         }
@@ -1160,7 +1171,7 @@ fn reset_order() {
         s.selected = None;
         s.verifying = false;
         s.message = if s.offline.is_some() { String::new() } else { "请输入爱发电订单号".into() };
-        if let Some(local) = s.offline.as_mut() { local.license_input.clear(); }
+        if let Some(local) = s.offline.as_mut() { local.license_input.clear(); local.importing = false; }
     });
     render();
 }
@@ -1568,7 +1579,7 @@ async fn on_device_message(raw: &str) {
         if pending.offline {
             set_phase(&pending.id, Phase::AwaitingLicense, "设备码已获取");
             render();
-            let has_license = STATE.with(|state| state.borrow().offline.as_ref().is_some_and(|local| !local.license_input.trim().is_empty()));
+            let has_license = STATE.with(|state| state.borrow().offline.as_ref().is_some_and(|local| local.importing && !local.license_input.trim().is_empty()));
             if has_license { import_offline_license().await; }
             return;
         }
@@ -1746,6 +1757,21 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
             return UiFollow::None;
         }
         if id == "device-code" || id == "request-text" { return UiFollow::None; }
+        if id == "device-select" {
+            if !locked() {
+                if let Ok(index) = event_text(payload).parse::<usize>() {
+                    STATE.with(|state| {
+                        let mut s = state.borrow_mut();
+                        if index < s.devices.len() && (s.offline.is_some() || s.pending.is_none()) {
+                            s.selected = Some(index);
+                            if s.offline.is_some() { s.pending = None; }
+                        }
+                    });
+                    render();
+                }
+            }
+            return UiFollow::None;
+        }
         if id == "offline-product" {
             let product_id = event_text(payload);
             if !locked() && offline::product_name(&product_id).is_some() {
@@ -1798,16 +1824,7 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
     if !matches!(event, ui::Event::Click) || locked() {
         return UiFollow::None;
     }
-    if id == "offline-decline" {
-        STATE.with(|state| {
-            let mut s = state.borrow_mut();
-            s.offline_prompt = false;
-            s.offline_prompt_dismissed = true;
-        });
-        render();
-        return UiFollow::None;
-    }
-    if id == "offline-accept" {
+    if id == "offline-activate" {
         enter_offline();
         return UiFollow::Refresh;
     }
@@ -1823,20 +1840,20 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
             "offline-paste" => return UiFollow::OfflinePaste,
             "offline-file" => return UiFollow::OfflineFile,
             "offline-import" => return UiFollow::OfflineImport,
+            "offline-next" | "offline-request" => {
+                STATE.with(|state| {
+                    let mut s = state.borrow_mut();
+                    if let Some(local) = s.offline.as_mut() { local.importing = id == "offline-next"; }
+                    s.message.clear();
+                });
+                render();
+                return UiFollow::None;
+            }
             "offline-device" => {
                 STATE.with(|state| state.borrow_mut().pending = None);
                 return UiFollow::Activate;
             },
-            _ => {
-                if let Some(index) = id.strip_prefix("device:").and_then(|value| value.parse::<usize>().ok()) {
-                    STATE.with(|state| {
-                        let mut s = state.borrow_mut();
-                        if index < s.devices.len() { s.selected = Some(index); s.pending = None; }
-                    });
-                    render();
-                }
-                return UiFollow::None;
-            }
+            _ => return UiFollow::None,
         }
     }
     if id == "cancel" {
@@ -1852,8 +1869,7 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         || id == "cancel"
         || id == "refresh"
         || id == "activate"
-        || id.starts_with("offer:")
-        || id.starts_with("device:");
+        || id.starts_with("offer:");
     if id == "verify" || id == "查询订单" || (first_step && !known) {
         queue_lookup();
         if STATE.with(|state| state.borrow().verifying) {
@@ -1879,19 +1895,6 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
     {
         confirm_offer(index);
         return UiFollow::Refresh;
-    }
-    if let Some(index) = id
-        .strip_prefix("device:")
-        .and_then(|value| value.parse::<usize>().ok())
-    {
-        STATE.with(|state| {
-            let mut s = state.borrow_mut();
-            if s.pending.is_none() && index < s.devices.len() {
-                s.selected = Some(index);
-            }
-        });
-        render();
-        return UiFollow::None;
     }
     if first_step {
         queue_lookup();
@@ -2028,6 +2031,65 @@ mod tests {
     #[test]
     fn rejects_a_lookup_without_products() {
         assert!(parse_offers(&json!({"items":[]})).is_err());
+    }
+
+    #[test]
+    fn device_selection_keeps_order_and_cannot_interrupt_installing() {
+        super::STATE.with(|state| *state.borrow_mut() = super::State {
+            order_no: "0000000000000001".into(),
+            devices: vec![("first".into(), "First".into()), ("second".into(), "Second".into())],
+            selected: Some(0),
+            ..Default::default()
+        });
+        super::dispatch_ui("device-select", super::ui::Event::Change, r#"{"value":"1"}"#);
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            assert_eq!(s.selected, Some(1));
+            assert_eq!(s.order_no, "0000000000000001");
+        });
+        super::dispatch_ui("device-select", super::ui::Event::Change, r#"{"value":"99"}"#);
+        assert_eq!(super::STATE.with(|state| state.borrow().selected), Some(1));
+        super::STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            s.offline = Some(super::OfflineState::default());
+            s.pending = Some(pending_at(super::Phase::Installing, None, false));
+        });
+        super::dispatch_ui("device-select", super::ui::Event::Change, r#"{"value":"0"}"#);
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            assert_eq!(s.selected, Some(1));
+            assert!(s.pending.as_ref().unwrap().phase == super::Phase::Installing);
+        });
+        super::STATE.with(|state| state.borrow_mut().pending.as_mut().unwrap().phase = super::Phase::AwaitingLicense);
+        super::dispatch_ui("device-select", super::ui::Event::Change, r#"{"value":"0"}"#);
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            assert_eq!(s.selected, Some(0));
+            assert!(s.pending.is_none());
+        });
+    }
+
+    #[test]
+    fn offline_navigation_retains_license_until_reset() {
+        super::STATE.with(|state| *state.borrow_mut() = super::State {
+            offline: Some(super::OfflineState { license_input: "KV1.saved".into(), importing: true, ..Default::default() }),
+            ..Default::default()
+        });
+        super::dispatch_ui("offline-request", super::ui::Event::Click, "{}");
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            let local = s.offline.as_ref().unwrap();
+            assert!(!local.importing);
+            assert_eq!(local.license_input, "KV1.saved");
+        });
+        super::dispatch_ui("offline-next", super::ui::Event::Click, "{}");
+        assert!(super::STATE.with(|state| state.borrow().offline.as_ref().unwrap().importing));
+        super::reset_order();
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            let local = s.offline.as_ref().unwrap();
+            assert!(!local.importing && local.license_input.is_empty());
+        });
     }
     #[test]
     fn keeps_an_order_number_embedded_in_an_input_event() {
@@ -2197,7 +2259,6 @@ mod tests {
             };
         });
         super::update_service(Err("爱发电服务暂时不可用".into()));
-        super::dispatch_ui(super::SERVICE_STATUS_EVENT, super::ui::Event::Click, "");
         super::STATE.with(|state| {
             let s = state.borrow();
             assert_eq!(s.service_status, super::ServiceStatus::Unavailable);
@@ -2233,7 +2294,7 @@ mod tests {
         };
         super::STATE.with(|state| {
             *state.borrow_mut() = super::State {
-                offline: Some(super::OfflineState { product_id: "com.komoridev.tankturmoil".into(), license_input: String::new() }),
+                offline: Some(super::OfflineState { product_id: "com.komoridev.tankturmoil".into(), ..Default::default() }),
                 pending: Some(pending),
                 ..Default::default()
             };
@@ -2302,19 +2363,44 @@ mod tests {
     }
 
     #[test]
-    fn service_failure_prompts_once_until_service_recovers() {
+    fn service_failure_shows_details_and_keeps_them_collapsed_until_recovery() {
         super::STATE.with(|state| *state.borrow_mut() = super::State::default());
         super::update_service(Err("network".into()));
-        assert!(super::STATE.with(|state| state.borrow().offline_prompt));
-        super::dispatch_ui("offline-decline", super::ui::Event::Click, "");
+        assert!(super::STATE.with(|state| state.borrow().service_reason_visible));
+        super::toggle_service_reason();
         super::update_service(Err("network again".into()));
-        assert!(!super::STATE.with(|state| state.borrow().offline_prompt));
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            assert!(!s.service_reason_visible);
+            assert_eq!(s.service_reason, "network again");
+        });
         super::update_service(Ok(()));
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            assert!(!s.service_reason_visible);
+            assert_eq!(s.service_reason, "");
+            assert_eq!(s.service_status, super::ServiceStatus::Healthy);
+        });
         super::update_service(Err("new outage".into()));
-        assert!(super::STATE.with(|state| state.borrow().offline_prompt));
-        super::dispatch_ui("offline-accept", super::ui::Event::Click, "");
+        assert!(super::STATE.with(|state| state.borrow().service_reason_visible));
+        super::dispatch_ui("offline-activate", super::ui::Event::Click, "");
         assert!(super::STATE.with(|state| state.borrow().offline.is_some()));
         assert!(!super::should_probe_service());
+    }
+
+    #[test]
+    fn offline_error_link_never_interrupts_license_installation() {
+        super::STATE.with(|state| *state.borrow_mut() = super::State {
+            pending: Some(pending_at(super::Phase::Installing, None, false)),
+            ..Default::default()
+        });
+        super::update_service(Err("network".into()));
+        super::dispatch_ui("offline-activate", super::ui::Event::Click, "");
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            assert!(s.offline.is_none());
+            assert!(s.pending.as_ref().unwrap().phase == super::Phase::Installing);
+        });
     }
 
     #[test]
