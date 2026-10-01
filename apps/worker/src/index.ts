@@ -5,7 +5,7 @@ import AfdianService, {
   type AfdianOrder,
 } from "@kovela/afdian";
 import { signLicense } from "@kovela/license/signing";
-import { PLUGIN_NAME, type ProductConfig } from "@kovela/protocol";
+import { PLUGIN_NAME, type ProductConfig, type OfflineLicense } from "@kovela/protocol";
 
 export interface Env {
   DB: D1Database;
@@ -17,6 +17,7 @@ export interface Env {
   AFDIAN_TOKEN: string;
   LICENSE_SIGNING_SEED: string;
   WEBHOOK_TOKEN: string;
+  ADMIN_KEY?: string;
   TURNSTILE_SITE_KEY?: string;
   TURNSTILE_SECRET_KEY?: string;
   AFDIAN_WEBHOOK_PUBLIC_KEY?: string;
@@ -365,6 +366,21 @@ export function createWorker(
     ]);
     await flushOutbox(env, api);
   }
+  async function bindLicense(env: Env, order: Entitlement, deviceId: string): Promise<Entitlement> {
+    const issuedAt = now();
+    const licenseToken = order.license_token ?? signLicense({
+      v: 1,
+      licenseId: order.license_id,
+      productId: order.product_id,
+      deviceId,
+      issuedAt,
+    }, env.LICENSE_SIGNING_SEED);
+    const bound = await env.DB.prepare(
+      "UPDATE entitlements SET device_id=?,license_token=COALESCE(license_token,?),issued_at=COALESCE(issued_at,?),state=CASE WHEN state='activated' THEN state ELSE 'issued' END,updated_at=? WHERE license_id=? AND (device_id IS NULL OR device_id=?) RETURNING *",
+    ).bind(deviceId, licenseToken, issuedAt, now(), order.license_id, deviceId).first<Entitlement>();
+    if (!bound) throw new HttpError(409, "DEVICE_BOUND", "此应用授权已绑定其他设备。");
+    return bound;
+  }
   async function receiptFor(
     env: Env,
     handoffHash: string,
@@ -482,6 +498,18 @@ export function createWorker(
       };
     if (request.method !== "POST")
       throw new HttpError(405, "METHOD_NOT_ALLOWED", "不支持此请求方式。");
+    const admin = url.pathname.startsWith("/api/admin/");
+    if (admin) {
+      await limit(env, "admin:" + (await digest(request.headers.get("CF-Connecting-IP") ?? "local")), 20, 60);
+      if (!/^[a-f0-9]{64}$/.test(env.ADMIN_KEY ?? ""))
+        throw new HttpError(503, "ADMIN_NOT_CONFIGURED", "管理员访问密钥尚未配置。");
+      const supplied = request.headers.get("Authorization")?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];
+      const [expectedHash, suppliedHash] = await Promise.all([digest(env.ADMIN_KEY!), digest(supplied ?? "")]);
+      let difference = 0;
+      for (let i = 0; i < expectedHash.length; i += 1) difference |= expectedHash.charCodeAt(i) ^ suppliedHash.charCodeAt(i);
+      if (!supplied || difference !== 0) throw new HttpError(401, "ADMIN_AUTH", "管理员访问密钥不正确。");
+      if (url.pathname === "/api/admin/session") return { authenticated: true };
+    }
     const body = await bodyOf(request, url.pathname === "/api/webhooks/afdian");
     if (url.pathname === "/api/orders/verify" && !verificationEnabled)
       throw new HttpError(
@@ -568,6 +596,28 @@ export function createWorker(
     }
     const ip = request.headers.get("CF-Connecting-IP") ?? "local";
     await limit(env, "ip:" + (await digest(ip)), 90, 60);
+    if (url.pathname === "/api/admin/licenses") {
+      if (!verificationEnabled) throw new HttpError(503, "NOT_CONFIGURED", "授权签发服务尚未配置完成。");
+      if (body.v !== 1 || body.type !== "kovela-offline-request")
+        throw new HttpError(400, "INVALID_INPUT", "不是 Kovela 离线激活申请。");
+      const orderNo = requireString(body, "orderNo", /^\d{16,32}$/);
+      const productId = requireString(body, "productId", productIdPattern);
+      const deviceId = requireString(body, "deviceId", /^[a-f0-9]{64}$/);
+      if (body.deviceModel !== undefined && (typeof body.deviceModel !== "string" || [...body.deviceModel].length > 80 || /[\u0000-\u001f\u007f]/.test(body.deviceModel)))
+        throw new HttpError(400, "INVALID_INPUT", "设备型号格式不正确。");
+      const product = availableProduct(products, productId);
+      const paidOrder = await eligible(api, orderNo);
+      if (!matchesProduct(paidOrder, product)) throw new HttpError(404, "ORDER_NOT_ELIGIBLE", "此订单不包含所选应用。");
+      await deliverPurchaseGuide(env, api, paidOrder, products.filter((item) => item.planIds.length > 0 && matchesProduct(paidOrder, item)));
+      const order = await env.DB.prepare("SELECT * FROM entitlements WHERE order_no=? AND product_id=?").bind(orderNo, productId).first<Entitlement>();
+      if (!order) throw new HttpError(503, "SERVICE_UNAVAILABLE", "暂时无法读取授权订单。");
+      const bound = await bindLicense(env, order, deviceId);
+      return {
+        v: 1, type: "kovela-offline-license", productId,
+        productName: product.productName, deviceId,
+        licenseId: bound.license_id, licenseToken: bound.license_token!,
+      } satisfies OfflineLicense;
+    }
     if (
       url.pathname === "/api/orders/verify" ||
       url.pathname === "/api/orders/lookup"
@@ -741,37 +791,7 @@ export function createWorker(
         .first();
       if (!claimed)
         throw new HttpError(409, "HANDOFF_USED", "该激活链接已被使用。");
-      const issuedAt = now();
-      const licenseToken =
-        order.license_token ??
-        signLicense(
-          {
-            v: 1,
-            licenseId: order.license_id,
-            productId: order.product_id,
-            deviceId,
-            issuedAt,
-          },
-          env.LICENSE_SIGNING_SEED,
-        );
-      const bound = await env.DB.prepare(
-        "UPDATE entitlements SET device_id=?,license_token=COALESCE(license_token,?),issued_at=COALESCE(issued_at,?),state=CASE WHEN state='activated' THEN state ELSE 'issued' END,updated_at=? WHERE license_id=? AND (device_id IS NULL OR device_id=?) RETURNING *",
-      )
-        .bind(
-          deviceId,
-          licenseToken,
-          issuedAt,
-          now(),
-          session.license_id,
-          deviceId,
-        )
-        .first<Entitlement>();
-      if (!bound)
-        throw new HttpError(
-          409,
-          "DEVICE_BOUND",
-          "此应用授权刚刚绑定了其他设备。",
-        );
+      const bound = await bindLicense(env, order, deviceId);
       return {
         licenseId: bound.license_id,
         licenseToken: bound.license_token,
@@ -907,7 +927,7 @@ export function createWorker(
       if (origin) headers.set("Access-Control-Allow-Origin", origin);
       if (request.method === "OPTIONS") {
         headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        headers.set("Access-Control-Allow-Headers", "Content-Type");
+        headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
         return new Response(null, { status: 204, headers });
       }
       const ctx = new Context();

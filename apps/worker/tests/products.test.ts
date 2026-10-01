@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { getPlatformProxy } from "wrangler";
 import { createWorker, type Env } from "../src/index";
 import type { AfdianOrder } from "@kovela/afdian";
 import type { ProductConfig } from "@kovela/protocol";
 import { verifyLicense } from "@kovela/license";
 import { signLicense } from "@kovela/license/signing";
+import { issueOfflineLicense, main as issueOfflineCommand } from "../../../scripts/issue-offline.mjs";
 
 const origin = "https://kovela.example.com";
 const issuer = generateKeyPairSync("ed25519");
@@ -595,4 +598,159 @@ test("upgrading preserves existing licenses, device bindings, status tokens and 
     productId: products[0].productId,
   });
   assert.equal(session.boundDeviceId, deviceId);
+});
+
+test("offline issuance shares the online device binding and only exports signed device licenses", async (t) => {
+  const { db, env, worker, ok } = await fixture(t);
+  env.PUBLIC_ORIGIN = origin;
+  env.DEV_MODE = "false";
+  await migrate(db, "0001_initial.sql");
+  await migrate(db, "0002_products.sql");
+  await migrate(db, "0003_guides.sql");
+  const deviceId = "a".repeat(64);
+  const request = {
+    v: 1, type: "kovela-offline-request", orderNo,
+    productId: products[0].productId, deviceId,
+  };
+  let ip = 0;
+  const transport: typeof fetch = (input, init) => worker.fetch(
+    new Request(String(input), { ...init, headers: { ...init?.headers, "CF-Connecting-IP": `192.0.2.${++ip}` } }), env,
+  );
+  const options = { origin, transport, verificationKey: publicKey };
+  const first = await issueOfflineLicense(request, options);
+  const repeated = await issueOfflineLicense(request, options);
+  assert.equal(repeated.licenseToken, first.licenseToken);
+  assert.deepEqual(Object.keys(first).sort(), ["v", "type", "productId", "productName", "deviceId", "licenseId", "licenseToken"].sort());
+  assert.equal(verifyLicense(first.licenseToken, publicKey, request.productId, deviceId)?.licenseId, first.licenseId);
+  assert.equal(verifyLicense(first.licenseToken, publicKey, request.productId, "b".repeat(64)), null);
+  await assert.rejects(issueOfflineLicense({ ...request, deviceId: "b".repeat(64) }, options), /DEVICE_BOUND/);
+  const online = await ok("/api/orders/lookup", { orderNo });
+  const blocked = await worker.fetch(new Request(origin + "/api/activate", {
+    method: "POST", headers: { "Content-Type": "application/json", "CF-Connecting-IP": "192.0.2.99" },
+    body: JSON.stringify({ handoffToken: online.items[0].handoffToken, productId: request.productId, deviceId: "b".repeat(64), requestId: "online-conflict-request-001" }),
+  }), env);
+  assert.equal(blocked.status, 409);
+  assert.equal((await blocked.json()).error.code, "DEVICE_BOUND");
+  const bound = await db.prepare("SELECT device_id,license_token,state FROM entitlements WHERE license_id=?").bind(first.licenseId).first();
+  assert.deepEqual(bound, { device_id: deviceId, license_token: first.licenseToken, state: "issued" });
+});
+
+test("offline issuer rejects unpaid orders, wrong products and an invalid server signature", async (t) => {
+  const { db, env, worker } = await fixture(t);
+  env.PUBLIC_ORIGIN = origin;
+  env.DEV_MODE = "false";
+  await migrate(db, "0001_initial.sql");
+  await migrate(db, "0002_products.sql");
+  await migrate(db, "0003_guides.sql");
+  const request = { v: 1, type: "kovela-offline-request", orderNo: unpaidNo, productId: products[0].productId, deviceId: "a".repeat(64) };
+  const transport: typeof fetch = (input, init) => worker.fetch(new Request(String(input), init), env);
+  const options = { origin, transport, verificationKey: publicKey };
+  await assert.rejects(issueOfflineLicense(request, options), /ORDER_NOT_ELIGIBLE/);
+  await assert.rejects(issueOfflineLicense({ ...request, orderNo, productId: products[1].productId }, options), /does not include/);
+  await assert.rejects(issueOfflineLicense({ ...request, orderNo }, { ...options, verificationKey: "0".repeat(64) }), /failed signature/);
+  const state = await db.prepare("SELECT device_id,license_token FROM entitlements WHERE order_no=? AND product_id=?").bind(unpaidNo, products[0].productId).first();
+  assert.equal(state, null);
+});
+
+test("offline issuance racing an online activation cannot bind one order to two devices", async (t) => {
+  const { db, env, worker, ok } = await fixture(t);
+  env.PUBLIC_ORIGIN = origin;
+  env.DEV_MODE = "false";
+  await migrate(db, "0001_initial.sql");
+  await migrate(db, "0002_products.sql");
+  await migrate(db, "0003_guides.sql");
+  const online = await ok("/api/orders/lookup", { orderNo });
+  const transport: typeof fetch = (input, init) => worker.fetch(new Request(String(input), init), env);
+  const offline = issueOfflineLicense({ v: 1, type: "kovela-offline-request", orderNo, productId: products[0].productId, deviceId: "a".repeat(64) }, { origin, transport, verificationKey: publicKey });
+  const competing = worker.fetch(new Request(origin + "/api/activate", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ handoffToken: online.items[0].handoffToken, productId: products[0].productId, deviceId: "b".repeat(64), requestId: "competing-online-request-001" }),
+  }), env);
+  const [issued, response] = await Promise.all([offline.then((value) => ({ value, error: null }), (error) => ({ value: null, error })), competing]);
+  const successful = Number(issued.value !== null) + Number(response.status === 200);
+  assert.equal(successful, 1);
+  if (issued.error) assert.match(issued.error.message, /DEVICE_BOUND/);
+  if (response.status !== 200) assert.equal((await response.json()).error.code, "DEVICE_BOUND");
+  const bound = await db.prepare("SELECT device_id,license_token FROM entitlements WHERE order_no=? AND product_id=?").bind(orderNo, products[0].productId).first<{ device_id: string; license_token: string }>();
+  assert.equal(bound?.device_id, issued.value ? "a".repeat(64) : "b".repeat(64));
+  assert.equal(verifyLicense(bound?.license_token, publicKey, products[0].productId, bound!.device_id)?.deviceId, bound?.device_id);
+});
+
+test("offline CLI exports a verified file and refuses to overwrite or leave a failed output", async (t) => {
+  const { db, env, worker } = await fixture(t);
+  env.PUBLIC_ORIGIN = origin;
+  env.DEV_MODE = "false";
+  await migrate(db, "0001_initial.sql");
+  await migrate(db, "0002_products.sql");
+  await migrate(db, "0003_guides.sql");
+  const directory = await mkdtemp(path.join(tmpdir(), "kovela-offline-cli-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const inputFile = path.join(directory, "request.json");
+  const outputFile = path.join(directory, "license.json");
+  const failedFile = path.join(directory, "failed.json");
+  const request = { v: 1, type: "kovela-offline-request", orderNo, productId: products[0].productId, deviceId: "a".repeat(64) };
+  await writeFile(inputFile, JSON.stringify(request));
+  const transport: typeof fetch = (input, init) => worker.fetch(new Request(String(input), init), env);
+  const dependencies = { transport, verificationKey: publicKey };
+  const args = ["--", "--request", inputFile, "--output", outputFile, "--origin", origin];
+  await issueOfflineCommand(args, dependencies);
+  const exported = JSON.parse(await readFile(outputFile, "utf8"));
+  assert.equal(verifyLicense(exported.licenseToken, publicKey, request.productId, request.deviceId)?.licenseId, exported.licenseId);
+  assert.equal(exported.receiptToken, undefined);
+  assert.equal(exported.handoffToken, undefined);
+  await assert.rejects(issueOfflineCommand(args, dependencies), { code: "EEXIST" });
+  await writeFile(inputFile, JSON.stringify({ ...request, orderNo: unpaidNo }));
+  await assert.rejects(issueOfflineCommand(["--request", inputFile, "--output", failedFile, "--origin", origin], dependencies), /ORDER_NOT_ELIGIBLE/);
+  await assert.rejects(readFile(failedFile), { code: "ENOENT" });
+});
+
+test("admin signing authenticates before orders and shares online device bindings", async (t) => {
+  let queries = 0;
+  const { db, env, worker, ok } = await fixture(t, (number) => { queries += 1; return orders[number]; });
+  env.PUBLIC_ORIGIN = origin;
+  env.DEV_MODE = "false";
+  env.ADMIN_KEY = "e".repeat(64);
+  for (const migration of ["0001_initial.sql", "0002_products.sql", "0003_guides.sql"]) await migrate(db, migration);
+  const input = { v: 1, type: "kovela-offline-request", orderNo, productId: products[0].productId, deviceId: "a".repeat(64) };
+  const admin = (path: string, value: unknown, key?: string) => worker.fetch(new Request(origin + path, {
+    method: "POST", headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(value),
+  }), env);
+  for (const key of [undefined, "f".repeat(64)]) assert.equal((await admin("/api/admin/licenses", input, key)).status, 401);
+  assert.equal(queries, 0);
+  assert.equal(await db.prepare("SELECT COUNT(*) AS total FROM entitlements").first("total"), 0);
+  assert.deepEqual(await (await admin("/api/admin/session", {}, env.ADMIN_KEY)).json(), { authenticated: true });
+  const response = await admin("/api/admin/licenses", input, env.ADMIN_KEY);
+  assert.equal(response.status, 200);
+  const license = await response.json();
+  assert.equal(verifyLicense(license.licenseToken, publicKey, input.productId, input.deviceId)?.licenseId, license.licenseId);
+  assert.deepEqual(Object.keys(license).sort(), ["v", "type", "productId", "productName", "deviceId", "licenseId", "licenseToken"].sort());
+  const repeated = await (await admin("/api/admin/licenses", input, env.ADMIN_KEY)).json();
+  assert.equal(repeated.licenseToken, license.licenseToken);
+  assert.equal((await admin("/api/admin/licenses", { ...input, deviceId: "b".repeat(64) }, env.ADMIN_KEY)).status, 409);
+  assert.equal((await admin("/api/admin/licenses", { ...input, orderNo: unpaidNo }, env.ADMIN_KEY)).status, 404);
+  assert.equal((await admin("/api/admin/licenses", { ...input, productId: products[1].productId }, env.ADMIN_KEY)).status, 404);
+  const online = await ok("/api/orders/lookup", { orderNo });
+  const competing = await worker.fetch(new Request(origin + "/api/activate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ handoffToken: online.items[0].handoffToken, productId: input.productId, deviceId: "b".repeat(64), requestId: "admin-online-conflict-001" }) }), env);
+  assert.equal(competing.status, 409);
+  assert.deepEqual(await db.prepare("SELECT device_id,state FROM entitlements WHERE license_id=?").bind(license.licenseId).first(), { device_id: input.deviceId, state: "issued" });
+  env.ADMIN_KEY = undefined;
+  assert.equal((await admin("/api/admin/licenses", input, "e".repeat(64))).status, 503);
+});
+
+test("admin issuance racing online activation cannot bind two devices", async (t) => {
+  const { db, env, worker, ok } = await fixture(t);
+  env.PUBLIC_ORIGIN = origin;
+  env.DEV_MODE = "false";
+  env.ADMIN_KEY = "e".repeat(64);
+  for (const migration of ["0001_initial.sql", "0002_products.sql", "0003_guides.sql"]) await migrate(db, migration);
+  const online = await ok("/api/orders/lookup", { orderNo });
+  const responses = await Promise.all([
+    worker.fetch(new Request(origin + "/api/admin/licenses", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.ADMIN_KEY}` }, body: JSON.stringify({ v: 1, type: "kovela-offline-request", orderNo, productId: products[0].productId, deviceId: "a".repeat(64) }) }), env),
+    worker.fetch(new Request(origin + "/api/activate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ handoffToken: online.items[0].handoffToken, productId: products[0].productId, deviceId: "b".repeat(64), requestId: "admin-online-race-001" }) }), env),
+  ]);
+  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 409]);
+  const successful = await responses.find((response) => response.status === 200)!.json();
+  const bound = await db.prepare("SELECT device_id,license_token FROM entitlements WHERE order_no=? AND product_id=?").bind(orderNo, products[0].productId).first<{ device_id: string; license_token: string }>();
+  assert.equal(bound?.device_id, successful.deviceId);
+  assert.equal(verifyLicense(bound?.license_token, publicKey, products[0].productId, successful.deviceId)?.licenseId, successful.licenseId);
 });

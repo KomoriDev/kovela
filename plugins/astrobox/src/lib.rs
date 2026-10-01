@@ -7,7 +7,7 @@ wit_bindgen::generate!({
 
 #[cfg(feature = "api4")]
 use astrobox::psys_host_v4::{
-    device, dialog, interconnect, notification, register, thirdpartyapp, timer, ui,
+    clipboard, device, dialog, interconnect, notification, register, thirdpartyapp, timer, ui,
 };
 #[cfg(feature = "api4")]
 use exports::astrobox::psys_plugin_v4::{
@@ -18,7 +18,7 @@ use exports::astrobox::psys_plugin_v4::{
 use astrobox_ng_wit::FutureReader;
 #[cfg(not(feature = "api4"))]
 use astrobox_ng_wit::astrobox::psys_host::{
-    device, dialog, interconnect, register, thirdpartyapp, timer, ui_v3 as ui,
+    clipboard, device, dialog, interconnect, register, thirdpartyapp, timer, ui_v3 as ui,
 };
 #[cfg(not(feature = "api4"))]
 use astrobox_ng_wit::exports::astrobox::psys_plugin::{
@@ -27,10 +27,13 @@ use astrobox_ng_wit::exports::astrobox::psys_plugin::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{cell::RefCell, time::Duration};
+use std::{cell::RefCell, time::{Duration, Instant}};
 use uuid::Uuid;
 
 mod theme;
+mod offline;
+#[cfg(not(feature = "api4"))]
+mod file_picker;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,23 +48,34 @@ struct Handoff {
 struct Issued {
     license_id: String,
     license_token: String,
-    receipt_token: String,
+    receipt_token: Option<String>,
     product_id: String,
     device_id: String,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
     Hello,
+    AwaitingLicense,
     Issuing,
     Installing,
     Reporting,
     Retry,
     Complete,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ServiceStatus {
+    #[default]
+    Checking,
+    Healthy,
+    Unavailable,
+}
+
 #[derive(Clone)]
 struct Pending {
     id: String,
     addr: String,
+    offline: bool,
     device_id: Option<String>,
     device_model: Option<String>,
     issued: Option<Issued>,
@@ -78,6 +92,20 @@ struct Offer {
     handoff_token: String,
     bound_device_id: Option<String>,
 }
+
+#[derive(Clone)]
+struct OfflineState {
+    product_id: String,
+    license_input: String,
+}
+impl Default for OfflineState {
+    fn default() -> Self {
+        Self {
+            product_id: offline::PRODUCTS[0].0.into(),
+            license_input: String::new(),
+        }
+    }
+}
 #[derive(Default)]
 struct State {
     root: Option<String>,
@@ -85,6 +113,9 @@ struct State {
     offers: Vec<Offer>,
     verifying: bool,
     handoff: Option<Handoff>,
+    offline: Option<OfflineState>,
+    #[cfg(not(feature = "api4"))]
+    file_picker: Option<file_picker::FilePicker>,
     devices: Vec<(String, String)>,
     selected: Option<usize>,
     pending: Option<Pending>,
@@ -93,7 +124,16 @@ struct State {
     scan_gen: u32,
     scan_tries: u32,
     scanning: bool,
+    service_status: ServiceStatus,
+    service_reason: String,
+    service_check_started: bool,
+    service_reason_visible: bool,
+    offline_prompt: bool,
+    offline_prompt_dismissed: bool,
+    status_clicks: u8,
+    last_status_click: Option<Instant>,
 }
+
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
 struct Kovela;
 
@@ -105,6 +145,12 @@ const PURCHASE_URL: &str = "https://afdian.com/a/komoridev";
 const COMMUNITY_EVENT: &str = "community";
 const PURCHASE_EVENT: &str = "purchase";
 const WEBSITE_EVENT: &str = "website";
+
+const SERVICE_STATUS_EVENT: &str = "service-status";
+const SERVICE_CHECK_PAYLOAD: &str = "service-check";
+const SERVICE_CHECK_DELAY_MS: u64 = 60_000;
+#[cfg(not(feature = "api4"))]
+const OFFLINE_FILE_PAYLOAD: &str = "offline-file";
 
 async fn host_register_recv(addr: &str, package: &str) -> Result<(), String> {
     #[cfg(feature = "api4")]
@@ -287,13 +333,224 @@ fn hello_tick(id: &str) -> Option<Option<(String, String)>> {
         if let Some(p) = s.pending.as_mut() {
             p.hello_tries += 1;
         }
-        let package = s.handoff.as_ref()?.product_id.clone();
+        let package = target(&s)?.0;
         let addr = s.pending.as_ref()?.addr.clone();
         Some(Some((addr, package)))
     })
 }
 fn locked() -> bool {
     busy() || STATE.with(|state| state.borrow().verifying)
+}
+
+fn target(s: &State) -> Option<(String, String)> {
+    if let Some(local) = &s.offline {
+        return Some((local.product_id.clone(), offline::product_name(&local.product_id)?.into()));
+    }
+    s.handoff.as_ref().map(|item| (item.product_id.clone(), item.product_name.clone()))
+}
+
+
+fn enter_offline() {
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        let product_id = s.handoff.as_ref().map(|item| item.product_id.as_str())
+            .filter(|id| offline::product_name(id).is_some())
+            .unwrap_or(offline::PRODUCTS[0].0).to_string();
+        let mut license_input = String::new();
+        if let Some(p) = s.pending.as_mut().filter(|p| p.device_id.is_some()) {
+            p.offline = true;
+            if let Some(issued) = p.issued.as_mut() {
+                license_input = issued.license_token.clone();
+                issued.receipt_token = None;
+            }
+            p.phase = if p.ack == Some(true) { Phase::Complete } else { Phase::AwaitingLicense };
+            p.reported = p.ack == Some(true);
+        } else {
+            s.pending = None;
+        }
+        s.verifying = false;
+        s.offline = Some(OfflineState { product_id, license_input });
+        s.offline_prompt = false;
+        s.status_clicks = 0;
+        s.last_status_click = None;
+        s.service_reason_visible = false;
+        s.message = if s.pending.as_ref().is_some_and(|p| p.phase == Phase::Complete) {
+            "激活成功，许可证已保存在手环".into()
+        } else { String::new() };
+    });
+    render();
+}
+
+fn return_online() {
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.offline = None;
+        s.pending = None;
+        s.handoff = None;
+        s.offers.clear();
+        s.message.clear();
+        s.offline_prompt = false;
+        s.offline_prompt_dismissed = false;
+    });
+    render();
+}
+
+fn offline_request() -> Result<String, String> {
+    STATE.with(|state| {
+        let s = state.borrow();
+        let local = s.offline.as_ref().ok_or("请切换到离线激活")?;
+        let pending = s.pending.as_ref().ok_or("请先获取设备码")?;
+        let device_id = pending.device_id.as_deref().ok_or("请先获取设备码")?;
+        offline::request(&s.order_no, &local.product_id, device_id, pending.device_model.as_deref())
+    })
+}
+
+async fn copy_offline_request() {
+    let text = match offline_request() {
+        Ok(text) => text,
+        Err(error) => { show(error); return; }
+    };
+    #[cfg(feature = "api4")]
+    let result = clipboard::write_text(text).await;
+    #[cfg(not(feature = "api4"))]
+    let result = clipboard::write_text(&text).await.map_err(|()| "无法写入剪贴板，请授予权限".to_string());
+    show(match result { Ok(()) => "申请已复制".into(), Err(error) => error });
+}
+
+fn remember_license(payload: &str) {
+    if payload.len() > 16_384 { return; }
+    let text = event_text(payload);
+    if text.len() > 8192 { show("许可证内容过长"); return; }
+    STATE.with(|state| {
+        if let Some(local) = state.borrow_mut().offline.as_mut() {
+            local.license_input = text;
+        }
+    });
+}
+
+async fn paste_offline_license() {
+    #[cfg(feature = "api4")]
+    let result = clipboard::read_text().await;
+    #[cfg(not(feature = "api4"))]
+    let result = clipboard::read_text().await.map_err(|()| "无法读取剪贴板，请授予权限".to_string());
+    match result {
+        Ok(text) => { remember_license(&serde_json::to_string(&text).unwrap()); render(); }
+        Err(error) => show(error),
+    }
+}
+
+async fn load_offline_license() {
+    let config = dialog::PickConfig { read: true, copy_to: None };
+    let filter = dialog::FilterConfig { multiple: false, extensions: vec!["json".into(), "txt".into()], default_directory: String::new(), default_file_name: String::new() };
+    #[cfg(feature = "api4")]
+    accept_license_file(dialog::pick_file(config, filter).await);
+    #[cfg(not(feature = "api4"))]
+    {
+        STATE.with(|state| state.borrow_mut().file_picker = Some(file_picker::FilePicker::new(dialog::pick_file(&config, &filter))));
+        render();
+        poll_offline_file().await;
+    }
+}
+
+#[cfg(not(feature = "api4"))]
+async fn poll_offline_file() {
+    let Some(mut picker) = STATE.with(|state| state.borrow_mut().file_picker.take()) else { return; };
+    match picker.poll() {
+        std::task::Poll::Ready(file) => { drop(picker); accept_license_file(Ok(file)); render(); }
+        std::task::Poll::Pending => {
+            STATE.with(|state| state.borrow_mut().file_picker = Some(picker));
+            host_timeout(250, OFFLINE_FILE_PAYLOAD).await;
+        }
+    }
+}
+
+fn accept_license_file(result: Result<dialog::PickResult, String>) {
+    match result {
+        Ok(file) if file.data.is_empty() => {},
+        Ok(file) if file.data.len() > 8192 => show("许可证文件过长"),
+        Ok(file) => match String::from_utf8(file.data) {
+            Ok(text) => { remember_license(&serde_json::to_string(&text).unwrap()); render(); }
+            Err(_) => show("许可证文件不是 UTF-8 文本"),
+        },
+        Err(error) => show(error),
+    }
+}
+
+async fn import_offline_license() {
+    let result: Result<Option<Pending>, String> = STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        let local = s.offline.as_ref().ok_or("请切换到离线激活")?;
+        let license = offline::parse_license(&local.license_input)?;
+        if license.product_id != local.product_id { return Err("许可证不属于所选应用".into()); }
+        if let Some(p) = s.pending.as_mut() {
+            if p.device_id.as_deref().is_some_and(|id| id != license.device_id) { return Err("许可证不属于当前手环".into()); }
+            if p.device_id.is_some() {
+                p.issued = Some(Issued { license_id: license.license_id, license_token: license.license_token, receipt_token: None, product_id: license.product_id, device_id: license.device_id });
+                p.ack = None;
+                p.reported = false;
+                p.install_retries = 0;
+                return Ok(Some(p.clone()));
+            }
+        }
+        Ok(None)
+    });
+    match result {
+        Ok(Some(pending)) => send_install(pending).await,
+        Ok(None) => start_activation().await,
+        Err(error) => show(error),
+    }
+}
+
+fn render_offline(root: &str) {
+    let page = STATE.with(|state| {
+        let s = state.borrow();
+        let Some(local) = s.offline.as_ref() else { return theme::page(); };
+        let active = busy();
+        let complete = s.pending.as_ref().is_some_and(|p| p.phase == Phase::Complete);
+        let mut page = theme::page()
+            .child(theme::top_bar(2, theme::chip("离线")))
+            .child(theme::headline(if complete { "激活完成" } else { "应用激活" }));
+        if !s.message.is_empty() { page = page.child(theme::body(&s.message)); }
+        page = page.child(gate(theme::field("爱发电订单号", "order-input").on(ui::Event::Blur, "order-input").prop("default-value", &s.order_no), active || complete));
+        let mut products = ui::Element::new(ui::ElementType::Select, None)
+            .prop("default-value", &local.product_id)
+            .on(ui::Event::Change, "offline-product");
+        for (id, name) in offline::PRODUCTS {
+            products = products.child(ui::Element::new(ui::ElementType::Option, Some(name)).prop("value", id));
+        }
+        page = page.child(gate(products, active || complete));
+        let ready = s.pending.as_ref().and_then(|p| p.device_id.as_ref());
+        if let Some(id) = ready {
+            page = page.child(theme::label("设备码"))
+                .child(theme::field("设备码", "device-code").height(80).prop("default-value", id).prop("read-only", "true"));
+        } else {
+            if !s.device_note.is_empty() { page = page.child(theme::status(&s.device_note)); }
+            for (index, (addr, name)) in s.devices.iter().enumerate() {
+                let text = if name.trim().is_empty() { addr } else { name };
+                let event = format!("device:{index}");
+                let button = if s.selected == Some(index) { theme::tonal_button(text, &event) } else { theme::outlined_button(text, &event) };
+                page = page.child(gate(button, active));
+            }
+            page = page.child(gate(theme::outlined_button("刷新设备", "refresh"), active));
+        }
+        if !complete {
+            page = page.child(gate(theme::outlined_button(if active { "连接中…" } else { "获取设备码" }, "offline-device"), active || s.selected.is_none()));
+            if let Ok(request) = offline_request() {
+                page = page.child(theme::label("激活申请"))
+                    .child(theme::field("激活申请", "request-text").height(112).prop("default-value", &request).prop("read-only", "true"))
+                    .child(gate(theme::outlined_button("复制申请", "offline-copy"), active));
+            }
+            page = page.child(theme::section("许可证"))
+                .child(gate(theme::field("KV1 授权串或许可证 JSON", "license-input").on(ui::Event::Blur, "license-input").height(128).prop("default-value", &local.license_input), active))
+                .child(theme::row(theme::space::TWO)
+                    .child(gate(theme::outlined_button("粘贴", "offline-paste").flex_shrink(1.0).min_width(0), active))
+                    .child(gate(theme::outlined_button("选择文件", "offline-file").flex_shrink(1.0).min_width(0), active)))
+                .child(gate(theme::filled_button(if active { "写入中…" } else { "导入并激活" }, "offline-import"), active || s.selected.is_none()));
+        }
+        page.child(gate(theme::text_button("返回在线", "return-online"), active))
+            .child(gate(theme::text_button("重新开始", "cancel"), active))
+    });
+    ui::render(root, theme::shell().child(page).child(theme::footer(&[("爱发电", PURCHASE_EVENT), ("官群", COMMUNITY_EVENT)])));
 }
 
 
@@ -343,11 +600,10 @@ fn parse_offers(value: &Value) -> Result<Vec<Offer>, String> {
 
 fn busy() -> bool {
     STATE.with(|state| {
-        state
-            .borrow()
-            .pending
-            .as_ref()
-            .is_some_and(|p| !matches!(p.phase, Phase::Retry | Phase::Complete))
+        let s = state.borrow();
+        #[cfg(not(feature = "api4"))]
+        if s.file_picker.is_some() { return true; }
+        s.pending.as_ref().is_some_and(|p| !matches!(p.phase, Phase::AwaitingLicense | Phase::Retry | Phase::Complete))
     })
 }
 fn fail(message: impl Into<String>) {
@@ -421,7 +677,7 @@ fn offer_card(offer: &Offer, index: usize) -> ui::Element {
 fn activation_step(pending: Option<&Pending>) -> usize {
     match pending.map(|item| item.phase) {
         Some(Phase::Hello) => 0,
-        Some(Phase::Issuing) => 1,
+        Some(Phase::AwaitingLicense | Phase::Issuing) => 1,
         Some(Phase::Installing) => 2,
         Some(Phase::Reporting) => 3,
         // 重试只是回到最近失败的那一段，不能把没走过的段落标成已完成。
@@ -452,6 +708,9 @@ fn render() {
         device_note,
         scanning,
         scan_tries,
+        service_status,
+        service_reason,
+        service_reason_visible,
     ) = STATE.with(|state| {
         let s = state.borrow();
         (
@@ -467,16 +726,23 @@ fn render() {
             s.device_note.clone(),
             s.scanning,
             s.scan_tries,
+            s.service_status,
+            s.service_reason.clone(),
+            s.service_reason_visible,
         )
     });
     let Some(root) = root else { return };
+    if STATE.with(|state| state.borrow().offline.is_some()) {
+        render_offline(&root);
+        return;
+    }
     let phase = pending.as_ref().map(|item| item.phase);
-    let active = phase.is_some_and(|phase| !matches!(phase, Phase::Retry | Phase::Complete));
+    let active = phase.is_some_and(|phase| !matches!(phase, Phase::AwaitingLicense | Phase::Retry | Phase::Complete));
     let complete = phase == Some(Phase::Complete);
     let ui_locked = verifying || active;
     let progress = match phase {
         Some(Phase::Hello) => Some(35),
-        Some(Phase::Issuing) => Some(55),
+        Some(Phase::AwaitingLicense | Phase::Issuing) => Some(55),
         Some(Phase::Installing) | Some(Phase::Retry) => Some(75),
         Some(Phase::Reporting) => Some(90),
         Some(Phase::Complete) => Some(100),
@@ -499,9 +765,21 @@ fn render() {
     } else {
         2
     };
-    let mut page = theme::page()
-        .child(theme::steps(step))
-        .child(theme::headline(&heading));
+    let service_error = service_status == ServiceStatus::Unavailable;
+    let mut page = theme::page().child(theme::top_bar(
+        step,
+        theme::service_badge(service_status),
+    ));
+    if service_error && service_reason_visible {
+        page = page.child(theme::service_reason(&service_reason));
+    }
+    if !ui_locked && STATE.with(|state| state.borrow().offline_prompt) {
+        page = page.child(theme::section("服务暂时不可用，是否离线激活？"))
+            .child(theme::row(theme::space::TWO)
+                .child(theme::outlined_button("继续在线", "offline-decline").flex_shrink(1.0).min_width(0))
+                .child(theme::tonal_button("离线激活", "offline-accept").flex_shrink(1.0).min_width(0)));
+    }
+    page = page.child(theme::headline(&heading));
     match step {
         1 => {
             page = page.child(if message.is_empty() {
@@ -516,7 +794,10 @@ fn render() {
             };
             let verify = gate(theme::filled_button(verify_label, "verify"), ui_locked);
             page = page
-                .child(gate(theme::field("爱发电订单号", "order-input"), ui_locked))
+                .child(gate(
+                    theme::field("爱发电订单号", "order-input").prop("default-value", &order_no),
+                    ui_locked,
+                ))
                 .child(verify);
         }
         _ => {
@@ -735,24 +1016,136 @@ fn post<T: serde::de::DeserializeOwned>(
         .connect_timeout(Duration::from_secs(12))
         .body(serde_json::to_vec(&body).map_err(|_| "请求发送失败")?)
         .send()
-        .map_err(|_| "无法连接服务器，请检查网络后重试")?;
+        .map_err(|_| {
+            let reason = "无法连接服务器，请检查网络后重试".to_string();
+            update_service(Err(reason.clone()));
+            reason
+        })?;
     let status = response.status_code();
-    let bytes = response
+    let result = response
         .body()
-        .map_err(|_| "服务器响应不完整，请重试")?;
-    if bytes.len() > 16384 {
+        .map_err(|_| "服务器响应不完整，请重试".to_string())
+        .and_then(|bytes| parse_response(status, &bytes));
+    match &result {
+        Ok(_) => {
+            update_service(Ok(()));
+        }
+        Err(reason) if status >= 500 || (200..300).contains(&status) => {
+            update_service(Err(reason.clone()));
+        }
+        _ => {}
+    }
+    result
+}
+
+fn parse_response<T: serde::de::DeserializeOwned>(status: u16, bytes: &[u8]) -> Result<T, String> {
+    if bytes.len() > 16_384 {
         return Err("服务器响应过长".into());
     }
     if !(200..300).contains(&status) {
-        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        return Err(value
+        let value: Value = serde_json::from_slice(bytes).unwrap_or(Value::Null);
+        let message = value
             .pointer("/error/message")
             .and_then(Value::as_str)
-            .filter(|s| s.len() < 512)
-            .unwrap_or("查询失败，请重试")
-            .into());
+            .filter(|message| !message.trim().is_empty() && message.len() < 512);
+        return Err(match message {
+            Some(message) => message.to_string(),
+            None => format!("服务返回异常（HTTP {status}）"),
+        });
     }
-    serde_json::from_slice(&bytes).map_err(|_| "服务器响应无法识别".into())
+    serde_json::from_slice(bytes).map_err(|_| "服务器响应无法识别".into())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceConfig {
+    verification_enabled: bool,
+}
+
+fn check_service() -> Result<(), String> {
+    let response = waki::Client::new()
+        .get(&format!("{}/api/config", server_origin()))
+        .connect_timeout(Duration::from_secs(8))
+        .send()
+        .map_err(|_| "无法连接服务，请检查网络".to_string())?;
+    let status = response.status_code();
+    let bytes = response.body().map_err(|_| "服务响应不完整".to_string())?;
+    parse_service_config(status, &bytes)
+}
+
+fn parse_service_config(status: u16, bytes: &[u8]) -> Result<(), String> {
+    let config: ServiceConfig = parse_response(status, bytes)?;
+    if !config.verification_enabled {
+        return Err("购买验证尚未开放，请等待服务配置完成".into());
+    }
+    Ok(())
+}
+
+fn update_service(result: Result<(), String>) -> bool {
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        match result {
+            Ok(()) => {
+                let changed = s.service_status != ServiceStatus::Healthy;
+                s.service_status = ServiceStatus::Healthy;
+                s.service_reason.clear();
+                s.service_reason_visible = false;
+                s.offline_prompt = false;
+                s.offline_prompt_dismissed = false;
+                changed
+            }
+            Err(reason) => {
+                let changed = s.service_status != ServiceStatus::Unavailable
+                    || s.service_reason != reason;
+                s.service_status = ServiceStatus::Unavailable;
+                s.service_reason = reason;
+                if s.offline.is_none() && !s.offline_prompt_dismissed { s.offline_prompt = true; }
+                changed
+            }
+        }
+    })
+}
+
+fn toggle_service_reason() {
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        if s.service_status == ServiceStatus::Unavailable {
+            s.service_reason_visible = !s.service_reason_visible;
+        }
+    });
+    render();
+}
+
+fn status_shortcut(now: Instant) -> bool {
+    let can_switch = !locked();
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        if !can_switch || s.offline.is_some() {
+            s.status_clicks = 0;
+            s.last_status_click = None;
+            return false;
+        }
+        s.status_clicks = if s.last_status_click.is_some_and(|last| now.saturating_duration_since(last) <= Duration::from_millis(1_500)) {
+            s.status_clicks + 1
+        } else { 1 };
+        s.last_status_click = Some(now);
+        if s.status_clicks == 5 {
+            s.status_clicks = 0;
+            s.last_status_click = None;
+            true
+        } else { false }
+    })
+}
+
+async fn probe_service() {
+    if should_probe_service() && update_service(check_service()) {
+        render();
+    }
+    host_timeout(SERVICE_CHECK_DELAY_MS, SERVICE_CHECK_PAYLOAD).await;
+}
+
+fn should_probe_service() -> bool {
+    !STATE.with(|state| state.borrow().offline.is_some()) && !locked()
 }
 fn show(message: impl Into<String>) {
     STATE.with(|state| state.borrow_mut().message = message.into());
@@ -766,7 +1159,8 @@ fn reset_order() {
         s.pending = None;
         s.selected = None;
         s.verifying = false;
-        s.message = "请输入爱发电订单号".into();
+        s.message = if s.offline.is_some() { String::new() } else { "请输入爱发电订单号".into() };
+        if let Some(local) = s.offline.as_mut() { local.license_input.clear(); }
     });
     render();
 }
@@ -904,7 +1298,7 @@ async fn send_install(pending: Pending) {
 async fn start_activation() {
     let needs_scan = STATE.with(|state| {
         let s = state.borrow();
-        s.handoff.is_some() && s.devices.is_empty()
+        target(&s).is_some() && s.devices.is_empty()
     });
     if needs_scan {
         load_devices().await;
@@ -934,7 +1328,8 @@ async fn start_activation() {
     }
     let selection = STATE.with(|state| {
         let mut s = state.borrow_mut();
-        let handoff = s.handoff.clone()?;
+        let (product_id, product_name) = target(&s)?;
+        let is_offline = s.offline.is_some();
         let index = match s.selected {
             Some(index) if index < s.devices.len() => index,
             _ => 0,
@@ -948,6 +1343,7 @@ async fn start_activation() {
         s.pending = Some(Pending {
             id: id.clone(),
             addr: addr.clone(),
+            offline: is_offline,
             device_id: None,
             device_model: None,
             issued: None,
@@ -958,18 +1354,18 @@ async fn start_activation() {
             install_retries: 0,
         });
         s.message = "正在获取设备信息…".into();
-        Some((handoff, addr, id))
+        Some((product_id, product_name, addr, id))
     });
-    let Some((handoff, addr, id)) = selection else {
+    let Some((product_id, product_name, addr, id)) = selection else {
         fail("未检测到设备：请在 AstroBox 中连接手环，然后点「刷新设备」");
         return;
     };
     render();
-    if let Err(error) = open_app(&addr, &handoff.product_id).await {
+    if let Err(error) = open_app(&addr, &product_id).await {
         fail(error);
         return;
     }
-    if host_register_recv(&addr, &handoff.product_id)
+    if host_register_recv(&addr, &product_id)
         .await
         .is_err()
     {
@@ -977,13 +1373,13 @@ async fn start_activation() {
         return;
     }
     let message = json!({"v":1,"id":id,"type":"hello"}).to_string();
-    if host_send(&addr, &handoff.product_id, &message)
+    if host_send(&addr, &product_id, &message)
         .await
         .is_err()
     {
         fail(format!(
             "无法连接{}，请在手环上打开应用",
-            handoff.product_name
+            product_name
         ));
         return;
     }
@@ -1012,6 +1408,18 @@ async fn notify_activated(addr: String, product: String) {
 
 async fn report(pending: Pending) {
     let (Some(issued), Some(success)) = (pending.issued.as_ref(), pending.ack) else {
+        return;
+    };
+    if pending.offline {
+        if success {
+            complete_offline(&pending.id);
+        } else {
+            fail("许可证未能写入，请查看手环提示后重试");
+        }
+        return;
+    }
+    let Some(receipt_token) = issued.receipt_token.as_deref() else {
+        fail("激活回执凭证缺失，请重新查询订单");
         return;
     };
     if !set_phase(
@@ -1051,7 +1459,7 @@ async fn report(pending: Pending) {
         &origin,
         "/api/activation/report",
         {
-            let mut payload = json!({"receiptToken":issued.receipt_token,"requestId":pending.id,"licenseId":issued.license_id,"deviceId":issued.device_id,"result":if success{"activated"}else{"failed"}});
+            let mut payload = json!({"receiptToken":receipt_token,"requestId":pending.id,"licenseId":issued.license_id,"deviceId":issued.device_id,"result":if success{"activated"}else{"failed"}});
             if let Some(model) = pending.device_model.clone().or_else(|| connected_name(&pending.addr)) {
                 payload["deviceModel"] = Value::String(model);
             }
@@ -1099,6 +1507,18 @@ async fn report(pending: Pending) {
     }
 }
 
+fn complete_offline(id: &str) {
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        let Some(p) = s.pending.as_mut() else { return; };
+        if !p.offline || p.id != id || p.ack != Some(true) { return; }
+        p.phase = Phase::Complete;
+        p.reported = true;
+        s.message = "离线激活成功，许可证已保存在手环".into();
+    });
+    render();
+}
+
 async fn on_device_message(raw: &str) {
     if raw.len() > 4096 {
         return;
@@ -1130,6 +1550,11 @@ async fn on_device_message(raw: &str) {
             fail("设备未提供有效标识，请检查权限");
             return;
         };
+        let expected = STATE.with(|state| target(&state.borrow()).map(|item| item.0));
+        if message["productId"].as_str() != expected.as_deref() {
+            fail("连接到的应用不匹配");
+            return;
+        }
         let handoff = STATE.with(|state| {
             let mut s = state.borrow_mut();
             let model = message
@@ -1140,6 +1565,13 @@ async fn on_device_message(raw: &str) {
             s.pending.as_mut().unwrap().device_model = model;
             s.handoff.clone()
         });
+        if pending.offline {
+            set_phase(&pending.id, Phase::AwaitingLicense, "设备码已获取");
+            render();
+            let has_license = STATE.with(|state| state.borrow().offline.as_ref().is_some_and(|local| !local.license_input.trim().is_empty()));
+            if has_license { import_offline_license().await; }
+            return;
+        }
         let Some(handoff) = handoff else {
             return;
         };
@@ -1161,7 +1593,7 @@ async fn on_device_message(raw: &str) {
             Ok(issued)
                 if issued.product_id == handoff.product_id
                     && issued.device_id == id
-                    && is_hex(&issued.receipt_token)
+                    && issued.receipt_token.as_deref().is_some_and(is_hex)
                     && issued.license_token.len() <= 2048
                     && issued.license_token.starts_with("KV1.")
                     && (16..=80).contains(&issued.license_id.len()) =>
@@ -1194,6 +1626,15 @@ async fn on_device_message(raw: &str) {
         let Some(success) = message["success"].as_bool() else {
             return;
         };
+        if pending.offline && !success {
+            match message["error"].as_str() {
+                Some("NOT_READY") => return,
+                Some("INVALID_LICENSE") => fail("授权验证失败，许可证或设备不匹配"),
+                Some("STORAGE_FAILED") => fail("手环未能保存许可证，请重试"),
+                _ => fail("离线激活未完成，请查看手环提示后重试"),
+            }
+            return;
+        }
         let updated = STATE.with(|state| {
             let mut s = state.borrow_mut();
             let p = s.pending.as_mut()?;
@@ -1215,7 +1656,14 @@ async fn dispatch_event(kind: EventType, payload: String) {
         EventType::InterconnectMessage => on_device_message(&payload).await,
         EventType::Timer => {
             let body = timer_body(&payload);
-            if let Some(id) = body.strip_prefix("tick:") {
+            #[cfg(not(feature = "api4"))]
+            if body == OFFLINE_FILE_PAYLOAD {
+                poll_offline_file().await;
+                return;
+            }
+            if body == SERVICE_CHECK_PAYLOAD {
+                probe_service().await;
+            } else if let Some(id) = body.strip_prefix("tick:") {
                 match hello_tick(id) {
                 Some(Some((addr, package))) => {
                     // 每次重发 hello 前补注册：宿主对回包的路由若只认最近
@@ -1267,12 +1715,60 @@ enum UiFollow {
     Refresh,
     Scan,
     Activate,
+    Probe,
+    OfflineCopy,
+    OfflinePaste,
+    OfflineFile,
+    OfflineImport,
 }
 fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
+    if id == SERVICE_STATUS_EVENT {
+        if matches!(event, ui::Event::Click) {
+            if status_shortcut(Instant::now()) {
+                enter_offline();
+                return UiFollow::Refresh;
+            }
+            toggle_service_reason();
+        }
+        return UiFollow::None;
+    }
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.status_clicks = 0;
+        s.last_status_click = None;
+    });
     if matches!(
         event,
         ui::Event::Input | ui::Event::Change | ui::Event::Blur
     ) {
+        if id == "license-input" {
+            if !locked() { remember_license(payload); }
+            return UiFollow::None;
+        }
+        if id == "device-code" || id == "request-text" { return UiFollow::None; }
+        if id == "offline-product" {
+            let product_id = event_text(payload);
+            if !locked() && offline::product_name(&product_id).is_some() {
+                STATE.with(|state| {
+                    let mut s = state.borrow_mut();
+                    if let Some(local) = s.offline.as_mut() {
+                        local.product_id = product_id;
+                        local.license_input.clear();
+                        s.pending = None;
+                        s.message.clear();
+                    }
+                });
+                render();
+            }
+            return UiFollow::None;
+        }
+        if STATE.with(|state| state.borrow().offline.is_some()) {
+            if id == "order-input" && !locked() {
+                remember_order(payload);
+                if matches!(event, ui::Event::Blur) { render(); }
+            }
+            return UiFollow::None;
+        }
         remember_order(payload);
         // 渲染时不做设备调用；用户开始输入订单号时顺带读一次设备列表，
         // 省得必须去点「刷新设备」。
@@ -1301,6 +1797,47 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
     }
     if !matches!(event, ui::Event::Click) || locked() {
         return UiFollow::None;
+    }
+    if id == "offline-decline" {
+        STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            s.offline_prompt = false;
+            s.offline_prompt_dismissed = true;
+        });
+        render();
+        return UiFollow::None;
+    }
+    if id == "offline-accept" {
+        enter_offline();
+        return UiFollow::Refresh;
+    }
+    if id == "return-online" {
+        return_online();
+        return UiFollow::Probe;
+    }
+    if STATE.with(|state| state.borrow().offline.is_some()) {
+        match id {
+            "cancel" => { reset_order(); return UiFollow::Refresh; },
+            "refresh" => return UiFollow::Refresh,
+            "offline-copy" => return UiFollow::OfflineCopy,
+            "offline-paste" => return UiFollow::OfflinePaste,
+            "offline-file" => return UiFollow::OfflineFile,
+            "offline-import" => return UiFollow::OfflineImport,
+            "offline-device" => {
+                STATE.with(|state| state.borrow_mut().pending = None);
+                return UiFollow::Activate;
+            },
+            _ => {
+                if let Some(index) = id.strip_prefix("device:").and_then(|value| value.parse::<usize>().ok()) {
+                    STATE.with(|state| {
+                        let mut s = state.borrow_mut();
+                        if index < s.devices.len() { s.selected = Some(index); s.pending = None; }
+                    });
+                    render();
+                }
+                return UiFollow::None;
+            }
+        }
     }
     if id == "cancel" {
         reset_order();
@@ -1371,9 +1908,18 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
     render();
     UiFollow::None
 }
-fn bind_root(id: String) {
-    STATE.with(|state| state.borrow_mut().root = Some(id));
+async fn bind_root(id: String) {
+    let first_render = STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.root = Some(id);
+        let first_render = !s.service_check_started;
+        s.service_check_started = true;
+        first_render
+    });
     render();
+    if first_render {
+        host_timeout(1, SERVICE_CHECK_PAYLOAD).await;
+    }
 }
 #[cfg(feature = "api4")]
 impl lifecycle::Guest for Kovela {
@@ -1391,14 +1937,18 @@ impl event::Guest for Kovela {
             UiFollow::Refresh => begin_scan().await,
             UiFollow::Scan => load_devices().await,
             UiFollow::Activate => start_activation().await,
+            UiFollow::Probe => probe_service().await,
+            UiFollow::OfflineCopy => copy_offline_request().await,
+            UiFollow::OfflinePaste => paste_offline_license().await,
+            UiFollow::OfflineFile => load_offline_license().await,
+            UiFollow::OfflineImport => import_offline_license().await,
             UiFollow::None => {}
         }
         String::new()
     }
-    // 渲染回调里不做任何宿主调用，也不依赖"导出返回后继续运行"的
-    // 后台任务：设备列表一律由用户动作（刷新/输入/激活）触发读取。
+    // 服务探测交给定时事件；设备读取仍由用户动作触发。
     async fn on_ui_render(id: String) {
-        bind_root(id);
+        bind_root(id).await;
     }
     async fn on_card_render(_id: String) {}
 }
@@ -1437,6 +1987,11 @@ impl event_v3::Guest for Kovela {
                 UiFollow::Refresh => begin_scan().await,
                 UiFollow::Scan => load_devices().await,
                 UiFollow::Activate => start_activation().await,
+                UiFollow::Probe => probe_service().await,
+                UiFollow::OfflineCopy => copy_offline_request().await,
+                UiFollow::OfflinePaste => paste_offline_license().await,
+                UiFollow::OfflineFile => load_offline_license().await,
+                UiFollow::OfflineImport => import_offline_license().await,
                 UiFollow::None => {}
             }
         });
@@ -1445,7 +2000,7 @@ impl event_v3::Guest for Kovela {
     }
     fn on_ui_render(id: String) -> FutureReader<()> {
         let (writer, reader) = astrobox_ng_wit::wit_future::new::<()>(|| ());
-        bind_root(id);
+        astrobox_ng_wit::block_on(bind_root(id));
         std::mem::forget(writer);
         reader
     }
@@ -1505,6 +2060,7 @@ mod tests {
             s.pending = Some(super::Pending {
                 id: "tick-target".into(),
                 addr: "AA:BB:CC:DD".into(),
+                offline: false,
                 device_id: None,
                 device_model: None,
                 issued: None,
@@ -1531,12 +2087,13 @@ mod tests {
         super::Pending {
             id: "pending".into(),
             addr: "addr".into(),
+            offline: false,
             device_id: None,
             device_model: None,
             issued: Some(super::Issued {
                 license_id: "license".into(),
                 license_token: "KV1.token".into(),
-                receipt_token: "b".repeat(64),
+                receipt_token: Some("b".repeat(64)),
                 product_id: "com.komoridev.billiard".into(),
                 device_id: "0816d5a8023c11".into(),
             }),
@@ -1602,35 +2159,216 @@ mod tests {
         assert_eq!(super::activation_step(Some(&retry_connect)), 0);
     }
 
-    // 回归守卫：Level 2/3 的导出是同步函数，宿主不会轮询 `spawn` 出来的
-    // 后台任务（wit-bindgen 的 spawn 只在孕育它的 async 计算被 crank 期间
-    // 运行）。曾因此导致设备扫描从未执行、界面永远停在"正在读取设备列表"。
-    // v3 路径的一切异步工作必须走 block_on，这里直接扫源码防止回退。
     #[test]
-    fn v3_path_never_spawns_background_tasks() {
-        let source = match std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")) {
-            Ok(source) => source,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return; // 发布打包环境里源码不可得时跳过
-            }
-            Err(error) => panic!("{error}"),
-        };
-        // 运行时拼装 needle，避免测试源码里的字面量自匹配。
-        let runtime = ["astrobox_ng_wit", "wit_bindgen"];
-        for crate_name in runtime {
-            let call = format!("{crate_name}::spawn(");
-            assert!(
-                !source.contains(&call),
-                "导出里禁止用 spawn 起后台任务：Level 2/3 的同步导出没人轮询这些任务（v4 也不要依赖返回后继续运行的任务），必须 block_on 或内联 await"
-            );
-        }
-        // 返回的 future 绝不能在导出内写入：write 要等宿主读、宿主要等导出
-        // 返回，循环等待会触发宿主 "deadlock detected" trap；drop 写端也会
-        // 因 wit-bindgen 的补写 panic。只能 mem::forget 让它保持挂起。
-        let write_call = format!("writer.{}", "write(");
-        assert!(
-            !source.contains(&write_call),
-            "禁止在导出内 block_on 写返回的 future（死锁），也不能 drop 写端（panic），只能 mem::forget"
+    fn service_probe_distinguishes_readiness_from_a_valid_http_response() {
+        assert_eq!(
+            super::parse_service_config(200, br#"{"verificationEnabled":true}"#),
+            Ok(())
         );
+        assert!(super::parse_service_config(200, br#"{"verificationEnabled":false}"#).is_err());
+        assert!(super::parse_service_config(200, br#"{}"#).is_err());
+        assert!(super::parse_service_config(200, b"<html>maintenance</html>").is_err());
+    }
+
+    #[test]
+    fn service_probe_preserves_server_errors_and_reports_http_failures() {
+        let body = serde_json::to_vec(&json!({
+            "error": { "message": "商品目录配置不正确，请联系创作者。" }
+        }))
+        .unwrap();
+        assert_eq!(
+            super::parse_service_config(503, &body),
+            Err("商品目录配置不正确，请联系创作者。".into())
+        );
+        assert_eq!(
+            super::parse_service_config(502, b"Bad Gateway"),
+            Err("服务返回异常（HTTP 502）".into())
+        );
+        assert!(super::parse_service_config(200, &vec![b' '; 16_385]).is_err());
+    }
+
+    #[test]
+    fn service_reason_can_toggle_while_busy_and_is_cleared_on_recovery() {
+        super::STATE.with(|state| {
+            *state.borrow_mut() = super::State {
+                order_no: "202609131234567890123456789".into(),
+                verifying: true,
+                ..Default::default()
+            };
+        });
+        super::update_service(Err("爱发电服务暂时不可用".into()));
+        super::dispatch_ui(super::SERVICE_STATUS_EVENT, super::ui::Event::Click, "");
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            assert_eq!(s.service_status, super::ServiceStatus::Unavailable);
+            assert!(s.service_reason_visible);
+            assert_eq!(s.service_reason, "爱发电服务暂时不可用");
+            assert_eq!(s.order_no, "202609131234567890123456789");
+            assert!(s.verifying);
+        });
+        super::dispatch_ui(super::SERVICE_STATUS_EVENT, super::ui::Event::Click, "");
+        assert!(!super::STATE.with(|state| state.borrow().service_reason_visible));
+        super::dispatch_ui(super::SERVICE_STATUS_EVENT, super::ui::Event::Click, "");
+        assert!(super::STATE.with(|state| state.borrow().service_reason_visible));
+        assert!(!super::update_service(Err("爱发电服务暂时不可用".into())));
+        assert!(super::STATE.with(|state| state.borrow().service_reason_visible));
+        super::update_service(Ok(()));
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            assert_eq!(s.service_status, super::ServiceStatus::Healthy);
+            assert!(s.service_reason.is_empty());
+            assert!(!s.service_reason_visible);
+        });
+        super::dispatch_ui(super::SERVICE_STATUS_EVENT, super::ui::Event::Click, "");
+        assert!(!super::STATE.with(|state| state.borrow().service_reason_visible));
+    }
+
+    #[test]
+    fn offline_wait_does_not_probe_and_hello_uses_selected_product() {
+        let pending = super::Pending {
+            offline: true,
+            issued: None,
+            phase: super::Phase::Hello,
+            ..pending_at(super::Phase::Hello, None, false)
+        };
+        super::STATE.with(|state| {
+            *state.borrow_mut() = super::State {
+                offline: Some(super::OfflineState { product_id: "com.komoridev.tankturmoil".into(), license_input: String::new() }),
+                pending: Some(pending),
+                ..Default::default()
+            };
+        });
+        assert_eq!(super::hello_tick("pending"), Some(Some(("addr".into(), "com.komoridev.tankturmoil".into()))));
+        super::STATE.with(|state| state.borrow_mut().pending.as_mut().unwrap().phase = super::Phase::AwaitingLicense);
+        assert!(!super::locked());
+        assert!(!super::should_probe_service());
+        assert!(super::hello_tick("pending").is_none());
+    }
+
+    #[test]
+    fn offline_completion_requires_successful_matching_install_receipt() {
+        super::STATE.with(|state| {
+            *state.borrow_mut() = super::State {
+                offline: Some(super::OfflineState::default()),
+                pending: Some(super::Pending { offline: true, ..pending_at(super::Phase::Installing, None, false) }),
+                ..Default::default()
+            };
+        });
+        super::complete_offline("pending");
+        assert!(super::STATE.with(|state| state.borrow().pending.as_ref().unwrap().phase == super::Phase::Installing));
+        super::STATE.with(|state| state.borrow_mut().pending.as_mut().unwrap().ack = Some(true));
+        super::complete_offline("another-request");
+        assert!(super::STATE.with(|state| state.borrow().pending.as_ref().unwrap().phase == super::Phase::Installing));
+        super::complete_offline("pending");
+        assert!(super::STATE.with(|state| state.borrow().pending.as_ref().unwrap().phase == super::Phase::Complete));
+    }
+
+    #[test]
+    fn offline_device_and_install_receipts_run_without_server_calls() {
+        let mut pending = pending_at(super::Phase::Hello, None, false);
+        pending.offline = true;
+        pending.device_id = None;
+        pending.issued = None;
+        super::STATE.with(|state| {
+            *state.borrow_mut() = super::State {
+                order_no: "0000000000000001".into(),
+                offline: Some(super::OfflineState::default()),
+                pending: Some(pending),
+                ..Default::default()
+            };
+        });
+        let replay = |raw: &str| {
+            let mut future = std::pin::pin!(super::on_device_message(raw));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(Future::poll(future.as_mut(), &mut context), std::task::Poll::Ready(())));
+        };
+        let device = "a".repeat(64);
+        replay(&json!({"v":1,"id":"pending","type":"device","productId":"com.komoridev.billiard","deviceId":device}).to_string());
+        assert!(super::STATE.with(|state| state.borrow().pending.as_ref().unwrap().phase == super::Phase::AwaitingLicense));
+        let request: serde_json::Value = serde_json::from_str(&super::offline_request().unwrap()).unwrap();
+        assert_eq!(request["deviceId"], device);
+        super::STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            let p = s.pending.as_mut().unwrap();
+            p.phase = super::Phase::Installing;
+            p.issued = Some(super::Issued { license_id: "offline-license-0001".into(), license_token: "KV1.token".into(), receipt_token: None, product_id: "com.komoridev.billiard".into(), device_id: device.clone() });
+        });
+        let mut reply = json!({"v":1,"id":"pending","type":"activation-result","licenseId":"offline-license-0001","deviceId":"b".repeat(64),"success":true});
+        replay(&reply.to_string());
+        assert!(super::STATE.with(|state| state.borrow().pending.as_ref().unwrap().phase == super::Phase::Installing));
+        reply["deviceId"] = device.into();
+        replay(&reply.to_string());
+        assert!(super::STATE.with(|state| state.borrow().pending.as_ref().unwrap().phase == super::Phase::Complete));
+    }
+
+    #[test]
+    fn service_failure_prompts_once_until_service_recovers() {
+        super::STATE.with(|state| *state.borrow_mut() = super::State::default());
+        super::update_service(Err("network".into()));
+        assert!(super::STATE.with(|state| state.borrow().offline_prompt));
+        super::dispatch_ui("offline-decline", super::ui::Event::Click, "");
+        super::update_service(Err("network again".into()));
+        assert!(!super::STATE.with(|state| state.borrow().offline_prompt));
+        super::update_service(Ok(()));
+        super::update_service(Err("new outage".into()));
+        assert!(super::STATE.with(|state| state.borrow().offline_prompt));
+        super::dispatch_ui("offline-accept", super::ui::Event::Click, "");
+        assert!(super::STATE.with(|state| state.borrow().offline.is_some()));
+        assert!(!super::should_probe_service());
+    }
+
+    #[test]
+    fn offline_transition_preserves_order_product_and_handshake() {
+        let mut pending = pending_at(super::Phase::Retry, None, false);
+        pending.device_id = Some("a".repeat(64));
+        pending.issued = None;
+        super::STATE.with(|state| *state.borrow_mut() = super::State {
+            order_no: "0000000000000001".into(),
+            handoff: Some(super::Handoff { server_origin: "https://kovela.example.com".into(), handoff_token: "c".repeat(64), product_id: "com.komoridev.tankturmoil".into(), product_name: "Tank Turmoil".into() }),
+            pending: Some(pending), selected: Some(0),
+            ..Default::default()
+        });
+        super::enter_offline();
+        let request: serde_json::Value = serde_json::from_str(&super::offline_request().unwrap()).unwrap();
+        assert_eq!(request["orderNo"], "0000000000000001");
+        assert_eq!(request["productId"], "com.komoridev.tankturmoil");
+        assert_eq!(request["deviceId"], "a".repeat(64));
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            let p = s.pending.as_ref().unwrap();
+            assert!(p.offline && p.phase == super::Phase::AwaitingLicense);
+            assert_eq!(s.selected, Some(0));
+        });
+    }
+
+    #[test]
+    fn offline_transition_keeps_confirmed_license_complete_without_receipt_token() {
+        let mut pending = pending_at(super::Phase::Retry, Some(true), false);
+        pending.device_id = Some("a".repeat(64));
+        super::STATE.with(|state| *state.borrow_mut() = super::State { pending: Some(pending), ..Default::default() });
+        super::enter_offline();
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            let p = s.pending.as_ref().unwrap();
+            assert!(p.offline && p.phase == super::Phase::Complete && p.reported);
+            assert!(p.issued.as_ref().unwrap().receipt_token.is_none());
+            assert_eq!(s.offline.as_ref().unwrap().license_input, p.issued.as_ref().unwrap().license_token);
+        });
+    }
+
+    #[test]
+    fn five_badge_clicks_require_continuity_and_never_interrupt_installing() {
+        let start = std::time::Instant::now();
+        super::STATE.with(|state| *state.borrow_mut() = super::State::default());
+        for index in 0..4 { assert!(!super::status_shortcut(start + std::time::Duration::from_millis(index * 100))); }
+        assert!(!super::STATE.with(|state| state.borrow().offline.is_some()));
+        assert!(super::status_shortcut(start + std::time::Duration::from_millis(400)));
+        assert!(!super::status_shortcut(start + std::time::Duration::from_secs(3)));
+        for index in 1..4 { assert!(!super::status_shortcut(start + std::time::Duration::from_secs(3) + std::time::Duration::from_millis(index * 100))); }
+        super::dispatch_ui("order-input", super::ui::Event::Input, "0000000000000001");
+        assert!(!super::status_shortcut(start + std::time::Duration::from_millis(3400)));
+        super::STATE.with(|state| state.borrow_mut().pending = Some(pending_at(super::Phase::Installing, None, false)));
+        for index in 0..5 { assert!(!super::status_shortcut(start + std::time::Duration::from_secs(4) + std::time::Duration::from_millis(index * 100))); }
+        assert!(!super::STATE.with(|state| state.borrow().offline.is_some()));
     }
 }

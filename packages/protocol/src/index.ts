@@ -64,6 +64,23 @@ export interface IssuedLicense {
   productId: string;
   deviceId: string;
 }
+export interface OfflineRequest {
+  v: 1;
+  type: "kovela-offline-request";
+  orderNo: string;
+  productId: string;
+  deviceId: string;
+  deviceModel?: string;
+}
+export interface OfflineLicense {
+  v: 1;
+  type: "kovela-offline-license";
+  licenseId: string;
+  licenseToken: string;
+  productId: string;
+  productName: string;
+  deviceId: string;
+}
 export interface ReportActivationRequest {
   receiptToken: string;
   requestId: string;

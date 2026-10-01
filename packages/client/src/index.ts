@@ -3,6 +3,8 @@ import { Service } from "cordis";
 import type {
   LookupOrderRequest,
   LookupOrderResult,
+  OfflineRequest,
+  OfflineLicense,
   PublicConfig,
   VerifiedOrder,
   VerifyOrderRequest,
@@ -56,22 +58,32 @@ export default class KovelaClient extends Service {
   status(statusToken: string, signal?: AbortSignal): Promise<ActivationStatus> {
     return this.request("/api/activation/status", { statusToken }, signal);
   }
+  authorizeAdmin(key: string, signal?: AbortSignal): Promise<{ authenticated: true }> {
+    return this.request("/api/admin/session", {}, signal, key);
+  }
+  issueOfflineLicense(input: OfflineRequest, key: string, signal?: AbortSignal): Promise<OfflineLicense> {
+    return this.request("/api/admin/licenses", input, signal, key);
+  }
 
   private async request<T>(
     path: string,
     body?: unknown,
     signal?: AbortSignal,
+    adminKey?: string,
   ): Promise<T> {
     let response: Response;
     try {
       response = await this.transport(this.origin + path, {
         method: body === undefined ? "GET" : "POST",
-        headers:
-          body === undefined ? {} : { "Content-Type": "application/json" },
+        headers: {
+          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          ...(adminKey === undefined ? {} : { Authorization: `Bearer ${adminKey}` }),
+        },
         body: body === undefined ? undefined : JSON.stringify(body),
         signal,
         cache: "no-store",
         credentials: "omit",
+        redirect: adminKey === undefined ? "follow" : "error",
       });
     } catch (error) {
       if (signal?.aborted) throw error;

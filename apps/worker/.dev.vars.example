@@ -11,5 +11,7 @@ AFDIAN_TOKEN=
 LICENSE_SIGNING_SEED=
 
 WEBHOOK_TOKEN=
+# Independent admin access key from pnpm admin:key; never use the signing seed here.
+ADMIN_KEY=
 TURNSTILE_SITE_KEY=
 TURNSTILE_SECRET_KEY=

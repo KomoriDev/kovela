@@ -10,7 +10,7 @@
 //! 都会变成行内样式，因此行内样式能压过组件默认样式；复合控件（TEXTAREA、
 //! PROGRESS 之类）的样式落在组件根节点上，不是内部的原生控件。
 
-use crate::ui;
+use crate::{ServiceStatus, SERVICE_STATUS_EVENT, ui};
 
 /// M3 深色配色角色，名称沿用 Material 3 的 token 名。
 pub(crate) mod color {
@@ -25,6 +25,10 @@ pub(crate) mod color {
     pub(crate) const ON_SURFACE_VARIANT: &str = "#cac4d0";
     pub(crate) const OUTLINE_VARIANT: &str = "#49454f";
     pub(crate) const TRANSPARENT: &str = "transparent";
+    pub(crate) const SUCCESS_CONTAINER: &str = "#1f3b2a";
+    pub(crate) const ON_SUCCESS_CONTAINER: &str = "#b7f7c8";
+    pub(crate) const ERROR_CONTAINER: &str = "#5a1f25";
+    pub(crate) const ON_ERROR_CONTAINER: &str = "#ffdada";
 }
 
 /// M3 圆角等级（4 / 8 / 12 / 16 / 20 dp）。
@@ -143,7 +147,11 @@ const STEP_LABELS: [&str; 2] = ["订单", "激活"];
 
 /// 顶部步骤条：只表示流程位置，不承载交互。
 pub(crate) fn steps(current: u32) -> ui::Element {
-    let mut row = row(space::ONE);
+    let mut row = ui::Element::new(ui::ElementType::Div, None)
+        .flex()
+        .gap(space::ONE)
+        .align_center()
+        .flex_grow(1.0);
     for (index, label) in STEP_LABELS.iter().enumerate() {
         let state = match (index as u32 + 1).cmp(&current) {
             std::cmp::Ordering::Less => StepState::Done,
@@ -153,6 +161,13 @@ pub(crate) fn steps(current: u32) -> ui::Element {
         row = row.child(step(label, state));
     }
     row
+}
+
+/// 顶栏：步骤靠左，服务状态徽标固定在右侧。
+pub(crate) fn top_bar(current: u32, service_badge: ui::Element) -> ui::Element {
+    row(space::TWO)
+        .child(steps(current).flex_grow(1.0))
+        .child(service_badge)
 }
 
 /// 步骤条上的一格：已完成的带 ✓，当前步骤是主色实底。
@@ -207,6 +222,60 @@ pub(crate) fn chip(text: &str) -> ui::Element {
         .text_color(color::ON_SECONDARY_CONTAINER)
         .padding(space::ONE)
         .bg(color::SECONDARY_CONTAINER)
+        .radius(shape::SMALL)
+}
+
+/// 固定尺寸的服务状态按钮，异常时可展开原因。
+pub(crate) fn service_badge(status: ServiceStatus) -> ui::Element {
+    let (text, background, foreground) = match status {
+        ServiceStatus::Checking => (
+            "检查服务…",
+            color::SURFACE_CONTAINER_HIGH,
+            color::ON_SURFACE_VARIANT,
+        ),
+        ServiceStatus::Healthy => (
+            "服务正常",
+            color::SUCCESS_CONTAINER,
+            color::ON_SUCCESS_CONTAINER,
+        ),
+        ServiceStatus::Unavailable => (
+            "服务异常",
+            color::ERROR_CONTAINER,
+            color::ON_ERROR_CONTAINER,
+        ),
+    };
+    let badge = ui::Element::new(ui::ElementType::Badge, Some(text))
+        .size(type_scale::LABEL_MEDIUM)
+        .width(88)
+        .height(28)
+        .flex()
+        .align_center()
+        .justify_center()
+        .bg(background)
+        .text_color(foreground)
+        .radius(shape::SMALL)
+        .flex_shrink(0.0)
+        .transition(TRANSITION);
+    ui::Element::new(ui::ElementType::Button, None)
+        .width(88)
+        .height(28)
+        .padding(0)
+        .margin(0)
+        .bg(color::TRANSPARENT)
+        .radius(shape::SMALL)
+        .flex_shrink(0.0)
+        .prop("variant", "ghost")
+        .prop("aria-label", text)
+        .on(ui::Event::Click, SERVICE_STATUS_EVENT)
+        .child(badge)
+}
+
+pub(crate) fn service_reason(reason: &str) -> ui::Element {
+    label(&format!("原因：{reason}"))
+        .padding(space::TWO)
+        .width_full()
+        .bg(color::ERROR_CONTAINER)
+        .text_color(color::ON_ERROR_CONTAINER)
         .radius(shape::SMALL)
 }
 
