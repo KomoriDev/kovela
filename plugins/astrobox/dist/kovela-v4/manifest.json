@@ -1,7 +1,7 @@
 {
   "name": "Kovela",
   "icon": "icon.png",
-  "version": "1.8.0",
+  "version": "1.8.2",
   "description": "验证购买并为 mi-vela 应用安全激活",
   "author": "Komorebi",
   "website": "https://kovela.komoridevs.icu",
