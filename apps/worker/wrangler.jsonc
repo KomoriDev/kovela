@@ -47,6 +47,13 @@
         "planIds": ["285dd096af2511f1ac1552540025c377"],
         "skuIds": [],
       },
+      {
+        "productId": "com.komoridev.watermelon",
+        "productName": "合成大西瓜图片自定义",
+        "purchaseUrl": "https://afdian.com/item/3187fe28c08a11f1805c52540025c377",
+        "planIds": ["3187fe28c08a11f1805c52540025c377"],
+        "skuIds": [],
+      },
     ],
     "AFDIAN_USER_ID": "9c2257f6628d11edb5e652540025c377",
     "TURNSTILE_SITE_KEY": "0x4AAAAAAEyF9L78iJGDnnH2",

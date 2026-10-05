@@ -57,6 +57,8 @@ pnpm --filter @kovela/worker deploy
 - `CLOUDFLARE_API_TOKEN`：包含 Workers 脚本、路由和 D1 写权限
 - `CLOUDFLARE_ACCOUNT_ID`
 
+网页与 Worker 的商品目录由 `apps/worker/wrangler.jsonc` 中的 `PRODUCTS` 统一提供，网页读取 `/api/config` 展示，无需单独硬编码。合成大西瓜图片自定义使用 `com.komoridev.watermelon` 和爱发电 item `3187fe28c08a11f1805c52540025c377`（<https://afdian.com/item/3187fe28c08a11f1805c52540025c377>）。该配置必须部署 Worker 才会生效；本次服务端商品配置不包含插件或手环产物发布。
+
 更换签发私钥会使已安装应用无法验证旧许可证，必须同时更新 `packages/vela/src/public-key.js` 并重新发布手环应用。
 
 ### 管理员签发

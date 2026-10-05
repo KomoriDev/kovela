@@ -754,3 +754,27 @@ test("admin issuance racing online activation cannot bind two devices", async (t
   assert.equal(bound?.device_id, successful.deviceId);
   assert.equal(verifyLicense(bound?.license_token, publicKey, products[0].productId, successful.deviceId)?.licenseId, successful.licenseId);
 });
+
+test("watermelon image entitlement matches its Afdian item without granting another application", async (t) => {
+  const product: ProductConfig = {
+    productId: "com.komoridev.watermelon",
+    productName: "合成大西瓜图片自定义",
+    purchaseUrl: "https://afdian.com/item/3187fe28c08a11f1805c52540025c377",
+    planIds: ["3187fe28c08a11f1805c52540025c377"],
+    skuIds: [],
+  };
+  const {db, env, post, ok} = await fixture(t, number => number === orderNo ? {...orders[orderNo], plan_id: product.planIds[0], sku_detail: []} : orders[number]);
+  env.PRODUCTS = [product, ...products];
+  for (const migration of ["0001_initial.sql", "0002_products.sql", "0003_guides.sql"]) await migrate(db, migration);
+  const lookup = await ok("/api/orders/lookup", {orderNo});
+  assert.deepEqual(lookup.items.map((item: {productId: string}) => item.productId), [product.productId]);
+  assert.equal((await post("/api/orders/verify", {orderNo, productId: products[0].productId})).status, 404);
+  const session = await ok("/api/orders/verify", {orderNo, productId: product.productId});
+  const deviceId = "a".repeat(64);
+  const request = {handoffToken: session.handoffToken, productId: product.productId, deviceId, requestId: "watermelon-entitlement-0001"};
+  const issued = await ok("/api/activate", request);
+  assert.equal(verifyLicense(issued.licenseToken, publicKey, product.productId, deviceId)?.licenseId, issued.licenseId);
+  assert.equal(verifyLicense(issued.licenseToken, publicKey, products[0].productId, deviceId), null);
+  assert.equal((await post("/api/activate", {...request, deviceId: "b".repeat(64), requestId: "watermelon-other-device-001"})).status, 409);
+  assert.equal((await post("/api/orders/verify", {orderNo: unpaidNo, productId: product.productId})).status, 404);
+});
