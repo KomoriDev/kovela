@@ -21,15 +21,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "astrobox-ng-wit"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c7afd9b404713d93b70abcff96af47fa9df4b66df5336adc551c0d544862e4a"
-dependencies = [
- "wit-bindgen 0.57.1",
-]
-
-[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -367,7 +358,6 @@ dependencies = [
 name = "kovela-astrobox"
 version = "1.0.0"
 dependencies = [
- "astrobox-ng-wit",
  "base64",
  "serde",
  "serde_json",

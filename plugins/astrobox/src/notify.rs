@@ -5,26 +5,26 @@
 //! 不等于设备已经显示。
 //!
 //! 宿主导入在宿主目标上不存在，所以单元测试（`cargo test`）里这些函数是空
-//! 操作，真机行为以 api4 构建为准——与仓库里其它宿主调用同样的处理。
+//! 操作，真机行为以 wasm 构建为准——与仓库里其它宿主调用同样的处理。
 
 /// 实时活动的通知 ID：同一个插件内 id 相同即更新，撤回也用这个 id。
-#[cfg(all(feature = "api4", not(test)))]
-pub(crate) const LIVE_ID: u32 = 1;
+#[cfg(not(test))]
+const LIVE_ID: u32 = 1;
 /// 激活结果通知的 ID（与实时活动分开，避免结果被后续更新覆盖）。
-#[cfg(all(feature = "api4", not(test)))]
+#[cfg(not(test))]
 const RESULT_ID: u32 = 2;
 
 /// 激活的四段动作，和插件里的进度条一一对应。
-#[cfg(feature = "api4")]
 const STEPS: [&str; 4] = ["连接设备", "签发许可证", "写入设备", "提交回执"];
 
 /// 焦点通知（focus）的 style 是协议原值，官方文档明确要求「使用目标设备已经
 /// 确认支持的取值」，跨型号没有保证。真机确认前先用 0；换机型或设备固件升级
 /// 后只改这一行，不必动调用点。
-#[cfg(all(feature = "api4", not(test)))]
+#[cfg(not(test))]
 const FOCUS_STYLE: u32 = 0;
 
-#[cfg(all(feature = "api4", not(test)))]
+/// 宿主导入在宿主目标上不存在：单元测试里换成下面的空实现。
+#[cfg(not(test))]
 mod host {
     use super::{FOCUS_STYLE, LIVE_ID, RESULT_ID, STEPS};
     use crate::astrobox::psys_host_v4::notification;
@@ -125,19 +125,19 @@ mod host {
     }
 }
 
-#[cfg(all(feature = "api4", not(test)))]
+#[cfg(not(test))]
 pub(crate) use host::{activated, clear, live, probe};
 
-#[cfg(any(not(feature = "api4"), test))]
+#[cfg(test)]
 pub(crate) async fn live(_addr: &str, _product: &str, _step: usize, _note: &str, _sequence: u32) {}
-#[cfg(any(not(feature = "api4"), test))]
+#[cfg(test)]
 pub(crate) async fn clear(_addr: &str) {}
-#[cfg(any(not(feature = "api4"), test))]
+#[cfg(test)]
 pub(crate) async fn activated(_addr: &str, _product: &str) {}
-#[cfg(any(not(feature = "api4"), test))]
+#[cfg(test)]
 pub(crate) async fn probe(_addr: &str, _scene: bool, _number: u32, _sequence: u32) {}
 
-#[cfg(all(test, feature = "api4"))]
+#[cfg(test)]
 mod tests {
     use super::STEPS;
 

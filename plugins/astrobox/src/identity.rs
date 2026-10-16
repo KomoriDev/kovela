@@ -4,13 +4,10 @@
 //! 实时确认，插件不缓存、也不把结果当成本地凭据。真正判定购买始终在服务端
 //! 用爱发电现场复核（见 `/api/account/activate`）。
 //!
-//! 宿主导入在宿主目标上不存在，所以单元测试里这些函数是空操作，真机行为以
-//! api4 构建为准。
+//! 宿主导入在宿主目标上不存在，所以单元测试里这些函数是空操作。
 
-/// 兼容构建没有账号接口：界面据此决定要不要显示「用 AstroBox 账号激活」。
-pub(crate) const SUPPORTED: bool = cfg!(feature = "api4");
-
-#[cfg(all(feature = "api4", not(test)))]
+/// 宿主导入在宿主目标上不存在：单元测试里换成下面的空实现。
+#[cfg(not(test))]
 mod host {
     use crate::astrobox::psys_host_v4::{account, os};
 
@@ -57,23 +54,16 @@ mod host {
     }
 }
 
-#[cfg(all(feature = "api4", not(test)))]
+#[cfg(not(test))]
 pub(crate) use host::{afdian_user_id, host_device_id};
 
-#[cfg(any(not(feature = "api4"), test))]
+/// 单元测试里不碰宿主导入：返回一个明确的未配置结论即可。
+#[cfg(test)]
 pub(crate) async fn afdian_user_id() -> Result<String, String> {
-    #[cfg(feature = "api4")]
-    {
-        // 单元测试里不碰宿主导入：返回一个明确的未配置结论即可。
-        Err("账号资料接口不可用".into())
-    }
-    #[cfg(not(feature = "api4"))]
-    {
-        Err("按账号激活需要 AstroBox 2.2 及以上版本".into())
-    }
+    Err("账号资料接口不可用".into())
 }
 
-#[cfg(any(not(feature = "api4"), test))]
+#[cfg(test)]
 pub(crate) async fn host_device_id() -> Option<String> {
     None
 }

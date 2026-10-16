@@ -19,8 +19,6 @@ def build():
             "--target",
             "wasm32-wasip2",
             "--locked",
-            "--features",
-            "api4",
         ],
         cwd=root,
         check=True,
@@ -63,7 +61,7 @@ for legacy in (
 # 现在只保留这一份主产物，旧目录整目录清掉，免得残留被误提交或被商店抓到。
 shutil.rmtree(dist / "kovela-v4", ignore_errors=True)
 
-# 唯一产物：Level 4（WASI 3 / api_level 4）。manifest.json 直接就是主版本清单。
+# 唯一产物：Level 4（WASI 3 / api_level 4）。源码也只剩这一条路径。
 build()
 pack(
     "kovela",

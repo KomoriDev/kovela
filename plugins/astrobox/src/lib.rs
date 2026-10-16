@@ -1,4 +1,3 @@
-#[cfg(feature = "api4")]
 wit_bindgen::generate!({
     path: "wit",
     world: "kovela",
@@ -11,24 +10,11 @@ wit_bindgen::generate!({
 /// 把编号 +1 发一条实时活动（同一个通知 id，会覆盖更新，不会堆一屏）。
 const NOTIFY_PROBE: bool = false;
 
-#[cfg(feature = "api4")]
 use astrobox::psys_host_v4::{
     clipboard, device, dialog, interconnect, register, thirdpartyapp, timer, ui,
 };
-#[cfg(feature = "api4")]
 use exports::astrobox::psys_plugin_v4::{
     event::{self, EventType},
-    lifecycle,
-};
-#[cfg(not(feature = "api4"))]
-use astrobox_ng_wit::FutureReader;
-#[cfg(not(feature = "api4"))]
-use astrobox_ng_wit::astrobox::psys_host::{
-    clipboard, device, dialog, interconnect, register, thirdpartyapp, timer, ui_v3 as ui,
-};
-#[cfg(not(feature = "api4"))]
-use astrobox_ng_wit::exports::astrobox::psys_plugin::{
-    event_v3::{self, EventType},
     lifecycle,
 };
 use serde::{Deserialize, Serialize};
@@ -41,8 +27,6 @@ mod icons;
 mod offline;
 mod identity;
 mod notify;
-#[cfg(not(feature = "api4"))]
-mod file_picker;
 
 /// 取许可证走哪条路：订单号查询得到的 handoff 凭证，或 AstroBox 账号里绑定的
 /// 爱发电账号。两条路只在「签发」那一次请求上分叉，写入设备与回执完全一样。
@@ -132,8 +116,6 @@ struct State {
     verifying: bool,
     handoff: Option<Handoff>,
     offline: Option<OfflineState>,
-    #[cfg(not(feature = "api4"))]
-    file_picker: Option<file_picker::FilePicker>,
     devices: Vec<(String, String)>,
     selected: Option<usize>,
     pending: Option<Pending>,
@@ -192,83 +174,36 @@ const ACCOUNT_PAYLOAD: &str = "account";
 const ACCOUNT_TIMEOUT_PAYLOAD: &str = "account-timeout";
 /// 账号查询的等待上限：官方口径单项最多 10 秒，留出三倍余量给三个绑定项。
 const ACCOUNT_TIMEOUT_MS: u64 = 20_000;
-#[cfg(not(feature = "api4"))]
-const OFFLINE_FILE_PAYLOAD: &str = "offline-file";
 
 async fn host_register_recv(addr: &str, package: &str) -> Result<(), String> {
-    #[cfg(feature = "api4")]
-    {
-        register::register_interconnect_recv(addr.to_string(), package.to_string()).await
-    }
-    #[cfg(not(feature = "api4"))]
-    {
-        register::register_interconnect_recv(addr, package)
-            .await
-            .map_err(|()| "权限被拒绝".into())
-    }
+    register::register_interconnect_recv(addr.to_string(), package.to_string()).await
 }
 async fn host_send(addr: &str, package: &str, data: &str) -> Result<(), String> {
-    #[cfg(feature = "api4")]
-    {
-        interconnect::send_qaic_message(addr.to_string(), package.to_string(), data.to_string())
-            .await
-    }
-    #[cfg(not(feature = "api4"))]
-    {
-        interconnect::send_qaic_message(addr, package, data)
-            .await
-            .map_err(|()| "发送失败".into())
-    }
+    interconnect::send_qaic_message(addr.to_string(), package.to_string(), data.to_string()).await
 }
 async fn host_timeout(delay_ms: u64, payload: &str) {
-    #[cfg(feature = "api4")]
-    {
-        let _ = timer::set_timeout(delay_ms, payload);
-    }
-    #[cfg(not(feature = "api4"))]
-    {
-        timer::set_timeout(delay_ms, payload).await;
-    }
+    let _ = timer::set_timeout(delay_ms, payload);
 }
 
 // 快应用必须先在前台运行并建立 interconnect 通道，插件才能收发消息。
 // 设备端应用列表读不到时继续尝试发送，避免宿主版本差异导致整条链路不可用。
 async fn open_app(addr: &str, package: &str) -> Result<(), String> {
-    #[cfg(feature = "api4")]
-    {
-        let Ok(apps) = thirdpartyapp::get_thirdparty_app_list(addr.to_string()).await else {
+    let Ok(apps) = thirdpartyapp::get_thirdparty_app_list(addr.to_string()).await else {
+        return Ok(());
+    };
+    let Some(app) = apps.into_iter().find(|app| app.package_name == package) else {
+        return Err("手环上未安装该应用，请先在 AstroBox 中安装".into());
+    };
+    for page in ["pages/activation", "/pages/activation", "pages/index"] {
+        if thirdpartyapp::launch_qa(addr.to_string(), app.clone(), page.to_string())
+            .await
+            .is_ok()
+        {
             return Ok(());
-        };
-        let Some(app) = apps.into_iter().find(|app| app.package_name == package) else {
-            return Err("手环上未安装该应用，请先在 AstroBox 中安装".into());
-        };
-        for page in ["pages/activation", "/pages/activation", "pages/index"] {
-            if thirdpartyapp::launch_qa(addr.to_string(), app.clone(), page.to_string())
-                .await
-                .is_ok()
-            {
-                return Ok(());
-            }
         }
-        Ok(())
     }
-    #[cfg(not(feature = "api4"))]
-    {
-        let Ok(apps) = thirdpartyapp::get_thirdparty_app_list(addr).await else {
-            return Ok(());
-        };
-        let Some(app) = apps.into_iter().find(|app| app.package_name == package) else {
-            return Err("手环上未安装该应用，请先在 AstroBox 中安装".into());
-        };
-        for page in ["pages/activation", "/pages/activation", "pages/index"] {
-            if thirdpartyapp::launch_qa(addr, &app, page).await.is_ok() {
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
+    Ok(())
 }
-
 
 fn is_hex(value: &str) -> bool {
     value.len() == 64
@@ -392,7 +327,6 @@ fn target(s: &State) -> Option<(String, String)> {
     s.handoff.as_ref().map(|item| (item.product_id.clone(), item.product_name.clone()))
 }
 
-
 fn enter_offline() {
     STATE.with(|state| {
         let mut s = state.borrow_mut();
@@ -453,10 +387,7 @@ async fn copy_offline_request() {
         Ok(text) => text,
         Err(error) => { show(error); return; }
     };
-    #[cfg(feature = "api4")]
     let result = clipboard::write_text(text).await;
-    #[cfg(not(feature = "api4"))]
-    let result = clipboard::write_text(&text).await.map_err(|()| "无法写入剪贴板，请授予权限".to_string());
     show(match result { Ok(()) => "申请已复制".into(), Err(error) => error });
 }
 
@@ -472,10 +403,7 @@ fn remember_license(payload: &str) {
 }
 
 async fn paste_offline_license() {
-    #[cfg(feature = "api4")]
     let result = clipboard::read_text().await;
-    #[cfg(not(feature = "api4"))]
-    let result = clipboard::read_text().await.map_err(|()| "无法读取剪贴板，请授予权限".to_string());
     match result {
         Ok(text) => { remember_license(&serde_json::to_string(&text).unwrap()); render(); }
         Err(error) => show(error),
@@ -485,26 +413,7 @@ async fn paste_offline_license() {
 async fn load_offline_license() {
     let config = dialog::PickConfig { read: true, copy_to: None };
     let filter = dialog::FilterConfig { multiple: false, extensions: vec!["json".into(), "txt".into()], default_directory: String::new(), default_file_name: String::new() };
-    #[cfg(feature = "api4")]
     accept_license_file(dialog::pick_file(config, filter).await);
-    #[cfg(not(feature = "api4"))]
-    {
-        STATE.with(|state| state.borrow_mut().file_picker = Some(file_picker::FilePicker::new(dialog::pick_file(&config, &filter))));
-        render();
-        poll_offline_file().await;
-    }
-}
-
-#[cfg(not(feature = "api4"))]
-async fn poll_offline_file() {
-    let Some(mut picker) = STATE.with(|state| state.borrow_mut().file_picker.take()) else { return; };
-    match picker.poll() {
-        std::task::Poll::Ready(file) => { drop(picker); accept_license_file(Ok(file)); render(); }
-        std::task::Poll::Pending => {
-            STATE.with(|state| state.borrow_mut().file_picker = Some(picker));
-            host_timeout(250, OFFLINE_FILE_PAYLOAD).await;
-        }
-    }
 }
 
 fn accept_license_file(result: Result<dialog::PickResult, String>) {
@@ -583,9 +492,6 @@ fn render_offline(root: &str) {
         let s = state.borrow();
         let Some(local) = s.offline.as_ref() else { return theme::page(); };
         let active = busy();
-        #[cfg(not(feature = "api4"))]
-        let picking_file = s.file_picker.is_some();
-        #[cfg(feature = "api4")]
         let picking_file = false;
         let phase = s.pending.as_ref().map(|p| p.phase);
         let complete = phase == Some(Phase::Complete);
@@ -659,7 +565,6 @@ fn render_offline(root: &str) {
     });
     ui::render(root, theme::shell().child(page).child(theme::footer(&[("爱发电", PURCHASE_EVENT), ("官群", COMMUNITY_EVENT)])));
 }
-
 
 fn connected_name(addr: &str) -> Option<String> {
     STATE.with(|state| {
@@ -748,8 +653,6 @@ fn parse_account_products(value: &Value, afdian_user_id: &str) -> Result<Vec<Off
 fn busy() -> bool {
     STATE.with(|state| {
         let s = state.borrow();
-        #[cfg(not(feature = "api4"))]
-        if s.file_picker.is_some() { return true; }
         s.activation_queued
             || s.pending.as_ref().is_some_and(|p| !matches!(p.phase, Phase::AwaitingLicense | Phase::Retry | Phase::Complete))
     })
@@ -949,7 +852,7 @@ fn render() {
                 .child(verify);
             // Level 4 宿主才有账号接口，而且服务端要已部署这套接口：
             // 条件不满足就不显示，免得点了只拿到「接口不存在」。
-            if identity::SUPPORTED && account_activation {
+            if account_activation {
                 page = page.child(gate(
                     theme::outlined_button("用 AstroBox 账号激活", "account"),
                     ui_locked,
@@ -2020,11 +1923,6 @@ async fn dispatch_event(kind: EventType, payload: String) {
         EventType::InterconnectMessage => on_device_message(&payload).await,
         EventType::Timer => {
             let body = timer_body(&payload);
-            #[cfg(not(feature = "api4"))]
-            if body == OFFLINE_FILE_PAYLOAD {
-                poll_offline_file().await;
-                return;
-            }
             if body == LOOKUP_PAYLOAD {
                 // 查询结果决定下一步：商品由订单号带出来，顺手把设备列表也
                 // 读出来，下一步就能直接点激活。
@@ -2332,14 +2230,12 @@ async fn bind_root(id: String) {
         host_timeout(1, SERVICE_CHECK_PAYLOAD).await;
     }
 }
-#[cfg(feature = "api4")]
 impl lifecycle::Guest for Kovela {
     // 设备列表只在用户动作后读取，加载时不做任何宿主调用。
     async fn on_load() {
         seed_notify_seq();
     }
 }
-#[cfg(feature = "api4")]
 impl event::Guest for Kovela {
     async fn on_event(kind: EventType, payload: String) -> String {
         dispatch_event(kind, payload).await;
@@ -2386,90 +2282,12 @@ impl event::Guest for Kovela {
     }
     async fn on_card_render(_id: String) {}
 }
-#[cfg(feature = "api4")]
 export!(Kovela);
-// Level 2/3 的导出都是同步函数，宿主不会驱动 `spawn` 出来的后台任务
-// （wit-bindgen 的 spawn 只在导出调用自身的执行期间被轮询），因此所有
-// 异步工作必须在导出内用 block_on 跑完。
-//
-// 返回的 future 只能"永不写入"（mem::forget 写端）：
-// - 在导出内 block_on 写它必然死锁——write 要等宿主读，宿主要等导出返回
-//   才拿到读端，宿主事件循环会报 "deadlock detected"；
-// - 直接 drop 写端也不行——wit-bindgen 的 Drop 会调度用默认值补写，
-//   唤醒时在无任务上下文里 panic。
-// 宿主并不读取这些返回值，未写入（挂起）正是参考项目在真机上的实际行为。
-#[cfg(not(feature = "api4"))]
-impl lifecycle::Guest for Kovela {
-    // 设备列表只在用户动作后读取，加载时不做任何宿主调用。
-    fn on_load() {
-        seed_notify_seq();
-    }
-}
-#[cfg(not(feature = "api4"))]
-impl event_v3::Guest for Kovela {
-    fn on_event(kind: EventType, payload: String) -> FutureReader<String> {
-        let (writer, reader) = astrobox_ng_wit::wit_future::new::<String>(String::new);
-        astrobox_ng_wit::block_on(async move {
-            dispatch_event(kind, payload).await;
-        });
-        std::mem::forget(writer);
-        reader
-    }
-    fn on_ui_event_v3(id: String, event: ui::Event, payload: String) -> FutureReader<String> {
-        let follow = dispatch_ui(&id, event, &payload);
-        let (writer, reader) = astrobox_ng_wit::wit_future::new::<String>(String::new);
-        astrobox_ng_wit::block_on(async move {
-            match follow {
-                UiFollow::Lookup => host_timeout(1, LOOKUP_PAYLOAD).await,
-                UiFollow::Account => {
-                    let generation = STATE.with(|state| state.borrow().account_gen);
-                    render();
-                    host_timeout(
-                        ACCOUNT_TIMEOUT_MS,
-                        &format!("{ACCOUNT_TIMEOUT_PAYLOAD}:{generation}"),
-                    )
-                    .await;
-                    host_timeout(1, &format!("{ACCOUNT_PAYLOAD}:{generation}")).await;
-                }
-                UiFollow::ClearLive => live_clear_any().await,
-                UiFollow::ProbeNotify(scene) => notify_probe(scene).await,
-                UiFollow::Refresh => {
-                    live_clear_any().await;
-                    begin_scan().await;
-                }
-                UiFollow::Scan => load_devices().await,
-                UiFollow::Activate => host_timeout(1, ACTIVATE_PAYLOAD).await,
-                UiFollow::Probe => probe_service().await,
-                UiFollow::OfflineCopy => copy_offline_request().await,
-                UiFollow::OfflinePaste => paste_offline_license().await,
-                UiFollow::OfflineFile => load_offline_license().await,
-                UiFollow::OfflineImport => import_offline_license().await,
-                UiFollow::None => {}
-            }
-        });
-        std::mem::forget(writer);
-        reader
-    }
-    fn on_ui_render(id: String) -> FutureReader<()> {
-        let (writer, reader) = astrobox_ng_wit::wit_future::new::<()>(|| ());
-        astrobox_ng_wit::block_on(bind_root(id));
-        std::mem::forget(writer);
-        reader
-    }
-    fn on_card_render(_id: String) -> FutureReader<()> {
-        let (writer, reader) = astrobox_ng_wit::wit_future::new::<()>(|| ());
-        std::mem::forget(writer);
-        reader
-    }
-}
-#[cfg(not(feature = "api4"))]
-astrobox_ng_wit::export!(Kovela);
 
 #[cfg(test)]
 mod tests {
     use super::{normalize_order, parse_offers, remember_order};
     use serde_json::json;
-
 
     #[test]
     fn reads_products_returned_for_an_order() {
@@ -2548,8 +2366,6 @@ mod tests {
         assert_eq!(stored, "202609131234567890123456789");
     }
 
-
-
     #[test]
     fn normalizes_an_order_number() {
         assert_eq!(
@@ -2558,7 +2374,6 @@ mod tests {
         );
         assert!(normalize_order("123").is_err());
     }
-
 
     #[test]
     fn retries_hello_ten_times_before_giving_up() {
