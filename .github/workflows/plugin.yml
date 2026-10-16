@@ -58,5 +58,4 @@ jobs:
           name: Kovela-astrobox
           path: |
             plugins/astrobox/dist/kovela/Kovela.abp
-            plugins/astrobox/dist/kovela-v4/Kovela-v4.abp
           if-no-files-found: error
