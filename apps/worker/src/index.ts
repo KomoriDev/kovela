@@ -42,6 +42,7 @@ interface Session {
   request_id: string | null;
   receipt_hash: string | null;
   receipt_expires_at: number | null;
+  verified_at: number | null;
 }
 interface Outbox {
   id: string;
@@ -72,6 +73,10 @@ const randomToken = () =>
     x.toString(16).padStart(2, "0"),
   ).join("");
 const productIdPattern = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
+// 签发的会话只要还在这个窗口内，就直接沿用查询订单时核过的爱发电结论。
+// 用户的实际节奏是查询后几秒内点激活；把窗口放长只会让「签发」白等一次
+// 外呼，放短则等于每次激活都重新核对一遍。
+const VERIFIED_SESSION_SECONDS = 120;
 function oneLine(value: string, maximum = 80) {
   return value
     .replace(/[\u0000-\u001f]/g, " ")
@@ -104,7 +109,10 @@ function purchaseGuide(names: string[], orderNo: string) {
     "为你分配商品激活订单号：",
     list,
     "",
-    "请打开 AstroBox 的 Kovela 插件，选择对应应用并输入订单号完成激活。",
+    ...(names.includes("合成大西瓜图片自定义")
+      ? ["合成大西瓜：打开 AstroBox 的合成大西瓜换肤插件，登录并绑定购买商品的爱发电账号，验证后即可导入自定义图片；内置皮肤和传输免费。",
+        ...(names.some((name) => name !== "合成大西瓜图片自定义") ? ["其他应用请在 Kovela 插件中输入订单号完成激活。"] : [])]
+      : ["请打开 AstroBox 的 Kovela 插件，选择对应应用并输入订单号完成激活。"]),
     "",
     "--------",
     "",
@@ -596,12 +604,37 @@ export function createWorker(
     }
     const ip = request.headers.get("CF-Connecting-IP") ?? "local";
     await limit(env, "ip:" + (await digest(ip)), 90, 60);
+    // The host binding supplies the buyer ID. This boolean endpoint returns no
+    // credentials, order details, or device licenses and does not authenticate HTTP callers.
+    if (url.pathname === "/api/watermelon/entitlement") {
+      const afdianUserId = requireString(body, "afdianUserId", /^[a-f0-9]{32}$/i).toLowerCase();
+      const product = availableProduct(products, "com.komoridev.watermelon");
+      if (!env.AFDIAN_TOKEN || !/^[a-f0-9]{32}$/i.test(env.AFDIAN_USER_ID ?? ""))
+        throw new HttpError(503, "NOT_CONFIGURED", "购买验证服务尚未配置完成。");
+      await limit(env, "skin:" + (await digest(ip)), 20, 60);
+      await limit(env, "skin-buyer:" + (await digest(afdianUserId)), 20, 60);
+      const candidates = await env.DB.prepare(
+        "SELECT p.order_no FROM purchases p JOIN entitlements e ON e.order_no=p.order_no WHERE lower(p.buyer_id)=? AND e.product_id=? AND p.payment_status=2 ORDER BY p.updated_at DESC",
+      ).bind(afdianUserId, product.productId).all<{ order_no: string }>();
+      let entitled = false;
+      for (const candidate of candidates.results) {
+        const order = await api.getOrder(candidate.order_no);
+        const paid = !!order && order.user_id.toLowerCase() === afdianUserId && order.status === 2 &&
+          /^\d+(?:\.\d{1,2})?$/.test(order.total_amount) && matchesProduct(order, product);
+        if (!paid) continue;
+        entitled = true;
+        break;
+      }
+      return { productId: product.productId, afdianUserId, entitled };
+    }
     if (url.pathname === "/api/admin/licenses") {
       if (!verificationEnabled) throw new HttpError(503, "NOT_CONFIGURED", "授权签发服务尚未配置完成。");
       if (body.v !== 1 || body.type !== "kovela-offline-request")
         throw new HttpError(400, "INVALID_INPUT", "不是 Kovela 离线激活申请。");
       const orderNo = requireString(body, "orderNo", /^\d{16,32}$/);
       const productId = requireString(body, "productId", productIdPattern);
+      if (productId === "com.komoridev.watermelon")
+        throw new HttpError(409, "PLUGIN_ENTITLEMENT", "合成大西瓜自定义是插件账号权益，无需手环许可证，请使用独立换肤插件验证。");
       const deviceId = requireString(body, "deviceId", /^[a-f0-9]{64}$/);
       if (body.deviceModel !== undefined && (typeof body.deviceModel !== "string" || [...body.deviceModel].length > 80 || /[\u0000-\u001f\u007f]/.test(body.deviceModel)))
         throw new HttpError(400, "INVALID_INPUT", "设备型号格式不正确。");
@@ -696,8 +729,11 @@ export function createWorker(
           );
         const handoffToken = randomToken();
         const statusToken = randomToken();
+        // 刚刚用爱发电核过这个订单：记下时刻，签发时可以直接复用结论
+        // （见 VERIFIED_SESSION_SECONDS）。
+        const verifiedAt = now();
         await env.DB.prepare(
-          "INSERT INTO sessions(handoff_hash,status_hash,license_id,expires_at,status_expires_at) VALUES(?,?,?,?,?)",
+          "INSERT INTO sessions(handoff_hash,status_hash,license_id,expires_at,status_expires_at,verified_at) VALUES(?,?,?,?,?,?)",
         )
           .bind(
             await digest(handoffToken),
@@ -705,6 +741,7 @@ export function createWorker(
             entitlement.license_id,
             expiresAt,
             expiresAt + 3600,
+            verifiedAt,
           )
           .run();
         items.push({
@@ -723,6 +760,8 @@ export function createWorker(
       const token = requireString(body, "handoffToken", /^[a-f0-9]{64}$/);
       const deviceId = requireString(body, "deviceId", /^[a-f0-9]{64}$/);
       const productId = requireString(body, "productId", productIdPattern);
+      if (productId === "com.komoridev.watermelon")
+        throw new HttpError(409, "PLUGIN_ENTITLEMENT", "合成大西瓜换肤传输免费，自定义请在独立插件中验证当前爱发电账号。");
       const requestId = requireString(
         body,
         "requestId",
@@ -762,7 +801,16 @@ export function createWorker(
           "激活链接与目标应用不匹配，请重新验证订单。",
         );
       const product = availableProduct(products, order.product_id);
-      if (!matchesProduct(await eligible(api, order.order_no), product))
+      // 查询订单时刚核过爱发电：会话还新就沿用那次结论。「签发」这一步
+      // 只留 D1，用户不再为一个已知结论多等一次外呼，爱发电抖动也不再
+      // 直接把激活打成失败。会话放久了才重新核对付款状态。
+      const fresh =
+        typeof session.verified_at === "number" &&
+        now() - session.verified_at <= VERIFIED_SESSION_SECONDS;
+      if (
+        !fresh &&
+        !matchesProduct(await eligible(api, order.order_no), product)
+      )
         throw new HttpError(
           404,
           "ORDER_NOT_ELIGIBLE",

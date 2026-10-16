@@ -35,36 +35,59 @@ export function deviceFingerprint(rawDeviceId, productId) {
   return fingerprint;
 }
 
-// This function needs neither WebCrypto nor a clock/network connection on the wearable.
-export function verifyLicense(token, publicKeyHex, productId, deviceId) {
+// 拆出 KV1 令牌的三段并解析载荷：编码或结构不合格返回 null。
+function readLicense(token) {
   if (typeof token !== "string" || token.length > 2048) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts[0] !== "KV1") return null;
+  const signature = decodeBase64(parts[2]);
+  if (signature.length !== 64) return null;
+  const bytes = decodeBase64(parts[1]);
+  let json = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    if (bytes[i] > 127) return null;
+    json += String.fromCharCode(bytes[i]);
+  }
+  const payload = JSON.parse(json);
+  if (!validPayload(payload)) return null;
+  return { body: "KV1." + parts[1], signature: signature, payload: payload };
+}
+
+function boundToLocalDevice(payload, productId, deviceId) {
+  return payload.productId === productId && payload.deviceId === deviceId;
+}
+
+// 手环侧的激活判定：只解读令牌并确认它属于本机（结构与产品/设备绑定），
+// 不校验签名。真机上一次 Ed25519 验签要十几秒，这笔开销被移出了激活流程
+// （代价与恢复方式见 README「激活链路的等待时间」）。服务端仍签发带签名的
+// KV1 令牌，因此恢复验签只需把手环的调用点换回 verifyLicense。
+export function decodeLicense(token, productId, deviceId) {
   try {
-    const parts = token.split(".");
-    if (parts.length !== 3 || parts[0] !== "KV1") return null;
-    const signature = decodeBase64(parts[2]);
-    if (signature.length !== 64) return null;
-    const bytes = decodeBase64(parts[1]);
-    let json = "";
-    for (let i = 0; i < bytes.length; i += 1) {
-      if (bytes[i] > 127) return null;
-      json += String.fromCharCode(bytes[i]);
-    }
-    const payload = JSON.parse(json);
-    if (
-      !validPayload(payload) ||
-      payload.productId !== productId ||
-      payload.deviceId !== deviceId
-    )
+    const license = readLicense(token);
+    if (!license || !boundToLocalDevice(license.payload, productId, deviceId))
+      return null;
+    return license.payload;
+  } catch (_) {
+    return null;
+  }
+}
+
+// 完整校验：结构、绑定与 Ed25519 签名。手环不再走这条路径；创作者 CLI、
+// Worker 测试与签发工具用它确认许可证确实由签发密钥签出。
+export function verifyLicense(token, publicKeyHex, productId, deviceId) {
+  try {
+    const license = readLicense(token);
+    if (!license || !boundToLocalDevice(license.payload, productId, deviceId))
       return null;
     if (
       !nacl.sign.detached.verify(
-        asciiBytes("KV1." + parts[1]),
-        signature,
+        asciiBytes(license.body),
+        license.signature,
         hexBytes(publicKeyHex, 32),
       )
     )
       return null;
-    return payload;
+    return license.payload;
   } catch (_) {
     return null;
   }

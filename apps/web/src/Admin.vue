@@ -25,7 +25,7 @@ const deviceModel = ref("");
 const buyerConfirmed = ref(false);
 const result = ref<OfflineLicense>();
 const fileInput = ref<HTMLInputElement>();
-const products = computed(() => (config.value?.products ?? []).filter((item) => item.available));
+const products = computed(() => (config.value?.products ?? []).filter((item) => item.available && item.productId !== "com.komoridev.watermelon"));
 const resultJson = computed(() => result.value ? JSON.stringify(result.value, null, 2) : "");
 let request = new AbortController();
 

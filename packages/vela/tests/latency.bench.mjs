@@ -1,12 +1,17 @@
 // 计时反馈回路：启动时授权结论（ready）的延迟。
 // 用法：node tests/latency.bench.mjs
 // 判据：无论本机有没有授权记录，启动结论都只取决于 storage.get（串行
-// 1–3 次）加纯 CPU 验签，与 device.getDeviceId 的响应速度完全无关——
-// 真机上它被拥堵拖到半分钟也不该影响启动。设备服务一旦在启动链路里
-// 被调用，这里的假端口会直接抛错。
+// 1–3 次），与 device.getDeviceId 的响应速度完全无关——真机上它被拥堵拖到
+// 半分钟也不该影响启动。设备服务一旦在启动链路里被调用，这里的假端口会
+// 直接抛错。激活握手的判定只解读令牌（decodeLicense），不再做签名校验；
+// verifyLicense 只作为参照打印，手环侧已停用。
 import { performance } from "node:perf_hooks";
 import { createPrivateKey, createPublicKey, sign } from "node:crypto";
-import { deviceFingerprint, verifyLicense } from "@kovela/license";
+import {
+  decodeLicense,
+  deviceFingerprint,
+  verifyLicense,
+} from "@kovela/license";
 import { createActivation } from "../src/index.js";
 
 const PRODUCT = "com.example.game";
@@ -53,13 +58,20 @@ const token = mint(fingerprint);
   for (let i = 0; i < rounds; i += 1) deviceFingerprint(RAW_DEVICE, PRODUCT);
   const fingerprintMs = (performance.now() - t0) / rounds;
   t0 = performance.now();
-  for (let i = 0; i < rounds; i += 1)
+  for (let i = 0; i < rounds; i += 1) decodeLicense(token, PRODUCT, fingerprint);
+  const decodeMs = (performance.now() - t0) / rounds;
+  // 已停用的参照路径：一次验签是激活判定的上千倍，所以不放在激活流程里。
+  const signatureRounds = 200;
+  t0 = performance.now();
+  for (let i = 0; i < signatureRounds; i += 1)
     verifyLicense(token, publicKey, PRODUCT, fingerprint);
-  const verifyMs = (performance.now() - t0) / rounds;
+  const verifyMs = (performance.now() - t0) / signatureRounds;
   console.log(
     "CPU/次（Node 参照）：deviceFingerprint=" +
       fingerprintMs.toFixed(3) +
-      "ms  verifyLicense=" +
+      "ms  激活判定 decodeLicense=" +
+      decodeMs.toFixed(3) +
+      "ms  已停用的 verifyLicense=" +
       verifyMs.toFixed(3) +
       "ms",
   );
@@ -70,7 +82,7 @@ function runOnce(storageDelayMs, files) {
     let readyAt = 0;
     let startedAt = 0;
     let busy = false;
-    const activation = createActivation(PRODUCT, publicKey, {
+    const activation = createActivation(PRODUCT, {
       device: {
         getDeviceId() {
           throw new Error("启动链路不允许调用 getDeviceId");
@@ -118,8 +130,8 @@ const scenarios = [
     true,
   ],
   [
-    // 启动路径：只读一次本机记录，不跑验签（签名只在激活握手验一次）。
-    "v2 记录命中（1 次读取，不验签）",
+    // 启动路径：只读一次本机记录，不做任何判定（判定只在激活握手做一次）。
+    "v2 记录命中（1 次读取，不判定）",
     new Map([[LICENSE_KEY, JSON.stringify({ token, device: fingerprint })]]),
     true,
   ],

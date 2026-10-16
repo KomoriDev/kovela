@@ -9,6 +9,11 @@ export function deviceFingerprint(
   rawDeviceId: string,
   productId: string,
 ): string;
+export function decodeLicense(
+  token: unknown,
+  productId: string,
+  deviceId: string,
+): LicensePayload | null;
 export function verifyLicense(
   token: unknown,
   publicKeyHex: string,

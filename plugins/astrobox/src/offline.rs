@@ -33,7 +33,8 @@ fn valid_device(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-// Decoding is only a routing check. The wearable verifies the Ed25519 signature.
+// Decoding is only a routing check: the wearable runs the same structural and
+// binding checks without a signature check (see README 激活链路的等待时间).
 pub(crate) fn parse_license(input: &str) -> Result<License, String> {
     if input.len() > 8192 {
         return Err("许可证内容过长".into());

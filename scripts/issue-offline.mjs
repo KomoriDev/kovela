@@ -26,6 +26,8 @@ export async function issueOfflineLicense(input, {
   verificationKey = publicKey,
 } = {}) {
   const request = parseRequest(input);
+  if (request.productId === "com.komoridev.watermelon")
+    throw new Error("Watermelon custom skins are a plugin account entitlement. Use the standalone Watermelon plugin; no wearable license is required.");
   const base = new URL(origin);
   const local = base.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(base.hostname);
   if (base.origin !== origin || (base.protocol !== "https:" && !local)) {

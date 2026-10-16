@@ -127,6 +127,9 @@ struct State {
     scan_gen: u32,
     scan_tries: u32,
     scanning: bool,
+    // 点击「激活」后、定时事件真正开跑之前的窗口：这期间必须算忙，
+    // 否则两次快点击会起两条握手与两条 tick 链，互相把重试次数耗掉。
+    activation_queued: bool,
     service_status: ServiceStatus,
     service_reason: String,
     service_check_started: bool,
@@ -150,6 +153,11 @@ const WEBSITE_EVENT: &str = "website";
 const SERVICE_STATUS_EVENT: &str = "service-status";
 const SERVICE_CHECK_PAYLOAD: &str = "service-check";
 const SERVICE_CHECK_DELAY_MS: u64 = 60_000;
+/// 查询订单与激活的延迟启动载荷。宿主只在导出返回后才绘制界面，点击处理器
+/// 里就地做网络或主机调用（查询订单、打开手环应用）会让界面停在点击前的
+/// 画面一到数秒，用户以为卡住了。先渲染进行中的状态，动作交给定时事件。
+const LOOKUP_PAYLOAD: &str = "lookup";
+const ACTIVATE_PAYLOAD: &str = "activate";
 #[cfg(not(feature = "api4"))]
 const OFFLINE_FILE_PAYLOAD: &str = "offline-file";
 
@@ -370,6 +378,7 @@ fn enter_offline() {
             s.pending = None;
         }
         s.verifying = false;
+        s.activation_queued = false;
         let importing = !license_input.trim().is_empty();
         s.offline = Some(OfflineState { product_id, license_input, importing });
         s.status_clicks = 0;
@@ -667,7 +676,8 @@ fn busy() -> bool {
         let s = state.borrow();
         #[cfg(not(feature = "api4"))]
         if s.file_picker.is_some() { return true; }
-        s.pending.as_ref().is_some_and(|p| !matches!(p.phase, Phase::AwaitingLicense | Phase::Retry | Phase::Complete))
+        s.activation_queued
+            || s.pending.as_ref().is_some_and(|p| !matches!(p.phase, Phase::AwaitingLicense | Phase::Retry | Phase::Complete))
     })
 }
 fn fail(message: impl Into<String>) {
@@ -801,7 +811,7 @@ fn render() {
     let phase = pending.as_ref().map(|item| item.phase);
     let active = phase.is_some_and(|phase| !matches!(phase, Phase::AwaitingLicense | Phase::Retry | Phase::Complete));
     let complete = phase == Some(Phase::Complete);
-    let ui_locked = verifying || active;
+    let ui_locked = verifying || active || busy();
     let progress = match phase {
         Some(Phase::Hello) => Some(35),
         Some(Phase::AwaitingLicense | Phase::Issuing) => Some(55),
@@ -983,30 +993,23 @@ async fn load_devices() {
             .as_ref()
             .is_none_or(|pending| matches!(pending.phase, Phase::Retry | Phase::Complete));
         if replace {
-            s.selected = if devices.is_empty() { None } else { Some(0) };
+            let selected_addr = s.selected.and_then(|index| s.devices.get(index)).map(|(addr, _)| addr.clone());
+            s.selected = selected_addr.and_then(|addr| devices.iter().position(|(item, _)| *item == addr))
+                .or_else(|| if devices.is_empty() { None } else { Some(0) });
             s.devices = devices.clone();
             s.device_note = note;
         }
         true
     });
-    if !applied {
-        return;
-    }
+    if !applied { return; }
     render();
 }
 
-// 用户主动刷新或刚确认应用时重置重试次数，重新开始扫描。
-async fn begin_scan() {
-    STATE.with(|state| {
-        state.borrow_mut().scan_tries = 0;
-    });
-    load_devices().await;
-}
+// 用户主动刷新或手动连接图片工具时重置扫描重试次数。
+async fn begin_scan() { STATE.with(|state| state.borrow_mut().scan_tries = 0); load_devices().await; }
 
 async fn scan_tick(id: &str) {
-    let Some(generation) = id.parse::<u32>().ok() else {
-        return;
-    };
+    let Some(generation) = id.parse::<u32>().ok() else { return; };
     let retry = STATE.with(|state| {
         let s = state.borrow();
         s.scan_gen == generation && s.devices.is_empty() && s.scan_tries < 6
@@ -1162,6 +1165,7 @@ fn show(message: impl Into<String>) {
     STATE.with(|state| state.borrow_mut().message = message.into());
     render();
 }
+
 fn reset_order() {
     STATE.with(|state| {
         let mut s = state.borrow_mut();
@@ -1170,7 +1174,7 @@ fn reset_order() {
         s.pending = None;
         s.selected = None;
         s.verifying = false;
-        s.message = if s.offline.is_some() { String::new() } else { "请输入爱发电订单号".into() };
+        s.activation_queued = false;
         if let Some(local) = s.offline.as_mut() { local.license_input.clear(); local.importing = false; }
     });
     render();
@@ -1239,7 +1243,13 @@ fn finish_lookup() {
         json!({"orderNo": order}),
     ) {
         Ok(value) => match parse_offers(&value) {
-            Ok(offers) => {
+            Ok(mut offers) => {
+                offers.retain(|offer| offer.product_id != "com.komoridev.watermelon");
+                if offers.is_empty() {
+                    STATE.with(|state| state.borrow_mut().verifying = false);
+                    show("合成大西瓜自定义图片已迁移，请使用独立的合成大西瓜换肤插件并验证当前爱发电账号");
+                    return;
+                }
                 // 订单号本身就决定了商品：只有一个就直接接管，多于一个才让用户挑。
                 let single = offers.len() == 1;
                 STATE.with(|state| {
@@ -1637,14 +1647,28 @@ async fn on_device_message(raw: &str) {
         let Some(success) = message["success"].as_bool() else {
             return;
         };
-        if pending.offline && !success {
+        if !success {
+            // NOT_READY 不是失败：手环还没读到指纹，或上一条安装包正在落盘。
+            // 插件每 12 秒重发一次安装包，等下一轮回执即可。当成失败会把手环
+            // 与应用都写成失败，还多给买家发一条失败私信，用户只能手动重试。
             match message["error"].as_str() {
                 Some("NOT_READY") => return,
-                Some("INVALID_LICENSE") => fail("授权验证失败，许可证或设备不匹配"),
-                Some("STORAGE_FAILED") => fail("手环未能保存许可证，请重试"),
-                _ => fail("离线激活未完成，请查看手环提示后重试"),
+                // 离线流程没有服务端重试通道，就地给出结论。
+                Some("INVALID_LICENSE") if pending.offline => {
+                    fail("许可证与本机不匹配：请确认设备码与所选应用");
+                    return;
+                }
+                Some("STORAGE_FAILED") if pending.offline => {
+                    fail("手环未能保存许可证，请重试");
+                    return;
+                }
+                _ if pending.offline => {
+                    fail("离线激活未完成，请查看手环提示后重试");
+                    return;
+                }
+                // 在线流程的失败如实上报（下面按 ack=false 走 report）。
+                _ => {}
             }
-            return;
         }
         let updated = STATE.with(|state| {
             let mut s = state.borrow_mut();
@@ -1672,7 +1696,17 @@ async fn dispatch_event(kind: EventType, payload: String) {
                 poll_offline_file().await;
                 return;
             }
-            if body == SERVICE_CHECK_PAYLOAD {
+            if body == LOOKUP_PAYLOAD {
+                // 查询结果决定下一步：商品由订单号带出来，顺手把设备列表也
+                // 读出来，下一步就能直接点激活。
+                finish_lookup();
+                if STATE.with(|state| state.borrow().handoff.is_some()) {
+                    begin_scan().await;
+                }
+            } else if body == ACTIVATE_PAYLOAD {
+                STATE.with(|state| state.borrow_mut().activation_queued = false);
+                start_activation().await;
+            } else if body == SERVICE_CHECK_PAYLOAD {
                 probe_service().await;
             } else if let Some(id) = body.strip_prefix("tick:") {
                 match hello_tick(id) {
@@ -1697,14 +1731,15 @@ async fn dispatch_event(kind: EventType, payload: String) {
                 if p.phase != Phase::Installing || body != format!("install:{}", p.id) {
                     return None;
                 }
-                if p.install_retries >= 2 {
+                if p.install_retries >= 4 {
                     return None;
                 }
                 p.install_retries += 1;
                 Some(p.clone())
             }) {
                 // 回执丢一次先自动重发安装包（发送后会补注册路由），
-                // 手环端收到重发会立即同步回执；两轮都失败才要求手动重试。
+                // 手环端收到重发会立即同步回执。手环落盘前要读指纹、写存储，
+                // 叠加系统服务拥堵，窗口不能太窄：放宽到 4 轮（约 60 秒）。
                 send_install(pending).await;
             } else {
                 let waiting = STATE.with(|state| {
@@ -1723,6 +1758,7 @@ async fn dispatch_event(kind: EventType, payload: String) {
 }
 enum UiFollow {
     None,
+    Lookup,
     Refresh,
     Scan,
     Activate,
@@ -1758,17 +1794,18 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         }
         if id == "device-code" || id == "request-text" { return UiFollow::None; }
         if id == "device-select" {
-            if !locked() {
-                if let Ok(index) = event_text(payload).parse::<usize>() {
-                    STATE.with(|state| {
-                        let mut s = state.borrow_mut();
-                        if index < s.devices.len() && (s.offline.is_some() || s.pending.is_none()) {
-                            s.selected = Some(index);
-                            if s.offline.is_some() { s.pending = None; }
-                        }
-                    });
-                    render();
-                }
+            if locked() { return UiFollow::None; }
+            let changed = event_text(payload).parse::<usize>().ok().is_some_and(|index| {
+                STATE.with(|state| {
+                    let mut s = state.borrow_mut();
+                    if index >= s.devices.len() || (s.offline.is_none() && s.pending.is_some()) { return false; }
+                    s.selected = Some(index);
+                    if s.offline.is_some() { s.pending = None; }
+                    true
+                })
+            });
+            if changed {
+                render();
             }
             return UiFollow::None;
         }
@@ -1872,21 +1909,21 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         || id.starts_with("offer:");
     if id == "verify" || id == "查询订单" || (first_step && !known) {
         queue_lookup();
-        if STATE.with(|state| state.borrow().verifying) {
-            finish_lookup();
-            // 商品已由订单号确定，顺手把设备列表也读出来，下一步就能直接激活。
-            if STATE.with(|state| state.borrow().handoff.is_some()) {
-                return UiFollow::Refresh;
-            }
+        // 查询要同步走网络，先渲染「查询中…」再交给定时事件：宿主在导出
+        // 返回后才绘制，就地查询会让界面定格在点击前，用户以为卡住了。
+        render();
+        return if STATE.with(|state| state.borrow().verifying) {
+            UiFollow::Lookup
         } else {
-            render();
-        }
-        return UiFollow::None;
+            UiFollow::None
+        };
     }
     if id == "refresh" {
         return UiFollow::Refresh;
     }
     if id == "activate" {
+        // 定时事件真正开跑之前也算忙：两次快点击会起两条握手与两条 tick 链。
+        STATE.with(|state| state.borrow_mut().activation_queued = true);
         return UiFollow::Activate;
     }
     if let Some(index) = id
@@ -1898,12 +1935,12 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
     }
     if first_step {
         queue_lookup();
-        if STATE.with(|state| state.borrow().verifying) {
-            finish_lookup();
+        render();
+        return if STATE.with(|state| state.borrow().verifying) {
+            UiFollow::Lookup
         } else {
-            render();
-        }
-        return UiFollow::None;
+            UiFollow::None
+        };
     }
     STATE.with(|state| {
         state.borrow_mut().message = format!("收到点击，但没有对应操作：{id}");
@@ -1937,9 +1974,12 @@ impl event::Guest for Kovela {
     }
     async fn on_ui_event(id: String, event: ui::Event, payload: String) -> String {
         match dispatch_ui(&id, event, &payload) {
+            UiFollow::Lookup => host_timeout(1, LOOKUP_PAYLOAD).await,
             UiFollow::Refresh => begin_scan().await,
             UiFollow::Scan => load_devices().await,
-            UiFollow::Activate => start_activation().await,
+            // 打开手环应用与握手都是主机调用（一到数秒），先让宿主画完
+            // 「连接设备」再执行。
+            UiFollow::Activate => host_timeout(1, ACTIVATE_PAYLOAD).await,
             UiFollow::Probe => probe_service().await,
             UiFollow::OfflineCopy => copy_offline_request().await,
             UiFollow::OfflinePaste => paste_offline_license().await,
@@ -1987,9 +2027,10 @@ impl event_v3::Guest for Kovela {
         let (writer, reader) = astrobox_ng_wit::wit_future::new::<String>(String::new);
         astrobox_ng_wit::block_on(async move {
             match follow {
+                UiFollow::Lookup => host_timeout(1, LOOKUP_PAYLOAD).await,
                 UiFollow::Refresh => begin_scan().await,
                 UiFollow::Scan => load_devices().await,
-                UiFollow::Activate => start_activation().await,
+                UiFollow::Activate => host_timeout(1, ACTIVATE_PAYLOAD).await,
                 UiFollow::Probe => probe_service().await,
                 UiFollow::OfflineCopy => copy_offline_request().await,
                 UiFollow::OfflinePaste => paste_offline_license().await,
@@ -2020,6 +2061,7 @@ astrobox_ng_wit::export!(Kovela);
 mod tests {
     use super::{normalize_order, parse_offers, remember_order};
     use serde_json::json;
+
 
     #[test]
     fn reads_products_returned_for_an_order() {
@@ -2109,6 +2151,7 @@ mod tests {
         assert!(normalize_order("123").is_err());
     }
 
+
     #[test]
     fn retries_hello_ten_times_before_giving_up() {
         super::STATE.with(|state| {
@@ -2143,6 +2186,78 @@ mod tests {
             state.borrow_mut().pending.as_mut().unwrap().phase = super::Phase::Complete;
         });
         assert!(super::hello_tick("tick-target").is_none());
+    }
+
+    #[test]
+    fn order_lookup_is_deferred_so_the_ui_can_paint_first() {
+        super::STATE.with(|state| {
+            *state.borrow_mut() = super::State {
+                order_no: "202609131234567890123456789".into(),
+                ..Default::default()
+            };
+        });
+        // 查询要同步走网络（数秒），点击处理器只能把它交给定时事件，
+        // 否则宿主画到的还是点击前的画面，用户以为卡住了。
+        let follow = super::dispatch_ui("verify", super::ui::Event::Click, "");
+        assert!(matches!(follow, super::UiFollow::Lookup));
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            assert!(s.verifying);
+            assert_eq!(s.message, "正在查询订单…");
+        });
+
+        super::STATE.with(|state| {
+            *state.borrow_mut() = super::State {
+                order_no: "123".into(),
+                ..Default::default()
+            };
+        });
+        assert!(matches!(
+            super::dispatch_ui("verify", super::ui::Event::Click, ""),
+            super::UiFollow::None
+        ));
+        assert!(!super::STATE.with(|state| state.borrow().verifying));
+    }
+
+    #[test]
+    fn online_not_ready_receipt_keeps_waiting_instead_of_reporting_failure() {
+        super::STATE.with(|state| {
+            *state.borrow_mut() = super::State {
+                handoff: Some(super::Handoff {
+                    server_origin: "https://kovela.example.com".into(),
+                    handoff_token: "c".repeat(64),
+                    product_id: "com.komoridev.billiard".into(),
+                    product_name: "口袋台球".into(),
+                }),
+                pending: Some(pending_at(super::Phase::Installing, None, false)),
+                ..Default::default()
+            };
+        });
+        let receipt = json!({
+            "v": 1,
+            "id": "pending",
+            "type": "activation-result",
+            "licenseId": "license",
+            "deviceId": "0816d5a8023c11",
+            "success": false,
+            "error": "NOT_READY",
+        })
+        .to_string();
+        let mut future = std::pin::pin!(super::on_device_message(&receipt));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Future::poll(future.as_mut(), &mut context),
+            std::task::Poll::Ready(())
+        ));
+        // 手环说「还没准备好」只是还没轮到：插件按 12 秒一轮重发安装包。
+        // 这既不能算成功，也不能算失败——算失败会联网上报并把用户推进
+        // 「激活未完成」的重试步骤。
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            let p = s.pending.as_ref().unwrap();
+            assert_eq!(p.ack, None);
+            assert!(p.phase == super::Phase::Installing);
+        });
     }
 
     fn pending_at(phase: super::Phase, ack: Option<bool>, reported: bool) -> super::Pending {

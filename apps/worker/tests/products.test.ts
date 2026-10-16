@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
-import { readFile, writeFile, mkdtemp, rm } from "node:fs/promises";
+import { readFile, readdir, writeFile, mkdtemp, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -100,6 +100,21 @@ async function migrate(db: D1Database, name: string) {
   );
 }
 
+// 迁移脚本只会增加：测试统一按顺序全量应用，免得每加一条就漏掉一处。
+async function migrationNames() {
+  const directory = new URL("../migrations/", import.meta.url);
+  return (await readdir(directory))
+    .filter((name) => name.endsWith(".sql"))
+    .sort();
+}
+async function migrateAll(db: D1Database) {
+  for (const name of await migrationNames()) await migrate(db, name);
+}
+// 升级路径的测试要先写旧数据，再接着应用剩余脚本。
+async function migrateAfter(db: D1Database, name: string) {
+  for (const item of await migrationNames()) if (item > name) await migrate(db, item);
+}
+
 async function fixture(
   t: TestContext,
   queryOrder: (orderNo: string) => unknown = (orderNo) => orders[orderNo],
@@ -159,9 +174,7 @@ test("public origin verifies an order without Turnstile and then rate-limits tha
   const { db, env, worker, post, ok } = await fixture(t);
   env.PUBLIC_ORIGIN = origin;
   env.DEV_MODE = "false";
-  await migrate(db, "0001_initial.sql");
-  await migrate(db, "0002_products.sql");
-  await migrate(db, "0003_guides.sql");
+  await migrateAll(db);
   const response = await worker.fetch(new Request(origin + "/api/config"), env);
   assert.equal(response.status, 200);
   const config = await response.json();
@@ -197,9 +210,7 @@ test("public origin verifies an order without Turnstile and then rate-limits tha
 
 test("completed zero-price redemptions can activate and notify without admitting unpaid orders", async (t) => {
   const { db, env, worker, post, ok, messages } = await fixture(t);
-  await migrate(db, "0001_initial.sql");
-  await migrate(db, "0002_products.sql");
-  await migrate(db, "0003_guides.sql");
+  await migrateAll(db);
   const product = products[0];
   const unpaid = await post("/api/orders/verify", {
     orderNo: unpaidNo,
@@ -304,17 +315,13 @@ test("purchase webhook still sends the guide when query-order is loose or not in
     status: "2",
     total_amount: 5,
   }));
-  await migrate(loose.db, "0001_initial.sql");
-  await migrate(loose.db, "0002_products.sql");
-  await migrate(loose.db, "0003_guides.sql");
+  await migrateAll(loose.db);
   await loose.ok("/api/webhooks/afdian?token=" + loose.env.WEBHOOK_TOKEN, hook);
   assert.match(loose.messages[0], /感谢您购买 坦克动荡/);
   assert.match(loose.messages[0], new RegExp(orderNo));
 
   const delayed = await fixture(t, () => null);
-  await migrate(delayed.db, "0001_initial.sql");
-  await migrate(delayed.db, "0002_products.sql");
-  await migrate(delayed.db, "0003_guides.sql");
+  await migrateAll(delayed.db);
   delayed.env.PRODUCTS = [{ ...products[0], skuIds: [] }];
   const bare = await delayed.worker.fetch(
     new Request(
@@ -329,9 +336,7 @@ test("purchase webhook still sends the guide when query-order is loose or not in
   assert.match(delayed.messages[0], new RegExp(orderNo));
 
   const waiting = await fixture(t, () => null);
-  await migrate(waiting.db, "0001_initial.sql");
-  await migrate(waiting.db, "0002_products.sql");
-  await migrate(waiting.db, "0003_guides.sql");
+  await migrateAll(waiting.db);
   const held = await waiting.post(
     "/api/webhooks/afdian?token=" + waiting.env.WEBHOOK_TOKEN,
     hook,
@@ -343,9 +348,7 @@ test("purchase webhook still sends the guide when query-order is loose or not in
 
 test("SKUs, handoffs, signatures, bindings and reports remain isolated for products sharing an order", async (t) => {
   const { db, env, post, ok, messages } = await fixture(t);
-  await migrate(db, "0001_initial.sql");
-  await migrate(db, "0002_products.sql");
-  await migrate(db, "0003_guides.sql");
+  await migrateAll(db);
   const [a, b] = products;
   assert.equal(
     (await post("/api/orders/verify", { orderNo, productId: b.productId }))
@@ -556,8 +559,7 @@ test("upgrading preserves existing licenses, device bindings, status tokens and 
         "existing activation notification",
       ),
   ]);
-  await migrate(db, "0002_products.sql");
-  await migrate(db, "0003_guides.sql");
+  await migrateAfter(db, "0001_initial.sql");
   const state = await ok("/api/activation/status", { statusToken });
   assert.deepEqual(state, {
     state: "activated",
@@ -604,9 +606,7 @@ test("offline issuance shares the online device binding and only exports signed 
   const { db, env, worker, ok } = await fixture(t);
   env.PUBLIC_ORIGIN = origin;
   env.DEV_MODE = "false";
-  await migrate(db, "0001_initial.sql");
-  await migrate(db, "0002_products.sql");
-  await migrate(db, "0003_guides.sql");
+  await migrateAll(db);
   const deviceId = "a".repeat(64);
   const request = {
     v: 1, type: "kovela-offline-request", orderNo,
@@ -639,9 +639,7 @@ test("offline issuer rejects unpaid orders, wrong products and an invalid server
   const { db, env, worker } = await fixture(t);
   env.PUBLIC_ORIGIN = origin;
   env.DEV_MODE = "false";
-  await migrate(db, "0001_initial.sql");
-  await migrate(db, "0002_products.sql");
-  await migrate(db, "0003_guides.sql");
+  await migrateAll(db);
   const request = { v: 1, type: "kovela-offline-request", orderNo: unpaidNo, productId: products[0].productId, deviceId: "a".repeat(64) };
   const transport: typeof fetch = (input, init) => worker.fetch(new Request(String(input), init), env);
   const options = { origin, transport, verificationKey: publicKey };
@@ -656,9 +654,7 @@ test("offline issuance racing an online activation cannot bind one order to two 
   const { db, env, worker, ok } = await fixture(t);
   env.PUBLIC_ORIGIN = origin;
   env.DEV_MODE = "false";
-  await migrate(db, "0001_initial.sql");
-  await migrate(db, "0002_products.sql");
-  await migrate(db, "0003_guides.sql");
+  await migrateAll(db);
   const online = await ok("/api/orders/lookup", { orderNo });
   const transport: typeof fetch = (input, init) => worker.fetch(new Request(String(input), init), env);
   const offline = issueOfflineLicense({ v: 1, type: "kovela-offline-request", orderNo, productId: products[0].productId, deviceId: "a".repeat(64) }, { origin, transport, verificationKey: publicKey });
@@ -680,9 +676,7 @@ test("offline CLI exports a verified file and refuses to overwrite or leave a fa
   const { db, env, worker } = await fixture(t);
   env.PUBLIC_ORIGIN = origin;
   env.DEV_MODE = "false";
-  await migrate(db, "0001_initial.sql");
-  await migrate(db, "0002_products.sql");
-  await migrate(db, "0003_guides.sql");
+  await migrateAll(db);
   const directory = await mkdtemp(path.join(tmpdir(), "kovela-offline-cli-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const inputFile = path.join(directory, "request.json");
@@ -710,7 +704,7 @@ test("admin signing authenticates before orders and shares online device binding
   env.PUBLIC_ORIGIN = origin;
   env.DEV_MODE = "false";
   env.ADMIN_KEY = "e".repeat(64);
-  for (const migration of ["0001_initial.sql", "0002_products.sql", "0003_guides.sql"]) await migrate(db, migration);
+  await migrateAll(db);
   const input = { v: 1, type: "kovela-offline-request", orderNo, productId: products[0].productId, deviceId: "a".repeat(64) };
   const admin = (path: string, value: unknown, key?: string) => worker.fetch(new Request(origin + path, {
     method: "POST", headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(value),
@@ -742,7 +736,7 @@ test("admin issuance racing online activation cannot bind two devices", async (t
   env.PUBLIC_ORIGIN = origin;
   env.DEV_MODE = "false";
   env.ADMIN_KEY = "e".repeat(64);
-  for (const migration of ["0001_initial.sql", "0002_products.sql", "0003_guides.sql"]) await migrate(db, migration);
+  await migrateAll(db);
   const online = await ok("/api/orders/lookup", { orderNo });
   const responses = await Promise.all([
     worker.fetch(new Request(origin + "/api/admin/licenses", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.ADMIN_KEY}` }, body: JSON.stringify({ v: 1, type: "kovela-offline-request", orderNo, productId: products[0].productId, deviceId: "a".repeat(64) }) }), env),
@@ -755,7 +749,7 @@ test("admin issuance racing online activation cannot bind two devices", async (t
   assert.equal(verifyLicense(bound?.license_token, publicKey, products[0].productId, successful.deviceId)?.licenseId, successful.licenseId);
 });
 
-test("watermelon image entitlement matches its Afdian item without granting another application", async (t) => {
+test("watermelon image entitlement matches its Afdian item without issuing a wearable license", async (t) => {
   const product: ProductConfig = {
     productId: "com.komoridev.watermelon",
     productName: "合成大西瓜图片自定义",
@@ -765,16 +759,17 @@ test("watermelon image entitlement matches its Afdian item without granting anot
   };
   const {db, env, post, ok} = await fixture(t, number => number === orderNo ? {...orders[orderNo], plan_id: product.planIds[0], sku_detail: []} : orders[number]);
   env.PRODUCTS = [product, ...products];
-  for (const migration of ["0001_initial.sql", "0002_products.sql", "0003_guides.sql"]) await migrate(db, migration);
+  await migrateAll(db);
   const lookup = await ok("/api/orders/lookup", {orderNo});
   assert.deepEqual(lookup.items.map((item: {productId: string}) => item.productId), [product.productId]);
   assert.equal((await post("/api/orders/verify", {orderNo, productId: products[0].productId})).status, 404);
   const session = await ok("/api/orders/verify", {orderNo, productId: product.productId});
   const deviceId = "a".repeat(64);
   const request = {handoffToken: session.handoffToken, productId: product.productId, deviceId, requestId: "watermelon-entitlement-0001"};
-  const issued = await ok("/api/activate", request);
-  assert.equal(verifyLicense(issued.licenseToken, publicKey, product.productId, deviceId)?.licenseId, issued.licenseId);
-  assert.equal(verifyLicense(issued.licenseToken, publicKey, products[0].productId, deviceId), null);
-  assert.equal((await post("/api/activate", {...request, deviceId: "b".repeat(64), requestId: "watermelon-other-device-001"})).status, 409);
+  const rejected = await post("/api/activate", request);
+  assert.equal(rejected.status, 409);
+  assert.equal((await rejected.json()).error.code, "PLUGIN_ENTITLEMENT");
+  const entitlement = await db.prepare("SELECT device_id,license_token FROM entitlements WHERE order_no=? AND product_id=?").bind(orderNo, product.productId).first();
+  assert.deepEqual(entitlement, {device_id: null, license_token: null});
   assert.equal((await post("/api/orders/verify", {orderNo: unpaidNo, productId: product.productId})).status, 404);
 });

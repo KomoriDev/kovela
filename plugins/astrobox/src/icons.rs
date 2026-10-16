@@ -1,4 +1,4 @@
-// Generated from lucide-vue-next 0.544.0.
+// Generated from lucide-vue-next 0.544.0 and @lucide/vue 1.45.0.
 /*
 ISC License
 

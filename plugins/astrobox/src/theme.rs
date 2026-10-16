@@ -38,7 +38,7 @@ pub(crate) mod shape {
     pub(crate) const FULL: u32 = 20;
 }
 
-/// 用到的 M3 字号（dp）：titleLarge / titleMedium / bodyMedium / labelMedium。
+/// 用到的 M3 字号（dp）：titleLarge / titleMedium / bodyMedium / labelMedium / labelSmall。
 pub(crate) mod type_scale {
     pub(crate) const TITLE_LARGE: u32 = 22;
     pub(crate) const TITLE_MEDIUM: u32 = 16;
@@ -64,6 +64,7 @@ const FIELD_HEIGHT: u32 = 56;
 const PROGRESS_HEIGHT: u32 = 4;
 const LINK_HEIGHT: u32 = 32;
 
+
 /// 页面内容与页脚共享宿主的深色底。
 pub(crate) fn shell() -> ui::Element {
     ui::Element::new(ui::ElementType::Div, None)
@@ -85,6 +86,7 @@ pub(crate) fn page() -> ui::Element {
         .max_width(640)
         .min_width(0)
 }
+
 
 /// M3 titleLarge：页面标题。
 pub(crate) fn headline(text: &str) -> ui::Element {
@@ -113,6 +115,7 @@ pub(crate) fn label(text: &str) -> ui::Element {
         .size(type_scale::LABEL_MEDIUM)
         .text_color(color::ON_SURFACE_VARIANT)
 }
+
 
 
 /// 横向排布的一行，用来让 chip 之类的元素按内容宽度收窄。
@@ -204,6 +207,7 @@ pub(crate) fn card() -> ui::Element {
         .radius(shape::MEDIUM)
 }
 
+
 /// M3 assist chip：标注绑定状态之类的短信息。
 pub(crate) fn chip(text: &str) -> ui::Element {
     ui::Element::new(ui::ElementType::Span, Some(text))
@@ -213,6 +217,7 @@ pub(crate) fn chip(text: &str) -> ui::Element {
         .bg(color::SECONDARY_CONTAINER)
         .radius(shape::SMALL)
 }
+
 
 /// 固定尺寸的服务状态按钮，异常时可展开原因。
 pub(crate) fn service_badge(status: ServiceStatus) -> ui::Element {

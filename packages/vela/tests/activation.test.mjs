@@ -100,11 +100,6 @@ function environment({ token = "", cachedDevice = "", record = null } = {}) {
       storage: {
         get(options) {
           assert.equal(outstandingGets, 0, "存储请求必须串行");
-          assert.equal(
-            options.default,
-            "",
-            "与最初真机验证过的调用形态保持一致（default 非必填）",
-          );
           outstandingGets += 1;
           pending.get.push(options);
         },
@@ -153,7 +148,7 @@ function environment({ token = "", cachedDevice = "", record = null } = {}) {
 
 function start(options) {
   const env = environment(options);
-  const activation = createActivation(PRODUCT, publicKey, env.ports);
+  const activation = createActivation(PRODUCT, env.ports);
   const states = [];
   activation.subscribe((state) => states.push(state));
   activation.start();
@@ -208,7 +203,7 @@ test("v2 记录命中：启动只读一次存储，全程不碰设备服务", ()
   });
   env.serveStorage();
   const done = latest();
-  assert.equal(done.ready, true, "本机记录直接出结论（启动不验签）");
+  assert.equal(done.ready, true, "本机记录直接出结论（启动不做判定）");
   assert.equal(done.activated, true);
   assert.equal(done.licenseId, licenseId, "编号取自记录标记");
   assert.equal(done.deviceId, fingerprint, "回执与界面使用记录里的指纹");
@@ -226,11 +221,11 @@ test("v2 记录命中：启动只读一次存储，全程不碰设备服务", ()
   assert.equal(reply.deviceId, fingerprint);
 });
 
-test("没有标记的旧记录同样直接生效：启动不做签名校验", () => {
+test("没有标记的旧记录同样直接生效：启动不做任何判定", () => {
   const fingerprint = deviceFingerprint(RAW_DEVICE, PRODUCT);
   const token = mint(fingerprint);
-  // 1.0.8 之前的记录只有 token/device。写这些记录的历史版本同样是
-  // "验签通过后才落盘"，所以启动直接采信；签名校验只留在激活握手。
+  // 1.0.8 之前的记录只有 token/device。历史版本写这些记录时也只发生在
+  // 激活握手成功之后，所以启动直接采信；判定只留在激活握手那一次。
   const { env, latest } = start({ record: { token, device: fingerprint } });
   env.serveStorage();
   const done = latest();
@@ -291,16 +286,22 @@ test("hello 时按需读取设备标识，读到后再回执", () => {
   env.connection.onmessage({ data: { v: 1, id: HELLO_ID, type: "hello" } });
   assert.equal(latest().connected, true, "收到报文即证明对端在场");
   assert.equal(env.pending.id.length, 1, "激活握手才按需发起读取");
-  assert.equal(env.pending.info.length, 1, "机型名同样此时才读");
+  assert.equal(
+    env.pending.info.length,
+    0,
+    "机型名不与指纹并发：真机设备服务同一刻只应有一个在途请求",
+  );
   assert.equal(env.sent.length, 0, "指纹未就绪不回执");
 
-  env.pending.info.shift().success({ brand: "Xiaomi", model: "Band 10" });
   env.pending.id.shift().success({ deviceId: RAW_DEVICE });
   const reply = env.sent[env.sent.length - 1];
   assert.equal(reply.type, "device");
+  assert.equal(reply.id, HELLO_ID);
   assert.equal(reply.activated, false);
   assert.equal(reply.deviceId, deviceFingerprint(RAW_DEVICE, PRODUCT));
-  assert.equal(reply.deviceModel, "Xiaomi Band 10");
+  assert.equal(reply.deviceModel, undefined, "回执不等机型，先发出去");
+  assert.equal(env.pending.info.length, 1, "回执发出后才补读机型");
+  env.pending.info.shift().success({ brand: "Xiaomi", model: "Band 10" });
 });
 
 test("设备标识读取失败不回执，错误上屏且允许下次再试", () => {
@@ -349,7 +350,7 @@ test("安装包在指纹未就绪时回 NOT_READY，就绪后重发即可激活"
       licenseToken,
     },
   });
-  assert.equal(env.pending.set.length, 1, "就绪后同一安装包直接验签落盘");
+  assert.equal(env.pending.set.length, 1, "就绪后同一安装包直接解读落盘");
   assert.equal(env.pending.set[0].key, LEGACY_TOKEN_KEY);
   env.pending.set.shift().success();
   assert.equal(latest().activated, true);
@@ -362,6 +363,86 @@ test("安装包在指纹未就绪时回 NOT_READY，就绪后重发即可激活"
   const finalReceipt = env.sent[env.sent.length - 1];
   assert.equal(finalReceipt.type, "activation-result");
   assert.equal(finalReceipt.success, true);
+});
+
+test("激活判定只解读令牌：签名不校验，绑定不匹配仍然拒绝", () => {
+  // 手环侧已放弃验签（见 README「激活链路的等待时间」）。这条用例固定住新
+  // 契约：结构合法、产品与设备绑定一致的令牌就生效，无论签名来自谁；绑定
+  // 换了设备或商品则照旧回 INVALID_LICENSE。
+  const fingerprint = deviceFingerprint(RAW_DEVICE, PRODUCT);
+  const licenseId = "license-0000000001";
+  const forged =
+    "KV1." +
+    Buffer.from(
+      JSON.stringify({
+        v: 1,
+        licenseId,
+        productId: PRODUCT,
+        deviceId: fingerprint,
+        issuedAt: 1790000000000,
+      }),
+      "ascii",
+    ).toString("base64url") +
+    "." +
+    Buffer.alloc(64, 9).toString("base64url");
+
+  const accepted = start({ token: "" });
+  accepted.env.serveStorage();
+  accepted.activation.retry();
+  accepted.env.serveStorage();
+  accepted.env.connection.onmessage({
+    data: {
+      v: 1,
+      id: HELLO_ID,
+      type: "install-license",
+      licenseId,
+      licenseToken: forged,
+    },
+  });
+  assert.equal(accepted.env.pending.id.length, 1, "先按需读指纹");
+  accepted.env.pending.id.shift().success({ deviceId: RAW_DEVICE });
+  // 第一份安装包只拿到 NOT_READY：插件按轮次重发，重发即落盘。
+  accepted.env.connection.onmessage({
+    data: {
+      v: 1,
+      id: HELLO_ID,
+      type: "install-license",
+      licenseId,
+      licenseToken: forged,
+    },
+  });
+  assert.equal(accepted.env.pending.set.length, 1, "指纹就绪即落盘");
+  accepted.env.pending.set.shift().success();
+  assert.equal(accepted.latest().activated, true);
+  assert.equal(accepted.env.sent[accepted.env.sent.length - 1].success, true);
+
+  const mismatched = start({ token: "" });
+  mismatched.env.serveStorage();
+  mismatched.activation.retry();
+  mismatched.env.serveStorage();
+  mismatched.env.connection.onmessage({
+    data: {
+      v: 1,
+      id: HELLO_ID,
+      type: "install-license",
+      licenseId,
+      licenseToken: forged,
+    },
+  });
+  mismatched.env.pending.id.shift().success({ deviceId: "another-raw-device" });
+  mismatched.env.connection.onmessage({
+    data: {
+      v: 1,
+      id: HELLO_ID,
+      type: "install-license",
+      licenseId,
+      licenseToken: forged,
+    },
+  });
+  assert.equal(mismatched.env.pending.set.length, 0, "绑定不匹配不落盘");
+  const rejection = mismatched.env.sent[mismatched.env.sent.length - 1];
+  assert.equal(rejection.success, false);
+  assert.equal(rejection.error, "INVALID_LICENSE");
 });
 
 test("同一许可证的重复安装包直接回执，不重写存储", () => {
@@ -433,15 +514,34 @@ test("固件没有 diagnosis 时干脆不查状态，绝不退回无界等待", 
   assert.equal(latest().ready, true, "结论照常给出，状态提示交给事件");
 });
 
-test("hello 在结论未出时只触发读取，不回执", () => {
+test("结论未出时收到的 hello 先记账，结论一出立即回执", () => {
   const { env, activation } = start({ token: "" });
-  // 读链路尚未兑现：ready 仍为 false。
+  // 读链路尚未兑现：ready 仍为 false，此时插件通常已经在发 hello。
   activation.retry();
   env.connection.onmessage({ data: { v: 1, id: HELLO_ID, type: "hello" } });
-  assert.equal(env.sent.length, 0);
+  assert.equal(env.sent.length, 0, "结论未出先不回执");
   env.serveStorage();
-  env.connection.onmessage({ data: { v: 1, id: HELLO_ID, type: "hello" } });
-  assert.equal(env.pending.id.length, 1, "结论已出，hello 走按需读取");
+  assert.equal(env.pending.id.length, 1, "结论一出立刻按需读指纹");
   env.pending.id.shift().success({ deviceId: RAW_DEVICE });
-  assert.equal(env.sent.length, 1);
+  const reply = env.sent[env.sent.length - 1];
+  assert.equal(reply.type, "device");
+  assert.equal(reply.id, HELLO_ID, "用记账的那条 hello 回执，插件不必再等一轮重发");
+  assert.equal(reply.deviceId, deviceFingerprint(RAW_DEVICE, PRODUCT));
+  assert.equal(reply.activated, false);
+});
+
+test("读链卡死超过 1.5 秒后 retry() 放弃在途读链重来", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const { env, activation, latest } = start({ token: "" });
+  assert.equal(env.pending.get.length, 1);
+  // 健康但在途的读取不打断：同时压两条存储请求会丢回调。
+  activation.retry();
+  assert.equal(env.pending.get.length, 1);
+  t.mock.timers.tick(1600);
+  env.dropPending();
+  activation.retry();
+  assert.equal(env.pending.get.length, 1, "在途超过 1.5 秒就放弃重读");
+  env.serveStorage();
+  assert.equal(latest().ready, true, "重读后照样出结论");
+  assert.equal(latest().error, "");
 });

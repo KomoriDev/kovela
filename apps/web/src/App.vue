@@ -41,8 +41,10 @@ const allBound = computed(
   () =>
     !!order.value &&
     order.value.items.length > 0 &&
-    order.value.items.every((item) => item.boundDeviceId),
+    order.value.items.filter((item) => item.productId !== "com.komoridev.watermelon").every((item) => item.boundDeviceId),
 );
+const hasWatermelon = computed(() => order.value?.items.some((item) => item.productId === "com.komoridev.watermelon"));
+const hasDeviceActivation = computed(() => order.value?.items.some((item) => item.productId !== "com.komoridev.watermelon"));
 const loading = ref(false);
 const error = ref("");
 const configError = ref("");
@@ -218,9 +220,11 @@ onBeforeUnmount(() => {
               <p class="mt-2 text-sm text-muted-foreground">
                 {{
                   order
-                    ? allBound
-                      ? "订单内的应用均已绑定设备。"
-                      : "本订单包含以下应用的授权。"
+                    ? hasWatermelon && !hasDeviceActivation
+                      ? "已确认插件自定义权益，无需绑定手环。"
+                      : allBound
+                        ? "订单内需激活的应用均已绑定设备。"
+                        : "本订单包含以下应用与插件权益。"
                     : "输入爱发电订单号，查看包含的应用与绑定状态。"
                 }}
               </p>
@@ -326,18 +330,23 @@ onBeforeUnmount(() => {
                 <span
                   class="shrink-0 rounded-full px-2.5 py-1 text-xs font-medium"
                   :class="
-                    item.boundDeviceId
+                    item.productId === 'com.komoridev.watermelon' || item.boundDeviceId
                       ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300'
                       : 'bg-muted text-muted-foreground'
                   "
                   >{{
-                    item.boundDeviceId
-                      ? `已绑定 ${item.boundDeviceId.slice(0, 12)}…`
-                      : "尚未绑定"
+                    item.productId === 'com.komoridev.watermelon'
+                      ? "插件自定义权益"
+                      : item.boundDeviceId
+                        ? `已绑定 ${item.boundDeviceId.slice(0, 12)}…`
+                        : "尚未绑定"
                   }}</span
                 >
               </div>
-              <p class="text-xs leading-6 text-muted-foreground">
+              <p v-if="hasWatermelon" class="text-xs leading-6 text-muted-foreground">
+                合成大西瓜：打开独立换肤插件，登录并绑定购买商品的爱发电账号后验证自定义权益。内置皮肤和手环传输免费，无需激活手环。
+              </p>
+              <p v-if="hasDeviceActivation" class="text-xs leading-6 text-muted-foreground">
                 {{
                   allBound
                     ? "如需重装应用或重新传输许可证，在插件中输入同一订单号即可。"
