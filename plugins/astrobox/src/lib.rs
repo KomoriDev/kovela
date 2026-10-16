@@ -127,8 +127,6 @@ struct State {
     // 点击「激活」后、定时事件真正开跑之前的窗口：这期间必须算忙，
     // 否则两次快点击会起两条握手与两条 tick 链，互相把重试次数耗掉。
     activation_queued: bool,
-    /// 服务端是否已提供账号维度接口（由 /api/config 探测得到）。
-    account_activation: bool,
     /// 账号查询代次：超时或重试后，迟到的旧结果直接丢弃。
     account_gen: u32,
     /// 宿主安装标识读一次就够（它属于同一份安装），避免每次重试都再要一次权限。
@@ -761,7 +759,6 @@ fn render() {
         service_status,
         service_reason,
         service_reason_visible,
-        account_activation,
     ) = STATE.with(|state| {
         let s = state.borrow();
         (
@@ -779,7 +776,6 @@ fn render() {
             s.service_status,
             s.service_reason.clone(),
             s.service_reason_visible,
-            s.account_activation,
         )
     });
     let Some(root) = root else { return };
@@ -849,15 +845,11 @@ fn render() {
                     theme::field("爱发电订单号", "order-input").prop("default-value", &order_no),
                     ui_locked,
                 ))
-                .child(verify);
-            // Level 4 宿主才有账号接口，而且服务端要已部署这套接口：
-            // 条件不满足就不显示，免得点了只拿到「接口不存在」。
-            if account_activation {
-                page = page.child(gate(
+                .child(verify)
+                .child(gate(
                     theme::outlined_button("用 AstroBox 账号激活", "account"),
                     ui_locked,
                 ));
-            }
         }
         _ => {
             if !message.is_empty() {
@@ -1035,7 +1027,7 @@ fn post<T: serde::de::DeserializeOwned>(
         .and_then(|bytes| parse_response(status, &bytes));
     match &result {
         Ok(_) => {
-            update_service(Ok(None));
+            update_service(Ok(()));
         }
         Err(reason) if status >= 500 || (200..300).contains(&status) => {
             update_service(Err(reason.clone()));
@@ -1067,13 +1059,9 @@ fn parse_response<T: serde::de::DeserializeOwned>(status: u16, bytes: &[u8]) -> 
 #[serde(rename_all = "camelCase")]
 struct ServiceConfig {
     verification_enabled: bool,
-    /// 服务端是否已提供账号维度激活接口。老 Worker 没有这个字段（按 false 处理），
-    /// 插件据此隐藏「用 AstroBox 账号激活」，避免点了只拿到「接口不存在」。
-    #[serde(default)]
-    account_activation: bool,
 }
 
-fn check_service() -> Result<ServiceConfig, String> {
+fn check_service() -> Result<(), String> {
     let response = waki::Client::new()
         .get(&format!("{}/api/config", server_origin()))
         .connect_timeout(Duration::from_secs(8))
@@ -1084,28 +1072,20 @@ fn check_service() -> Result<ServiceConfig, String> {
     parse_service_config(status, &bytes)
 }
 
-fn parse_service_config(status: u16, bytes: &[u8]) -> Result<ServiceConfig, String> {
+fn parse_service_config(status: u16, bytes: &[u8]) -> Result<(), String> {
     let config: ServiceConfig = parse_response(status, bytes)?;
     if !config.verification_enabled {
         return Err("购买验证尚未开放，请等待服务配置完成".into());
     }
-    Ok(config)
+    Ok(())
 }
 
-/// `Ok(None)` 表示结果来自业务请求（成功但没带回配置），只刷新健康状态；只有
-/// 服务探测会带回配置，并可能改变「账号激活是否可用」这类能力标志。
-fn update_service(result: Result<Option<ServiceConfig>, String>) -> bool {
+fn update_service(result: Result<(), String>) -> bool {
     STATE.with(|state| {
         let mut s = state.borrow_mut();
         match result {
-            Ok(config) => {
-                let mut changed = s.service_status != ServiceStatus::Healthy;
-                if let Some(config) = config {
-                    if s.account_activation != config.account_activation {
-                        s.account_activation = config.account_activation;
-                        changed = true;
-                    }
-                }
+            Ok(()) => {
+                let changed = s.service_status != ServiceStatus::Healthy;
                 s.service_status = ServiceStatus::Healthy;
                 s.service_reason.clear();
                 s.service_reason_visible = false;
@@ -1157,7 +1137,7 @@ fn status_shortcut(now: Instant) -> bool {
 }
 
 async fn probe_service() {
-    if should_probe_service() && update_service(check_service().map(Some)) {
+    if should_probe_service() && update_service(check_service()) {
         render();
     }
     host_timeout(SERVICE_CHECK_DELAY_MS, SERVICE_CHECK_PAYLOAD).await;
@@ -1387,15 +1367,7 @@ fn finish_account_lookup(generation: u32, result: Result<Vec<Offer>, String>) {
                 render();
             }
         }
-        Err(error) => {
-            // 服务端还没有这套接口时不要把原始 404 抛给用户看。
-            let error = if error.contains("接口不存在") {
-                "账号激活暂不可用（服务端尚未更新），请稍后重试或改用订单号激活".into()
-            } else {
-                error
-            };
-            show(error);
-        }
+        Err(error) => show(error),
     }
 }
 
@@ -2513,18 +2485,17 @@ mod tests {
         assert!(super::account_lookup_timed_out(generation));
         assert!(!super::STATE.with(|state| state.borrow().verifying));
         // 超时之后迟到的结果直接丢掉，不覆盖界面。
-        super::finish_account_lookup(generation, Err("接口不存在。".into()));
+        super::finish_account_lookup(generation, Err("账号服务暂时不可用".into()));
         assert_eq!(
             super::STATE.with(|state| state.borrow().message.clone()),
             "正在读取 AstroBox 账号…（首次会请求授权）"
         );
-        // 服务端还没上这套接口时给能照做的提示，而不是原始 404。
         let next = super::queue_account_lookup();
-        super::finish_account_lookup(next, Err("接口不存在。".into()));
+        super::finish_account_lookup(next, Err("账号服务暂时不可用".into()));
         super::STATE.with(|state| {
             let s = state.borrow();
             assert!(!s.verifying);
-            assert!(s.message.contains("改用订单号激活"), "{}", s.message);
+            assert_eq!(s.message, "账号服务暂时不可用");
         });
     }
 
@@ -2640,16 +2611,7 @@ mod tests {
 
     #[test]
     fn service_probe_distinguishes_readiness_from_a_valid_http_response() {
-        let ready = super::parse_service_config(
-            200,
-            br#"{"verificationEnabled":true,"accountActivation":true}"#,
-        )
-        .unwrap();
-        assert!(ready.verification_enabled);
-        assert!(ready.account_activation, "账号激活能力由服务端下发");
-        // 老 Worker 没有这个字段：按不可用处理，界面就不显示账号按钮。
-        let legacy = super::parse_service_config(200, br#"{"verificationEnabled":true}"#).unwrap();
-        assert!(!legacy.account_activation);
+        super::parse_service_config(200, br#"{"verificationEnabled":true}"#).unwrap();
         assert!(super::parse_service_config(200, br#"{"verificationEnabled":false}"#).is_err());
         assert!(super::parse_service_config(200, br#"{}"#).is_err());
         assert!(super::parse_service_config(200, b"<html>maintenance</html>").is_err());
@@ -2696,7 +2658,7 @@ mod tests {
         assert!(super::STATE.with(|state| state.borrow().service_reason_visible));
         assert!(!super::update_service(Err("爱发电服务暂时不可用".into())));
         assert!(super::STATE.with(|state| state.borrow().service_reason_visible));
-        super::update_service(Ok(None));
+        super::update_service(Ok(()));
         super::STATE.with(|state| {
             let s = state.borrow();
             assert_eq!(s.service_status, super::ServiceStatus::Healthy);
@@ -2797,7 +2759,7 @@ mod tests {
             assert!(!s.service_reason_visible);
             assert_eq!(s.service_reason, "network again");
         });
-        super::update_service(Ok(None));
+        super::update_service(Ok(()));
         super::STATE.with(|state| {
             let s = state.borrow();
             assert!(!s.service_reason_visible);

@@ -538,9 +538,6 @@ export function createWorker(
           }),
         ),
         verificationEnabled,
-        // 插件据此决定要不要显示「用 AstroBox 账号激活」：没部署这两个接口时
-        // 隐藏按钮，用户不会点到一个必然 404 的功能。
-        accountActivation: true,
         pluginName: PLUGIN_NAME,
         publicOrigin: env.PUBLIC_ORIGIN,
         turnstileSiteKey:
