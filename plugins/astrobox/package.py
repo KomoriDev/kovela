@@ -9,6 +9,10 @@ dist = root / "dist"
 target = root / "target" / "wasm32-wasip2" / "release" / "kovela_astrobox.wasm"
 base = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
 
+# manifest.json 是主版本（Level 4 / WASI 3，AstroBox 2.2+）。下面这些权限只有
+# Level 4 认识，兼容构建必须去掉，否则旧宿主会因未知权限拒绝安装。
+LEVEL4_PERMISSIONS = ("notification", "account.profile", "os.device-id")
+
 
 def build(features):
     command = ["cargo", "build", "--release", "--target", "wasm32-wasip2", "--locked"]
@@ -49,20 +53,27 @@ for legacy in (
 ):
     (dist / legacy).unlink(missing_ok=True)
 
+# 兼容构建：Level 2/3 宿主（WASI 2 / api_level 3）仍能安装，但没有账号与设备
+# 通知能力。上架入口只列主版本，这份留给用户本地导入。
 build("")
 pack(
     "kovela",
     "Kovela.abp",
-    base,
+    {
+        **base,
+        "wasi_version": 2,
+        "api_level": 3,
+        "permissions": [
+            permission
+            for permission in base["permissions"]
+            if permission not in LEVEL4_PERMISSIONS
+        ],
+    },
 )
+# 主版本：Level 4（WASI 3 / api_level 4），账号资料、设备通知与实时活动都在这里。
 build("api4")
 pack(
     "kovela-v4",
     "Kovela-v4.abp",
-    {
-        **base,
-        "wasi_version": 3,
-        "api_level": 4,
-        "permissions": [*base["permissions"], "notification"],
-    },
+    base,
 )

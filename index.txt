@@ -1,1 +1,4 @@
-plugins/astrobox/dist/kovela
+plugins/astrobox/dist/kovela-v4
+# 兼容构建（AstroBox < 2.2 / WASI 2 / api_level 3）：不上架，产物目录里仍有
+# Kovela.abp 供本地导入。
+# plugins/astrobox/dist/kovela

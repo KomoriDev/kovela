@@ -77,6 +77,15 @@ pnpm --filter @kovela/worker deploy
 
 右上角服务状态徽标在首次打开时通过 `/api/config` 检查服务连通性与配置，每分钟复查；订单查询和激活期间暂缓探测。网络失败、服务端错误或服务配置未就绪时显示红色「服务异常」，点击可展开/收起原因，恢复后自动清除。业务请求的网络和 5xx 错误也会同步到徽标；订单号错误、设备通信错误不作为服务异常。此探测不主动请求爱发电，爱发电运行故障由实际订单请求反映。切到离线激活后不再探测，也不调用订单、签发或回执 API。
 
+### 构建与上架：Level 4 是主版本
+
+`plugins/astrobox/manifest.json` 是 Level 4 基准（`wasi_version: 3`、`api_level: 4`，权限含 `notification`、`account.profile`、`os.device-id`）。`pnpm build:plugin` 会额外派生一份 Level 2/3 兼容构建，把只有 Level 4 认识的权限去掉后打包；上架入口（仓库根目录 `index.txt`）只列 Level 4 那一份 `plugins/astrobox/dist/kovela-v4`，兼容构建仍产出 `Kovela.abp` 供旧宿主本地导入。
+
+账号资料与设备通知都是 Level 4 才有的宿主能力：
+
+- 主界面第一步可以直接点「用 AstroBox 账号激活」：插件读宿主已登录账号里已确认的爱发电绑定（`account.get-current`），把账号 ID 交给服务端查购买状态，用户不必去翻订单号。宿主安装标识（`os.device-id`，形如 `ab-install-…`，不是硬件序列号、清除应用数据后会变）随请求一起发给服务端，只用于限流。
+- 激活过程用一条实时活动（通知 id 1）在手环上显示四段进度：按相位 `send` 更新（同一 id、`updatable`、递增 `sequence`），失败时改成失败文案，完成后发一条普通通知（id 2）并 `remove` 撤回实时活动。设备不支持小米通知协议、用户没给 `notification` 权限、传输失败、甚至实时活动本身不显示，都不影响激活。`focus` 的 `style` 是协议原值，官方文档要求「使用目标设备已经确认支持的取值」，常量集中在 `plugins/astrobox/src/notify.rs` 的 `FOCUS_STYLE`，真机确认后改这一行。
+
 本地打包需要 Rust stable 和 `wasm32-wasip2` 目标：
 
 ```bash
@@ -88,8 +97,8 @@ pnpm build:plugin
 
 | 路径 | 用途 |
 | --- | --- |
-| `plugins/astrobox/dist/kovela/` | **上架用**：AstroBox 2.0.0+（wasi 2 / api_level 3），含 `manifest.json`、`kovela_astrobox.wasm`、`icon.png`、`Kovela.abp` |
-| `plugins/astrobox/dist/kovela-v4/` | AstroBox 2.2.0+（wasi 3 / api_level 4），2.2.0 未发布前不上架 |
+| `plugins/astrobox/dist/kovela-v4/` | **上架用**：AstroBox 2.2.0+（wasi 3 / api_level 4），含 `manifest.json`、`kovela_astrobox.wasm`、`icon.png`、`Kovela-v4.abp` |
+| `plugins/astrobox/dist/kovela/` | 兼容构建：AstroBox 2.0.0+（wasi 2 / api_level 3），没有账号资料与设备通知能力，产物里仍有 `Kovela.abp` 供旧宿主本地导入 |
 
 每个目录里的 `.abp` 是给用户本地导入的完整包（不在 `additional_files` 里，商店不会下载它）；其余 `.abp` 仍被 `.gitignore` 排除。
 
@@ -99,9 +108,9 @@ pnpm build:plugin
 
 聚合脚本（[`AstroBox-NG-Plugin-Repo`](https://github.com/AstralSightStudios/AstroBox-NG-Plugin-Repo) 的 `generate-index`）每 4 小时按**匿名 raw URL** 抓一次产物，因此仓库必须是公开的，且产物必须提交进 Git：
 
-- 仓库根目录的 [`index.txt`](index.txt) 列出存放 `manifest.json` 的文件夹（当前是 `plugins/astrobox/dist/kovela`）；空行和 `#` 行会被忽略，所以 v4 那行先注释着，2.2.0 发布后再放开。
+- 仓库根目录的 [`index.txt`](index.txt) 列出存放 `manifest.json` 的文件夹（当前只列主版本 `plugins/astrobox/dist/kovela-v4`）；空行和 `#` 行会被忽略，兼容构建那一行注释着，需要旧宿主重新上架时再放开。
 - 上架入口写在上游仓库的 `index.txt` 里：`https://raw.githubusercontent.com/KomoriDev/kovela/refs/heads/main/`。
-- 发版本时只改 `plugins/astrobox/manifest.json` 的 `version`（api4 那份由 `package.py` 覆盖 `wasi_version`/`api_level`），推上去等 Action 生效即可。
+- 发版本时只改 `plugins/astrobox/manifest.json` 的 `version`（Level 4 那份直接用它，兼容构建由 `package.py` 降级派生 `wasi_version`/`api_level` 并去掉 Level 4 权限），推上去等 Action 生效即可。
 
 ### 合成大西瓜自定义权益
 
@@ -157,6 +166,12 @@ V4 `account.get-current` 提供实时绑定资料，不提供可供后端验证�
 服务端仍用 `LICENSE_SIGNING_SEED` 签发带 Ed25519 签名的令牌，`pnpm license:issue`、Worker 测试与 `packages/license` 的 `verifyLicense` 继续做完整校验。因此**恢复验签只需两步**：把 `packages/vela/src/index.js` 里的 `decodeLicense` 换回 `verifyLicense`（并把公钥参数接回 `scripts/prepare-vela.mjs` 与 `createActivation`），然后重新发布手环应用；不需要轮换密钥或更换令牌格式。想在设备上重新加一道门槛，可先确认 `@system.crypto` 的 RSA-SHA256 验签在本机型可用（原生秒级），再决定是否改用该原语。
 
 手环侧改动只需改 `packages/vela/src/index.js`，运行 `pnpm prepare:vela` 会重新生成 `../billiard`、`../tank-turmoil` 的 `src/activation/index.js`。`packages/vela/src/public-key.js` 已不再进入手环产物，只服务于 `pnpm license:issue` 的自检与将来恢复验签。
+
+### 账号维度激活
+
+Level 4 插件另有两条接口：`POST /api/account/products` 用宿主确认的 `afdianUserId` 列出该账号已完成的商品与绑定状态，`POST /api/account/activate` 用同一账号加设备码签发许可证。两者都不返回订单详情，服务端每次重新用爱发电现场复核付款状态与商品匹配，签发后回执、状态查询与私信通知都沿用在线激活那条路径（`sessions` 记录把这次核对标成 `verified_at`）。同一订单仍然只绑定第一台设备，所以账号买过多份时可以继续用下一份订单。
+
+信任边界要说清楚：`afdianUserId` 由插件提供，和 `/api/watermelon/entitlement` 一样，这不是对任意 HTTP 调用者的身份认证——知道某个买家的爱发电用户 ID，就能用该账号尚未绑定的订单激活一台设备。接口为此按 IP、按账号、按宿主安装标识限流，并把绑定限制在每订单一台；要彻底关掉这条路，删掉这两条接口与插件里的「用 AstroBox 账号激活」按钮即可。
 
 ## 检查
 

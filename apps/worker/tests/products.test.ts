@@ -698,6 +698,99 @@ test("offline CLI exports a verified file and refuses to overwrite or leave a fa
   await assert.rejects(readFile(failedFile), { code: "ENOENT" });
 });
 
+test("account activation issues a bound license from a live Afdian check and reuses the receipt flow", async (t) => {
+  const { db, env, worker, post, ok, messages } = await fixture(t);
+  env.PUBLIC_ORIGIN = origin;
+  env.DEV_MODE = "false";
+  await migrateAll(db);
+  // 订单先入库（正常路径是 webhook）；账号维度只认库里已有的候选订单。
+  await ok("/api/webhooks/afdian?token=" + env.WEBHOOK_TOKEN, {
+    ec: 200,
+    data: {
+      type: "order",
+      order: orders[orderNo],
+      sign: sign(
+        "sha256",
+        Buffer.from(orderNo + buyer + plan + orders[orderNo].total_amount),
+        providerKey.privateKey,
+      ).toString("base64"),
+    },
+  });
+  const deviceId = "a".repeat(64);
+  const hostId = "ab-install-" + "1".repeat(32);
+
+  const listed = await ok("/api/account/products", { afdianUserId: buyer, hostId });
+  assert.deepEqual(listed, {
+    afdianUserId: buyer,
+    items: [
+      {
+        productId: products[0].productId,
+        productName: products[0].productName,
+        boundDeviceId: null,
+      },
+    ],
+  });
+  // 别的账号什么都没有；这条路径不返回订单详情。
+  assert.deepEqual(
+    (await ok("/api/account/products", { afdianUserId: "e".repeat(32) })).items,
+    [],
+  );
+
+  const requestId = "account-activate-request-01";
+  const issued = await ok("/api/account/activate", {
+    afdianUserId: buyer,
+    productId: products[0].productId,
+    deviceId,
+    requestId,
+    hostId,
+  });
+  assert.equal(issued.deviceId, deviceId);
+  assert.equal(issued.productId, products[0].productId);
+  assert.equal(
+    verifyLicense(issued.licenseToken, publicKey, products[0].productId, deviceId)?.licenseId,
+    issued.licenseId,
+  );
+  // 同设备重发返回原许可证；换设备则拒绝——同一订单只绑定第一台设备。
+  const repeated = await ok("/api/account/activate", {
+    afdianUserId: buyer,
+    productId: products[0].productId,
+    deviceId,
+    requestId,
+  });
+  assert.equal(repeated.licenseToken, issued.licenseToken);
+  assert.equal(
+    (
+      await post("/api/account/activate", {
+        afdianUserId: buyer,
+        productId: products[0].productId,
+        deviceId: "f".repeat(64),
+        requestId: "account-activate-request-02",
+      })
+    ).status,
+    404,
+  );
+  // 回执、状态查询与私信通知沿用在线激活那条路径。
+  assert.equal(
+    (
+      await ok("/api/activation/report", {
+        receiptToken: issued.receiptToken,
+        requestId,
+        deviceId,
+        licenseId: issued.licenseId,
+        result: "activated",
+      })
+    ).notification,
+    "sent",
+  );
+  assert.equal(messages.length, 2, "购买引导与激活通知各一条");
+  assert.equal(
+    (
+      await ok("/api/account/products", { afdianUserId: buyer })
+    ).items[0].boundDeviceId,
+    deviceId,
+  );
+});
+
 test("admin signing authenticates before orders and shares online device bindings", async (t) => {
   let queries = 0;
   const { db, env, worker, ok } = await fixture(t, (number) => { queries += 1; return orders[number]; });

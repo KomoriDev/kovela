@@ -7,7 +7,7 @@ wit_bindgen::generate!({
 
 #[cfg(feature = "api4")]
 use astrobox::psys_host_v4::{
-    clipboard, device, dialog, interconnect, notification, register, thirdpartyapp, timer, ui,
+    clipboard, device, dialog, interconnect, register, thirdpartyapp, timer, ui,
 };
 #[cfg(feature = "api4")]
 use exports::astrobox::psys_plugin_v4::{
@@ -33,14 +33,23 @@ use uuid::Uuid;
 mod theme;
 mod icons;
 mod offline;
+mod identity;
+mod notify;
 #[cfg(not(feature = "api4"))]
 mod file_picker;
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// 取许可证走哪条路：订单号查询得到的 handoff 凭证，或 AstroBox 账号里绑定的
+/// 爱发电账号。两条路只在「签发」那一次请求上分叉，写入设备与回执完全一样。
+#[derive(Clone)]
+enum Route {
+    Order { handoff_token: String },
+    Account { afdian_user_id: String },
+}
+
+#[derive(Clone)]
 struct Handoff {
     server_origin: String,
-    handoff_token: String,
+    route: Route,
     product_id: String,
     product_name: String,
 }
@@ -90,7 +99,7 @@ struct Pending {
 struct Offer {
     product_id: String,
     product_name: String,
-    handoff_token: String,
+    route: Route,
     bound_device_id: Option<String>,
 }
 
@@ -130,6 +139,16 @@ struct State {
     // 点击「激活」后、定时事件真正开跑之前的窗口：这期间必须算忙，
     // 否则两次快点击会起两条握手与两条 tick 链，互相把重试次数耗掉。
     activation_queued: bool,
+    /// 服务端是否已提供账号维度接口（由 /api/config 探测得到）。
+    account_activation: bool,
+    /// 账号查询代次：超时或重试后，迟到的旧结果直接丢弃。
+    account_gen: u32,
+    /// 宿主安装标识读一次就够（它属于同一份安装），避免每次重试都再要一次权限。
+    host_id: Option<String>,
+    // 实时活动的序号与当前分段：同一 id 反复更新时 sequence 必须递增，
+    // 失败提示要停在失败的那一步（见 live_step / live_note）。
+    notify_seq: u32,
+    notify_step: usize,
     service_status: ServiceStatus,
     service_reason: String,
     service_check_started: bool,
@@ -158,6 +177,12 @@ const SERVICE_CHECK_DELAY_MS: u64 = 60_000;
 /// 画面一到数秒，用户以为卡住了。先渲染进行中的状态，动作交给定时事件。
 const LOOKUP_PAYLOAD: &str = "lookup";
 const ACTIVATE_PAYLOAD: &str = "activate";
+/// 按账号查询的延迟启动载荷：读取宿主账号资料要弹授权、单项最多等 10 秒。
+const ACCOUNT_PAYLOAD: &str = "account";
+/// 账号查询的超时兜底载荷。宿主的绑定查询卡住时，界面不能永远锁在读取中。
+const ACCOUNT_TIMEOUT_PAYLOAD: &str = "account-timeout";
+/// 账号查询的等待上限：官方口径单项最多 10 秒，留出三倍余量给三个绑定项。
+const ACCOUNT_TIMEOUT_MS: u64 = 20_000;
 #[cfg(not(feature = "api4"))]
 const OFFLINE_FILE_PAYLOAD: &str = "offline-file";
 
@@ -660,13 +685,53 @@ fn parse_offers(value: &Value) -> Result<Vec<Offer>, String> {
         offers.push(Offer {
             product_id: product_id.to_string(),
             product_name: name.unwrap(),
-            handoff_token: token.to_string(),
+            route: Route::Order { handoff_token: token.to_string() },
             bound_device_id: item
                 .get("boundDeviceId")
                 .and_then(Value::as_str)
                 .filter(|id| is_hex(id))
                 .map(str::to_string),
         });
+    }
+    Ok(offers)
+}
+
+/// 账号维度查到的可激活商品：与订单查询结果同构，凭证换成已确认的爱发电账号。
+/// 回执里的账号 ID 必须与请求一致，否则拿到的可能是别人的权益。
+fn parse_account_products(value: &Value, afdian_user_id: &str) -> Result<Vec<Offer>, String> {
+    if value.get("afdianUserId").and_then(Value::as_str) != Some(afdian_user_id) {
+        return Err("账号查询结果不匹配，请重试".into());
+    }
+    let Some(items) = value.get("items").and_then(Value::as_array) else {
+        return Err("账号查询结果异常，请重试".into());
+    };
+    if items.is_empty() || items.len() > 8 {
+        return Err("该爱发电账号没有可激活的应用，请核对购买记录或改用订单号激活".into());
+    }
+    let mut offers: Vec<Offer> = Vec::new();
+    for item in items {
+        let product_id = item.get("productId").and_then(Value::as_str).unwrap_or("");
+        let product_name = item.get("productName").and_then(Value::as_str).unwrap_or("");
+        let name = usable_label(product_name);
+        if !valid_product_id(product_id) || name.is_none() {
+            return Err("账号查询结果不匹配，请重试".into());
+        }
+        if offers.iter().any(|offer| offer.product_id == product_id) {
+            continue;
+        }
+        offers.push(Offer {
+            product_id: product_id.to_string(),
+            product_name: name.unwrap(),
+            route: Route::Account { afdian_user_id: afdian_user_id.to_string() },
+            bound_device_id: item
+                .get("boundDeviceId")
+                .and_then(Value::as_str)
+                .filter(|id| is_hex(id))
+                .map(str::to_string),
+        });
+    }
+    if offers.is_empty() {
+        return Err("该爱发电账号没有可激活的应用，请核对购买记录或改用订单号激活".into());
     }
     Ok(offers)
 }
@@ -784,6 +849,7 @@ fn render() {
         service_status,
         service_reason,
         service_reason_visible,
+        account_activation,
     ) = STATE.with(|state| {
         let s = state.borrow();
         (
@@ -801,6 +867,7 @@ fn render() {
             s.service_status,
             s.service_reason.clone(),
             s.service_reason_visible,
+            s.account_activation,
         )
     });
     let Some(root) = root else { return };
@@ -865,6 +932,14 @@ fn render() {
                     ui_locked,
                 ))
                 .child(verify);
+            // Level 4 宿主才有账号接口，而且服务端要已部署这套接口：
+            // 条件不满足就不显示，免得点了只拿到「接口不存在」。
+            if identity::SUPPORTED && account_activation {
+                page = page.child(gate(
+                    theme::outlined_button("用 AstroBox 账号激活", "account"),
+                    ui_locked,
+                ));
+            }
         }
         _ => {
             if !message.is_empty() {
@@ -1042,7 +1117,7 @@ fn post<T: serde::de::DeserializeOwned>(
         .and_then(|bytes| parse_response(status, &bytes));
     match &result {
         Ok(_) => {
-            update_service(Ok(()));
+            update_service(Ok(None));
         }
         Err(reason) if status >= 500 || (200..300).contains(&status) => {
             update_service(Err(reason.clone()));
@@ -1070,13 +1145,17 @@ fn parse_response<T: serde::de::DeserializeOwned>(status: u16, bytes: &[u8]) -> 
     serde_json::from_slice(bytes).map_err(|_| "服务器响应无法识别".into())
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServiceConfig {
     verification_enabled: bool,
+    /// 服务端是否已提供账号维度激活接口。老 Worker 没有这个字段（按 false 处理），
+    /// 插件据此隐藏「用 AstroBox 账号激活」，避免点了只拿到「接口不存在」。
+    #[serde(default)]
+    account_activation: bool,
 }
 
-fn check_service() -> Result<(), String> {
+fn check_service() -> Result<ServiceConfig, String> {
     let response = waki::Client::new()
         .get(&format!("{}/api/config", server_origin()))
         .connect_timeout(Duration::from_secs(8))
@@ -1087,20 +1166,28 @@ fn check_service() -> Result<(), String> {
     parse_service_config(status, &bytes)
 }
 
-fn parse_service_config(status: u16, bytes: &[u8]) -> Result<(), String> {
+fn parse_service_config(status: u16, bytes: &[u8]) -> Result<ServiceConfig, String> {
     let config: ServiceConfig = parse_response(status, bytes)?;
     if !config.verification_enabled {
         return Err("购买验证尚未开放，请等待服务配置完成".into());
     }
-    Ok(())
+    Ok(config)
 }
 
-fn update_service(result: Result<(), String>) -> bool {
+/// `Ok(None)` 表示结果来自业务请求（成功但没带回配置），只刷新健康状态；只有
+/// 服务探测会带回配置，并可能改变「账号激活是否可用」这类能力标志。
+fn update_service(result: Result<Option<ServiceConfig>, String>) -> bool {
     STATE.with(|state| {
         let mut s = state.borrow_mut();
         match result {
-            Ok(()) => {
-                let changed = s.service_status != ServiceStatus::Healthy;
+            Ok(config) => {
+                let mut changed = s.service_status != ServiceStatus::Healthy;
+                if let Some(config) = config {
+                    if s.account_activation != config.account_activation {
+                        s.account_activation = config.account_activation;
+                        changed = true;
+                    }
+                }
                 s.service_status = ServiceStatus::Healthy;
                 s.service_reason.clear();
                 s.service_reason_visible = false;
@@ -1152,7 +1239,7 @@ fn status_shortcut(now: Instant) -> bool {
 }
 
 async fn probe_service() {
-    if should_probe_service() && update_service(check_service()) {
+    if should_probe_service() && update_service(check_service().map(Some)) {
         render();
     }
     host_timeout(SERVICE_CHECK_DELAY_MS, SERVICE_CHECK_PAYLOAD).await;
@@ -1191,7 +1278,7 @@ fn confirm_offer(index: usize) {
         Some(id) => format!(
             "已确认 {}，已绑定 {}，仅可在该设备上重新传输",
             offer.product_name,
-            &id[..12]
+            short_device_id(id)
         ),
         None => format!("已确认 {}，请选择手环后激活", offer.product_name),
     };
@@ -1200,7 +1287,7 @@ fn confirm_offer(index: usize) {
         s.pending = None;
         s.handoff = Some(Handoff {
             server_origin: server_origin().into(),
-            handoff_token: offer.handoff_token,
+            route: offer.route,
             product_id: offer.product_id,
             product_name: offer.product_name,
         });
@@ -1287,6 +1374,179 @@ fn finish_lookup() {
     }
 }
 
+// 按账号激活：读宿主账号里已确认的爱发电绑定，再让服务端算出这个账号买了
+// 哪些应用。购买判定只在服务端做，插件不解释权益、也不缓存绑定结论。
+//
+// 这一步要弹授权，而且宿主每次都会向服务器实时查询绑定（官方口径：单项最多
+// 等 10 秒），所以它必须带代次与超时：宿主卡住时界面不能永远锁在「正在读取
+// AstroBox 账号」。
+fn queue_account_lookup() -> u32 {
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.account_gen = s.account_gen.wrapping_add(1);
+        s.verifying = true;
+        s.message = "正在读取 AstroBox 账号…（首次会请求授权）".into();
+        s.account_gen
+    })
+}
+
+/// 账号查询超时收场：只有仍在进行的那一代才解锁，迟到的结果由代次挡掉。
+fn account_lookup_timed_out(generation: u32) -> bool {
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        if !s.verifying || s.account_gen != generation {
+            return false;
+        }
+        s.verifying = false;
+        true
+    })
+}
+
+/// 宿主安装标识：读一次缓存一次（同一份安装内不会变），失败不缓存、下次再试。
+async fn host_install_id() -> Option<String> {
+    if let Some(cached) = STATE.with(|state| state.borrow().host_id.clone()) {
+        return Some(cached);
+    }
+    let value = identity::host_device_id().await;
+    if let Some(id) = value.as_ref() {
+        STATE.with(|state| state.borrow_mut().host_id = Some(id.clone()));
+    }
+    value
+}
+
+async fn account_lookup(generation: u32) {
+    let result = match identity::afdian_user_id().await {
+        Ok(id) => {
+            // 宿主安装标识只用于服务端限流，不参与权益判定；两处账号请求都带上。
+            let mut body = json!({"afdianUserId": id});
+            if let Some(host) = host_install_id().await {
+                body["hostId"] = Value::String(host);
+            }
+            post::<Value>(server_origin(), "/api/account/products", body)
+                .and_then(|value| parse_account_products(&value, &id))
+        }
+        Err(error) => Err(error),
+    };
+    finish_account_lookup(generation, result);
+}
+
+fn finish_account_lookup(generation: u32, result: Result<Vec<Offer>, String>) {
+    let current = STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        if !s.verifying || s.account_gen != generation {
+            // 已经被超时或新的尝试取代：丢掉这次结果，不覆盖界面。
+            return false;
+        }
+        s.verifying = false;
+        true
+    });
+    if !current {
+        return;
+    }
+    match result {
+        Ok(mut offers) => {
+            // 西瓜自定义是插件内权益，手环许可证那条路不处理它。
+            offers.retain(|offer| offer.product_id != "com.komoridev.watermelon");
+            if offers.is_empty() {
+                show("这个爱发电账号没有可激活的应用，请核对购买记录或改用订单号激活");
+                return;
+            }
+            let single = offers.len() == 1;
+            STATE.with(|state| {
+                let mut s = state.borrow_mut();
+                s.pending = None;
+                s.handoff = None;
+                s.offers = offers;
+                s.message = if single {
+                    String::new()
+                } else {
+                    "这个爱发电账号有多个应用，请选择要激活的那个".into()
+                };
+            });
+            if single {
+                confirm_offer(0);
+            } else {
+                render();
+            }
+        }
+        Err(error) => {
+            // 服务端还没有这套接口时不要把原始 404 抛给用户看。
+            let error = if error.contains("接口不存在") {
+                "账号激活暂不可用（服务端尚未更新），请稍后重试或改用订单号激活".into()
+            } else {
+                error
+            };
+            show(error);
+        }
+    }
+}
+
+/// 实时活动的 `sequence` 必须在同一通知 id 上递增。插件重载会重置 State，
+/// 所以用墙上时钟的秒数起头：重载后不会从 0 重来，避免设备把更新当成过期。
+fn seed_notify_seq() {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as u32)
+        .unwrap_or(0);
+    STATE.with(|state| state.borrow_mut().notify_seq = seconds);
+}
+
+/// 当前流程的产品名：在线取订单/账号确认的商品，离线取离线目录，兜底「应用」。
+fn product_label() -> String {
+    STATE.with(|state| {
+        let s = state.borrow();
+        s.handoff
+            .as_ref()
+            .map(|handoff| handoff.product_name.clone())
+            .or_else(|| {
+                let local = s.offline.as_ref()?;
+                offline::product_name(&local.product_id).map(str::to_string)
+            })
+            .unwrap_or_else(|| "应用".into())
+    })
+}
+
+/// 阶段推进时同步一次实时活动：同一通知 id 反复更新，`sequence` 递增。
+/// 通知是尽力而为，失败只影响这一条，不影响激活；缺 pending 就跳过。
+async fn live_step(id: &str, step: usize, note: &str) {
+    let target = STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        if !s.pending.as_ref().is_some_and(|p| p.id == id) {
+            return None;
+        }
+        let addr = s.pending.as_ref().map(|p| p.addr.clone())?;
+        s.notify_seq = s.notify_seq.wrapping_add(1);
+        s.notify_step = step;
+        Some((addr, s.notify_seq))
+    });
+    if let Some((addr, sequence)) = target {
+        notify::live(&addr, &product_label(), step, note, sequence).await;
+    }
+}
+
+/// 失败提示：分段停在失败的那一步，只换说明文字。
+async fn live_note(id: &str, note: &str) {
+    let step = STATE.with(|state| state.borrow().notify_step);
+    live_step(id, step, note).await;
+}
+
+/// 失败：先按原样上屏（相位转重试），再把手环上的实时活动改成同一句话。
+async fn fail_live(id: &str, message: impl Into<String>) {
+    let message = message.into();
+    fail(message.clone());
+    live_note(id, &message).await;
+}
+
+/// 放弃激活（重新输入订单、切换到离线）时撤回实时活动。
+async fn live_clear_any() {
+    let addr = STATE.with(|state| {
+        state.borrow().pending.as_ref().map(|pending| pending.addr.clone())
+    });
+    if let Some(addr) = addr {
+        notify::clear(&addr).await;
+    }
+}
+
 async fn send_install(pending: Pending) {
     let Some(issued) = pending.issued.as_ref() else {
         return;
@@ -1299,12 +1559,13 @@ async fn send_install(pending: Pending) {
         return;
     }
     render();
+    live_step(&pending.id, 2, "许可证已签发，正在写入手环…").await;
     let data=json!({"v":1,"id":pending.id,"type":"install-license","licenseId":issued.license_id,"licenseToken":issued.license_token}).to_string();
     if host_send(&pending.addr, &issued.product_id, &data)
         .await
         .is_err()
     {
-        fail("传输失败，请打开手环应用并保持连接后重试");
+        fail_live(&pending.id, "传输失败，请打开手环应用并保持连接后重试").await;
         return;
     }
     // 宿主对快应用回包的路由可能只认最近一次注册（Daymatter 每次发送前都
@@ -1382,15 +1643,17 @@ async fn start_activation() {
         return;
     };
     render();
+    // 手环与手机上都先亮出「连接设备」，用户在插件里点完激活就能看到进度。
+    live_step(&id, 0, "正在连接手环，请保持 AstroBox 连接").await;
     if let Err(error) = open_app(&addr, &product_id).await {
-        fail(error);
+        fail_live(&id, error).await;
         return;
     }
     if host_register_recv(&addr, &product_id)
         .await
         .is_err()
     {
-        fail("无法接收设备消息，请授予权限后重试");
+        fail_live(&id, "无法接收设备消息，请授予权限后重试").await;
         return;
     }
     let message = json!({"v":1,"id":id,"type":"hello"}).to_string();
@@ -1398,33 +1661,10 @@ async fn start_activation() {
         .await
         .is_err()
     {
-        fail(format!(
-            "无法连接{}，请在手环上打开应用",
-            product_name
-        ));
+        fail_live(&id, format!("无法连接{}，请在手环上打开应用", product_name)).await;
         return;
     }
     host_timeout(2_000, &format!("tick:{id}")).await;
-}
-
-async fn notify_activated(addr: String, product: String) {
-    #[cfg(not(feature = "api4"))]
-    {
-        let _ = (addr, product);
-    }
-    #[cfg(feature = "api4")]
-    {
-        let message = notification::Message {
-            id: 1,
-            app_name: "Kovela".into(),
-            title: format!("{product}已激活"),
-            sub_title: String::new(),
-            body: "许可证已保存在手环上，可离线使用".into(),
-            timestamp_ms: None,
-            live_activity: None,
-        };
-        let _ = notification::send(addr, message).await;
-    }
 }
 
 async fn report(pending: Pending) {
@@ -1433,14 +1673,18 @@ async fn report(pending: Pending) {
     };
     if pending.offline {
         if success {
+            // 离线流程没有服务端回执，但手环上的“已激活”通知与手机上撤回
+            // 实时活动一样成立。
+            let product = product_label();
+            notify::activated(&pending.addr, &product).await;
             complete_offline(&pending.id);
         } else {
-            fail("许可证未能写入，请查看手环提示后重试");
+            fail_live(&pending.id, "许可证未能写入，请查看手环提示后重试").await;
         }
         return;
     }
     let Some(receipt_token) = issued.receipt_token.as_deref() else {
-        fail("激活回执凭证缺失，请重新查询订单");
+        fail_live(&pending.id, "激活回执凭证缺失，请重新查询订单").await;
         return;
     };
     if !set_phase(
@@ -1455,16 +1699,20 @@ async fn report(pending: Pending) {
         return;
     }
     render();
+    live_step(
+        &pending.id,
+        3,
+        if success {
+            "手环已激活，正在同步结果…"
+        } else {
+            "激活未完成，正在记录结果…"
+        },
+    )
+    .await;
     if success {
-        let product = STATE.with(|state| {
-            state
-                .borrow()
-                .handoff
-                .as_ref()
-                .map(|handoff| handoff.product_name.clone())
-                .unwrap_or_else(|| "应用".into())
-        });
-        notify_activated(pending.addr.clone(), product).await;
+        // 结果通知只发一条，发完顺手撤回实时活动（同一个 id 会一直挂在岛上）。
+        let product = product_label();
+        notify::activated(&pending.addr, &product).await;
     }
     let origin = STATE.with(|state| {
         state
@@ -1520,11 +1768,15 @@ async fn report(pending: Pending) {
             });
             render();
         }
-        _ => fail(if success {
-            "设备已激活，但通知未能发送，请保持页面打开并重试，无需重新购买"
-        } else {
-            "激活未完成，结果尚未提交，请重试"
-        }),
+        _ => fail_live(
+            &pending.id,
+            if success {
+                "设备已激活，但通知未能发送，请保持页面打开并重试，无需重新购买"
+            } else {
+                "激活未完成，结果尚未提交，请重试"
+            },
+        )
+        .await,
     }
 }
 
@@ -1568,12 +1820,12 @@ async fn on_device_message(raw: &str) {
             .and_then(Value::as_str)
             .filter(|id| is_hex(id))
         else {
-            fail("设备未提供有效标识，请检查权限");
+            fail_live(&pending.id, "设备未提供有效标识，请检查权限").await;
             return;
         };
         let expected = STATE.with(|state| target(&state.borrow()).map(|item| item.0));
         if message["productId"].as_str() != expected.as_deref() {
-            fail("连接到的应用不匹配");
+            fail_live(&pending.id, "连接到的应用不匹配").await;
             return;
         }
         let handoff = STATE.with(|state| {
@@ -1597,7 +1849,7 @@ async fn on_device_message(raw: &str) {
             return;
         };
         if message["productId"] != handoff.product_id {
-            fail("连接到的应用不匹配");
+            fail_live(&pending.id, "连接到的应用不匹配").await;
             return;
         }
         set_phase(
@@ -1606,11 +1858,33 @@ async fn on_device_message(raw: &str) {
             "正在为该设备签发许可证…",
         );
         render();
-        match post::<Issued>(
-            &handoff.server_origin,
-            "/api/activate",
-            json!({"handoffToken":handoff.handoff_token,"productId":handoff.product_id,"deviceId":id,"requestId":pending.id}),
-        ) {
+        live_step(&pending.id, 1, "正在为该设备签发许可证…").await;
+        // 两条路只在这一次请求上分叉：订单走 handoff 凭证；账号走宿主已确认
+        // 的爱发电账号，服务端会现场复核付款状态后再签发。宿主安装标识只用于
+        // 让创作者把同一份 AstroBox 安装上的激活串起来，拿不到就不带。
+        let issuance = match &handoff.route {
+            Route::Order { handoff_token } => post::<Issued>(
+                &handoff.server_origin,
+                "/api/activate",
+                json!({"handoffToken":handoff_token,"productId":handoff.product_id,"deviceId":id,"requestId":pending.id}),
+            ),
+            Route::Account { afdian_user_id } => {
+                let mut body = json!({
+                    "afdianUserId": afdian_user_id,
+                    "productId": handoff.product_id,
+                    "deviceId": id,
+                    "requestId": pending.id,
+                });
+                if let Some(host) = identity::host_device_id().await {
+                    body["hostId"] = Value::String(host);
+                }
+                if let Some(model) = pending.device_model.clone() {
+                    body["deviceModel"] = Value::String(model);
+                }
+                post::<Issued>(&handoff.server_origin, "/api/account/activate", body)
+            }
+        };
+        match issuance {
             Ok(issued)
                 if issued.product_id == handoff.product_id
                     && issued.device_id == id
@@ -1632,8 +1906,8 @@ async fn on_device_message(raw: &str) {
                     send_install(p).await;
                 }
             }
-            Ok(_) => fail("许可证与所选设备不匹配"),
-            Err(error) => fail(error),
+            Ok(_) => fail_live(&pending.id, "许可证与所选设备不匹配").await,
+            Err(error) => fail_live(&pending.id, error).await,
         }
     } else if message["type"] == "activation-result"
         && matches!(pending.phase, Phase::Installing | Phase::Retry)
@@ -1706,6 +1980,21 @@ async fn dispatch_event(kind: EventType, payload: String) {
             } else if body == ACTIVATE_PAYLOAD {
                 STATE.with(|state| state.borrow_mut().activation_queued = false);
                 start_activation().await;
+            } else if let Some(generation) = body.strip_prefix("account-timeout:") {
+                // 宿主资料卡住：解锁界面并给出能照做的提示（超时不动已发出的请求）。
+                if generation
+                    .parse::<u32>()
+                    .is_ok_and(account_lookup_timed_out)
+                {
+                    show("读取 AstroBox 账号超时：请检查网络后重试，或改用订单号激活");
+                }
+            } else if let Some(generation) = body.strip_prefix("account:") {
+                if let Ok(generation) = generation.parse::<u32>() {
+                    account_lookup(generation).await;
+                    if STATE.with(|state| state.borrow().handoff.is_some()) {
+                        begin_scan().await;
+                    }
+                }
             } else if body == SERVICE_CHECK_PAYLOAD {
                 probe_service().await;
             } else if let Some(id) = body.strip_prefix("tick:") {
@@ -1719,7 +2008,7 @@ async fn dispatch_event(kind: EventType, payload: String) {
                     host_timeout(2_000, &format!("tick:{id}")).await;
                 }
                     Some(None) => {
-                        fail("连接超时，请在手环应用里点重试，或重新打开应用后再试")
+                        fail_live(id, "连接超时，请在手环应用里点重试，或重新打开应用后再试").await
                     }
                     None => {}
                 }
@@ -1749,7 +2038,11 @@ async fn dispatch_event(kind: EventType, payload: String) {
                     })
                 });
                 if waiting {
-                    fail("等待设备响应超时，请保持应用打开后重试，本次尚未激活成功");
+                    fail_live(
+                        body.strip_prefix("install:").unwrap_or_default(),
+                        "等待设备响应超时，请保持应用打开后重试，本次尚未激活成功",
+                    )
+                    .await;
                 }
             }
         }
@@ -1759,6 +2052,8 @@ async fn dispatch_event(kind: EventType, payload: String) {
 enum UiFollow {
     None,
     Lookup,
+    Account,
+    ClearLive,
     Refresh,
     Scan,
     Activate,
@@ -1894,8 +2189,10 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         }
     }
     if id == "cancel" {
+        let had_pending = STATE.with(|state| state.borrow().pending.is_some());
         reset_order();
-        return UiFollow::None;
+        // 激活中途放弃：把手环上的实时活动一并撤回，别让进度留在屏幕上。
+        return if had_pending { UiFollow::ClearLive } else { UiFollow::None };
     }
     remember_order(payload);
     let first_step = STATE.with(|state| {
@@ -1906,6 +2203,7 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         || id == "cancel"
         || id == "refresh"
         || id == "activate"
+        || id == "account"
         || id.starts_with("offer:");
     if id == "verify" || id == "查询订单" || (first_step && !known) {
         queue_lookup();
@@ -1917,6 +2215,13 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         } else {
             UiFollow::None
         };
+    }
+    if id == "account" {
+        // 与查询订单同一套：先渲染「正在读取 AstroBox 账号…」，读取动作
+        // 交给定时事件（要弹授权、单项最多等 10 秒）。
+        queue_account_lookup();
+        render();
+        return UiFollow::Account;
     }
     if id == "refresh" {
         return UiFollow::Refresh;
@@ -1964,7 +2269,9 @@ async fn bind_root(id: String) {
 #[cfg(feature = "api4")]
 impl lifecycle::Guest for Kovela {
     // 设备列表只在用户动作后读取，加载时不做任何宿主调用。
-    async fn on_load() {}
+    async fn on_load() {
+        seed_notify_seq();
+    }
 }
 #[cfg(feature = "api4")]
 impl event::Guest for Kovela {
@@ -1975,7 +2282,24 @@ impl event::Guest for Kovela {
     async fn on_ui_event(id: String, event: ui::Event, payload: String) -> String {
         match dispatch_ui(&id, event, &payload) {
             UiFollow::Lookup => host_timeout(1, LOOKUP_PAYLOAD).await,
-            UiFollow::Refresh => begin_scan().await,
+            UiFollow::Account => {
+                // 代次在点击时就已经发放（点击即锁界面），这里补排超时兜底：
+                // 宿主资料卡住时 20 秒后自动解锁并给出可操作的提示。
+                let generation = STATE.with(|state| state.borrow().account_gen);
+                render();
+                host_timeout(
+                    ACCOUNT_TIMEOUT_MS,
+                    &format!("{ACCOUNT_TIMEOUT_PAYLOAD}:{generation}"),
+                )
+                .await;
+                host_timeout(1, &format!("{ACCOUNT_PAYLOAD}:{generation}")).await;
+            }
+            UiFollow::ClearLive => live_clear_any().await,
+            UiFollow::Refresh => {
+                // 切离线、重新输入订单都会走到这里：顺手撤回实时活动。
+                live_clear_any().await;
+                begin_scan().await;
+            }
             UiFollow::Scan => load_devices().await,
             // 打开手环应用与握手都是主机调用（一到数秒），先让宿主画完
             // 「连接设备」再执行。
@@ -2010,7 +2334,9 @@ export!(Kovela);
 #[cfg(not(feature = "api4"))]
 impl lifecycle::Guest for Kovela {
     // 设备列表只在用户动作后读取，加载时不做任何宿主调用。
-    fn on_load() {}
+    fn on_load() {
+        seed_notify_seq();
+    }
 }
 #[cfg(not(feature = "api4"))]
 impl event_v3::Guest for Kovela {
@@ -2028,7 +2354,21 @@ impl event_v3::Guest for Kovela {
         astrobox_ng_wit::block_on(async move {
             match follow {
                 UiFollow::Lookup => host_timeout(1, LOOKUP_PAYLOAD).await,
-                UiFollow::Refresh => begin_scan().await,
+                UiFollow::Account => {
+                    let generation = STATE.with(|state| state.borrow().account_gen);
+                    render();
+                    host_timeout(
+                        ACCOUNT_TIMEOUT_MS,
+                        &format!("{ACCOUNT_TIMEOUT_PAYLOAD}:{generation}"),
+                    )
+                    .await;
+                    host_timeout(1, &format!("{ACCOUNT_PAYLOAD}:{generation}")).await;
+                }
+                UiFollow::ClearLive => live_clear_any().await,
+                UiFollow::Refresh => {
+                    live_clear_any().await;
+                    begin_scan().await;
+                }
                 UiFollow::Scan => load_devices().await,
                 UiFollow::Activate => host_timeout(1, ACTIVATE_PAYLOAD).await,
                 UiFollow::Probe => probe_service().await,
@@ -2158,7 +2498,7 @@ mod tests {
             let mut s = state.borrow_mut();
             s.handoff = Some(super::Handoff {
                 server_origin: "https://kovela.komoridevs.icu".into(),
-                handoff_token: "a".repeat(64),
+                route: super::Route::Order { handoff_token: "a".repeat(64) },
                 product_id: "com.komoridev.billiard".into(),
                 product_name: "口袋台球".into(),
             });
@@ -2225,7 +2565,7 @@ mod tests {
             *state.borrow_mut() = super::State {
                 handoff: Some(super::Handoff {
                     server_origin: "https://kovela.example.com".into(),
-                    handoff_token: "c".repeat(64),
+                    route: super::Route::Order { handoff_token: "c".repeat(64) },
                     product_id: "com.komoridev.billiard".into(),
                     product_name: "口袋台球".into(),
                 }),
@@ -2260,6 +2600,85 @@ mod tests {
         });
     }
 
+    #[test]
+    fn account_click_starts_the_account_route_not_an_order_lookup() {
+        super::STATE.with(|state| {
+            *state.borrow_mut() = super::State {
+                order_no: "202609131234567890123456789".into(),
+                ..Default::default()
+            };
+        });
+        // 「用 AstroBox 账号激活」不是回车查询：必须走账号路由。
+        let follow = super::dispatch_ui("account", super::ui::Event::Click, "");
+        assert!(matches!(follow, super::UiFollow::Account));
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            assert!(s.verifying);
+            assert_eq!(s.message, "正在读取 AstroBox 账号…（首次会请求授权）");
+        });
+    }
+
+    #[test]
+    fn account_lookup_timeout_unlocks_the_pending_attempt_and_drops_late_results() {
+        super::STATE.with(|state| *state.borrow_mut() = super::State::default());
+        let generation = super::queue_account_lookup();
+        assert!(super::STATE.with(|state| state.borrow().verifying));
+        // 上一代的超时不影响这次尝试。
+        assert!(!super::account_lookup_timed_out(generation.wrapping_sub(1)));
+        assert!(super::STATE.with(|state| state.borrow().verifying));
+        // 当前这一代超时：解锁，界面能再次操作。
+        assert!(super::account_lookup_timed_out(generation));
+        assert!(!super::STATE.with(|state| state.borrow().verifying));
+        // 超时之后迟到的结果直接丢掉，不覆盖界面。
+        super::finish_account_lookup(generation, Err("接口不存在。".into()));
+        assert_eq!(
+            super::STATE.with(|state| state.borrow().message.clone()),
+            "正在读取 AstroBox 账号…（首次会请求授权）"
+        );
+        // 服务端还没上这套接口时给能照做的提示，而不是原始 404。
+        let next = super::queue_account_lookup();
+        super::finish_account_lookup(next, Err("接口不存在。".into()));
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            assert!(!s.verifying);
+            assert!(s.message.contains("改用订单号激活"), "{}", s.message);
+        });
+    }
+
+    #[test]
+    fn account_lookup_requires_the_same_user_and_a_usable_product() {
+        let user = "a".repeat(32);
+        let value = json!({
+            "afdianUserId": user,
+            "items": [{"productId":"com.komoridev.billiard","productName":"口袋台球","boundDeviceId":null}]
+        });
+        let offers = super::parse_account_products(&value, &user).unwrap();
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].product_name, "口袋台球");
+        assert!(matches!(offers[0].route, super::Route::Account { .. }));
+        assert!(offers[0].bound_device_id.is_none());
+
+        // 回执里的账号必须是请求的那个，否则可能是别人的权益。
+        assert!(super::parse_account_products(&value, &"b".repeat(32)).is_err());
+        // 空列表、非法商品 ID、重复商品都按异常处理。
+        for items in [
+            json!([]),
+            json!([{"productId":"Bad","productName":"口袋台球"}]),
+            json!([{"productId":"com.komoridev.billiard","productName":""}]),
+        ] {
+            let value = json!({"afdianUserId": user, "items": items});
+            assert!(super::parse_account_products(&value, &user).is_err());
+        }
+        let duplicated = json!({
+            "afdianUserId": user,
+            "items": [
+                {"productId":"com.komoridev.billiard","productName":"口袋台球"},
+                {"productId":"com.komoridev.billiard","productName":"口袋台球"},
+            ]
+        });
+        assert_eq!(super::parse_account_products(&duplicated, &user).unwrap().len(), 1);
+    }
+
     fn pending_at(phase: super::Phase, ack: Option<bool>, reported: bool) -> super::Pending {
         super::Pending {
             id: "pending".into(),
@@ -2287,7 +2706,7 @@ mod tests {
         let bound = super::Offer {
             product_id: "com.komoridev.billiard".into(),
             product_name: "口袋台球".into(),
-            handoff_token: "token".into(),
+            route: super::Route::Order { handoff_token: "token".into() },
             bound_device_id: Some("0816d5a8023c11".into()),
         };
         let unbound = super::Offer {
@@ -2338,10 +2757,16 @@ mod tests {
 
     #[test]
     fn service_probe_distinguishes_readiness_from_a_valid_http_response() {
-        assert_eq!(
-            super::parse_service_config(200, br#"{"verificationEnabled":true}"#),
-            Ok(())
-        );
+        let ready = super::parse_service_config(
+            200,
+            br#"{"verificationEnabled":true,"accountActivation":true}"#,
+        )
+        .unwrap();
+        assert!(ready.verification_enabled);
+        assert!(ready.account_activation, "账号激活能力由服务端下发");
+        // 老 Worker 没有这个字段：按不可用处理，界面就不显示账号按钮。
+        let legacy = super::parse_service_config(200, br#"{"verificationEnabled":true}"#).unwrap();
+        assert!(!legacy.account_activation);
         assert!(super::parse_service_config(200, br#"{"verificationEnabled":false}"#).is_err());
         assert!(super::parse_service_config(200, br#"{}"#).is_err());
         assert!(super::parse_service_config(200, b"<html>maintenance</html>").is_err());
@@ -2354,12 +2779,12 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            super::parse_service_config(503, &body),
-            Err("商品目录配置不正确，请联系创作者。".into())
+            super::parse_service_config(503, &body).unwrap_err(),
+            "商品目录配置不正确，请联系创作者。".to_string()
         );
         assert_eq!(
-            super::parse_service_config(502, b"Bad Gateway"),
-            Err("服务返回异常（HTTP 502）".into())
+            super::parse_service_config(502, b"Bad Gateway").unwrap_err(),
+            "服务返回异常（HTTP 502）".to_string()
         );
         assert!(super::parse_service_config(200, &vec![b' '; 16_385]).is_err());
     }
@@ -2388,7 +2813,7 @@ mod tests {
         assert!(super::STATE.with(|state| state.borrow().service_reason_visible));
         assert!(!super::update_service(Err("爱发电服务暂时不可用".into())));
         assert!(super::STATE.with(|state| state.borrow().service_reason_visible));
-        super::update_service(Ok(()));
+        super::update_service(Ok(None));
         super::STATE.with(|state| {
             let s = state.borrow();
             assert_eq!(s.service_status, super::ServiceStatus::Healthy);
@@ -2489,7 +2914,7 @@ mod tests {
             assert!(!s.service_reason_visible);
             assert_eq!(s.service_reason, "network again");
         });
-        super::update_service(Ok(()));
+        super::update_service(Ok(None));
         super::STATE.with(|state| {
             let s = state.borrow();
             assert!(!s.service_reason_visible);
@@ -2525,7 +2950,7 @@ mod tests {
         pending.issued = None;
         super::STATE.with(|state| *state.borrow_mut() = super::State {
             order_no: "0000000000000001".into(),
-            handoff: Some(super::Handoff { server_origin: "https://kovela.example.com".into(), handoff_token: "c".repeat(64), product_id: "com.komoridev.tankturmoil".into(), product_name: "Tank Turmoil".into() }),
+            handoff: Some(super::Handoff { server_origin: "https://kovela.example.com".into(), route: super::Route::Order { handoff_token: "c".repeat(64) }, product_id: "com.komoridev.tankturmoil".into(), product_name: "Tank Turmoil".into() }),
             pending: Some(pending), selected: Some(0),
             ..Default::default()
         });

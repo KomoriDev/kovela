@@ -10,6 +10,9 @@ world kovela {
   import astrobox:psys-host-v4/interconnect;
   import astrobox:psys-host-v4/thirdpartyapp;
   import astrobox:psys-host-v4/notification;
+  // Level 4 的宿主标识与账号资料：账号维度查购买状态用它取已绑定的爱发电 ID。
+  import astrobox:psys-host-v4/account;
+  import astrobox:psys-host-v4/os;
 
   export astrobox:psys-plugin-v4/lifecycle;
   export astrobox:psys-plugin-v4/event;

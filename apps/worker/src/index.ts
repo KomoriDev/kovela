@@ -156,6 +156,10 @@ function deviceModelOf(body: Record<string, unknown>) {
   return typeof body.deviceModel === "string" ? oneLine(body.deviceModel) : "";
 }
 
+// 宿主安装标识（Level 4 `os.device-id`）只用于限流与排查：不是硬件序列号，
+// 清除 AstroBox 数据后会变，格式不对就当没带。
+const HOST_INSTALL_PATTERN = /^ab-install-[a-f0-9]{32}$/;
+
 function catalog(env: Env): ProductConfig[] {
   let products: unknown = env.PRODUCTS ?? [];
   try {
@@ -389,6 +393,43 @@ export function createWorker(
     if (!bound) throw new HttpError(409, "DEVICE_BOUND", "此应用授权已绑定其他设备。");
     return bound;
   }
+  // 账号维度找订单：先在 D1 里挑这个买家在这个商品上已完成的候选订单，再逐条
+  // 向爱发电现场复核付款状态与商品匹配。绑定了其他设备的订单会跳过（同订单
+  // 只能绑一台），所以同一账号买过多份时可以继续用下一份。
+  async function accountOrder(
+    env: Env,
+    api: AfdianService,
+    afdianUserId: string,
+    product: ProductConfig,
+    deviceId?: string,
+  ): Promise<Entitlement | null> {
+    const candidates = await env.DB.prepare(
+      "SELECT order_no FROM purchases p WHERE lower(buyer_id)=? AND payment_status=2 AND EXISTS (SELECT 1 FROM entitlements e WHERE e.order_no=p.order_no AND e.product_id=?) ORDER BY updated_at DESC LIMIT 3",
+    )
+      .bind(afdianUserId, product.productId)
+      .all<{ order_no: string }>();
+    for (const candidate of candidates.results) {
+      const order = await api.getOrder(candidate.order_no);
+      if (
+        !order ||
+        order.user_id.toLowerCase() !== afdianUserId ||
+        order.status !== 2 ||
+        !/^\d+(?:\.\d{1,2})?$/.test(order.total_amount) ||
+        !matchesProduct(order, product)
+      )
+        continue;
+      const entitlement = await env.DB.prepare(
+        "SELECT * FROM entitlements WHERE order_no=? AND product_id=?",
+      )
+        .bind(candidate.order_no, product.productId)
+        .first<Entitlement>();
+      if (!entitlement) continue;
+      if (deviceId && entitlement.device_id && entitlement.device_id !== deviceId)
+        continue;
+      return entitlement;
+    }
+    return null;
+  }
   async function receiptFor(
     env: Env,
     handoffHash: string,
@@ -497,6 +538,9 @@ export function createWorker(
           }),
         ),
         verificationEnabled,
+        // 插件据此决定要不要显示「用 AstroBox 账号激活」：没部署这两个接口时
+        // 隐藏按钮，用户不会点到一个必然 404 的功能。
+        accountActivation: true,
         pluginName: PLUGIN_NAME,
         publicOrigin: env.PUBLIC_ORIGIN,
         turnstileSiteKey:
@@ -755,6 +799,98 @@ export function createWorker(
       }
       if (url.pathname === "/api/orders/lookup") return { orderNo, items };
       return { orderNo, ...items[0] };
+    }
+    // 账号维度：宿主确认过的爱发电账号。插件只递账号 ID（可选的宿主安装标识
+    // 仅用于限流），服务端自己找订单、现场向爱发电复核付款状态；返回的只有
+    // 商品与绑定状态，不含订单详情，也不缓存绑定结论。
+    if (url.pathname === "/api/account/products") {
+      if (!verificationEnabled)
+        throw new HttpError(503, "NOT_CONFIGURED", "购买验证尚未开放，请等待服务配置完成。");
+      const afdianUserId = requireString(body, "afdianUserId", /^[a-f0-9]{32}$/i).toLowerCase();
+      await limit(env, "account:" + (await digest(ip)), 10, 60);
+      await limit(env, "account-buyer:" + (await digest(afdianUserId)), 30, 600);
+      const hostId =
+        typeof body.hostId === "string" && HOST_INSTALL_PATTERN.test(body.hostId)
+          ? body.hostId
+          : "";
+      if (hostId) await limit(env, "account-host:" + (await digest(hostId)), 40, 600);
+      const items = [];
+      for (const product of products) {
+        if (!product.planIds.length || product.productId === "com.komoridev.watermelon")
+          continue;
+        const order = await accountOrder(env, api, afdianUserId, product);
+        if (!order) continue;
+        items.push({
+          productId: product.productId,
+          productName: product.productName,
+          boundDeviceId: order.device_id,
+        });
+      }
+      return { afdianUserId, items };
+    }
+    if (url.pathname === "/api/account/activate") {
+      if (!signingReady)
+        throw new HttpError(503, "NOT_CONFIGURED", "授权签发服务尚未配置完成。");
+      const afdianUserId = requireString(body, "afdianUserId", /^[a-f0-9]{32}$/i).toLowerCase();
+      const productId = requireString(body, "productId", productIdPattern);
+      if (productId === "com.komoridev.watermelon")
+        throw new HttpError(
+          409,
+          "PLUGIN_ENTITLEMENT",
+          "合成大西瓜换肤传输免费，自定义请在独立插件中验证当前爱发电账号。",
+        );
+      const deviceId = requireString(body, "deviceId", /^[a-f0-9]{64}$/);
+      const requestId = requireString(body, "requestId", /^[A-Za-z0-9_-]{16,80}$/);
+      await limit(env, "account:" + (await digest(ip)), 10, 60);
+      await limit(env, "account-buyer:" + (await digest(afdianUserId)), 30, 600);
+      const hostId =
+        typeof body.hostId === "string" && HOST_INSTALL_PATTERN.test(body.hostId)
+          ? body.hostId
+          : "";
+      if (hostId) await limit(env, "account-host:" + (await digest(hostId)), 40, 600);
+      const product = availableProduct(products, productId);
+      const order = await accountOrder(env, api, afdianUserId, product, deviceId);
+      if (!order)
+        throw new HttpError(
+          404,
+          "ACCOUNT_NOT_ELIGIBLE",
+          "该爱发电账号没有可用授权：订单未完成、商品不符，或许可证已绑定其他设备。",
+        );
+      // 这次调用本身就是一次现场核对：为它开一条会话，回执校验与上报沿用
+      // 在线激活同一条路径（verified_at 即本次核对时刻）。
+      const handoffToken = randomToken();
+      const statusToken = randomToken();
+      const hash = await digest(handoffToken);
+      const time = now();
+      await env.DB.prepare(
+        "INSERT INTO sessions(handoff_hash,status_hash,license_id,expires_at,status_expires_at,verified_at) VALUES(?,?,?,?,?,?)",
+      )
+        .bind(
+          hash,
+          await digest(statusToken),
+          order.license_id,
+          time + 600,
+          time + 3600,
+          time,
+        )
+        .run();
+      const receiptToken = await receiptFor(env, hash, requestId, deviceId);
+      const claimed = await env.DB.prepare(
+        "UPDATE sessions SET device_id=?,request_id=?,receipt_hash=?,receipt_expires_at=? WHERE handoff_hash=? AND expires_at>? AND device_id IS NULL RETURNING handoff_hash",
+      )
+        .bind(deviceId, requestId, await digest(receiptToken), time + 3600, hash, time)
+        .first();
+      if (!claimed)
+        throw new HttpError(503, "SERVICE_UNAVAILABLE", "暂时无法完成激活，请重试。");
+      const bound = await bindLicense(env, order, deviceId);
+      return {
+        licenseId: bound.license_id,
+        licenseToken: bound.license_token,
+        receiptToken,
+        productId: bound.product_id,
+        productName: product.productName,
+        deviceId,
+      };
     }
     if (url.pathname === "/api/activate") {
       const token = requireString(body, "handoffToken", /^[a-f0-9]{64}$/);
