@@ -61,6 +61,49 @@ mod host {
         let _ = notification::send(addr.to_string(), message).await;
     }
 
+    /// 调试自测：用最小字段发一条实时活动，编号由调用方递增。
+    /// 反复调用会更新同一条（同一个 id），所以连点不会在手环上堆一排通知。
+    pub(crate) async fn probe(addr: &str, scene: bool, number: u32, sequence: u32) {
+        let live_activity = if scene {
+            notification::LiveActivity::FocusV2(notification::FocusV2 {
+                scene: number,
+                ticker: "Kovela 自测".into(),
+                basic_info: notification::Info {
+                    title: text("Kovela 场景自测"),
+                    sub_title: Some(text(&format!("scene={number}"))),
+                    content: Some(text("手环上有变化就记下这个数")),
+                    sub_content: None,
+                    special_title: None,
+                    special_title_bg: None,
+                },
+                hint_info: None,
+                progress: None,
+                updatable: true,
+                sequence,
+            })
+        } else {
+            notification::LiveActivity::Focus(notification::Focus {
+                style: number,
+                title: text("Kovela 样式自测"),
+                content: text(&format!("style={number}")),
+                desc: text("手环上有变化就记下这个数"),
+                progress: None,
+                updatable: true,
+                sequence,
+            })
+        };
+        let message = notification::Message {
+            id: LIVE_ID,
+            app_name: "Kovela".into(),
+            title: "Kovela 通知自测".into(),
+            sub_title: String::new(),
+            body: format!("{}={number}", if scene { "scene" } else { "style" }),
+            timestamp_ms: None,
+            live_activity: Some(live_activity),
+        };
+        let _ = notification::send(addr.to_string(), message).await;
+    }
+
     /// 撤回实时活动。
     pub(crate) async fn clear(addr: &str) {
         let _ = notification::remove(addr.to_string(), LIVE_ID).await;
@@ -83,7 +126,7 @@ mod host {
 }
 
 #[cfg(all(feature = "api4", not(test)))]
-pub(crate) use host::{activated, clear, live};
+pub(crate) use host::{activated, clear, live, probe};
 
 #[cfg(any(not(feature = "api4"), test))]
 pub(crate) async fn live(_addr: &str, _product: &str, _step: usize, _note: &str, _sequence: u32) {}
@@ -91,6 +134,8 @@ pub(crate) async fn live(_addr: &str, _product: &str, _step: usize, _note: &str,
 pub(crate) async fn clear(_addr: &str) {}
 #[cfg(any(not(feature = "api4"), test))]
 pub(crate) async fn activated(_addr: &str, _product: &str) {}
+#[cfg(any(not(feature = "api4"), test))]
+pub(crate) async fn probe(_addr: &str, _scene: bool, _number: u32, _sequence: u32) {}
 
 #[cfg(all(test, feature = "api4"))]
 mod tests {

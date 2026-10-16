@@ -5,6 +5,12 @@ wit_bindgen::generate!({
     generate_all,
 });
 
+/// 通知样式自测：真机上确认 `focus` 的 style / `focus-v2` 的 scene 取值用。
+/// 官方文档明确这两个是协议原值、没有跨型号枚举，只能实测。上架前保持 `false`；
+/// 本地调试时改成 `true` 重新编译，插件「更多操作」里会多出两个自测项，每点一次
+/// 把编号 +1 发一条实时活动（同一个通知 id，会覆盖更新，不会堆一屏）。
+const NOTIFY_PROBE: bool = false;
+
 #[cfg(feature = "api4")]
 use astrobox::psys_host_v4::{
     clipboard, device, dialog, interconnect, register, thirdpartyapp, timer, ui,
@@ -145,6 +151,9 @@ struct State {
     account_gen: u32,
     /// 宿主安装标识读一次就够（它属于同一份安装），避免每次重试都再要一次权限。
     host_id: Option<String>,
+    /// 通知自测用：focus 的 style 与 focus-v2 的 scene 各一个递增编号。
+    probe_style: u32,
+    probe_scene: u32,
     // 实时活动的序号与当前分段：同一 id 反复更新时 sequence 必须递增，
     // 失败提示要停在失败的那一步（见 live_step / live_note）。
     notify_seq: u32,
@@ -905,10 +914,16 @@ fn render() {
         2
     };
     let service_error = service_status == ServiceStatus::Unavailable;
+    // 自测入口只在本地调试开关打开时出现（见 NOTIFY_PROBE）。
+    let mut more: Vec<(&str, &str)> = vec![("重新输入订单", "cancel")];
+    if NOTIFY_PROBE {
+        more.push(("样式自测 focus", "probe-focus"));
+        more.push(("场景自测 focus-v2", "probe-scene"));
+    }
     let mut page = theme::page().child(theme::row(theme::space::TWO)
         .child(theme::steps(step))
         .child(theme::service_badge(service_status))
-        .child(theme::more_menu(&[("重新输入订单", "cancel")], ui_locked)));
+        .child(theme::more_menu(&more, ui_locked)));
     if service_error && service_reason_visible {
         page = page.child(theme::service_reason(&service_reason, ui_locked));
     }
@@ -1537,6 +1552,46 @@ async fn fail_live(id: &str, message: impl Into<String>) {
     live_note(id, &message).await;
 }
 
+/// 调试自测：把当前编号（focus 的 style 或 focus-v2 的 scene）发成一条实时活动，
+/// 并把编号显示在插件界面上。手环上有变化就说明这个编号可用，记下来填进
+/// `notify.rs` 的常量；没反应就再点一次换下一个编号。
+async fn notify_probe(scene: bool) {
+    let target = STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        // 激活进行中用当前 pending 的设备；否则用本页选中的设备。
+        let addr = s
+            .pending
+            .as_ref()
+            .map(|pending| pending.addr.clone())
+            .or_else(|| {
+                let index = s
+                    .selected
+                    .filter(|index| *index < s.devices.len())
+                    .unwrap_or(0);
+                s.devices.get(index).map(|(addr, _)| addr.clone())
+            })?;
+        s.notify_seq = s.notify_seq.wrapping_add(1);
+        let number = if scene {
+            s.probe_scene = s.probe_scene.wrapping_add(1);
+            s.probe_scene
+        } else {
+            s.probe_style = s.probe_style.wrapping_add(1);
+            s.probe_style
+        };
+        Some((addr, s.notify_seq, number))
+    });
+    let Some((addr, sequence, number)) = target else {
+        show("通知自测：请先在 AstroBox 里连接手环，并在本页选中它");
+        return;
+    };
+    notify::probe(&addr, scene, number, sequence).await;
+    show(if scene {
+        format!("已发送 focus-v2：scene={number}（手环上有变化就记下这个数）")
+    } else {
+        format!("已发送 focus：style={number}（手环上有变化就记下这个数）")
+    });
+}
+
 /// 放弃激活（重新输入订单、切换到离线）时撤回实时活动。
 async fn live_clear_any() {
     let addr = STATE.with(|state| {
@@ -2053,6 +2108,8 @@ enum UiFollow {
     None,
     Lookup,
     Account,
+    /// 参数为 true 时自测 focus-v2 的 scene，否则自测 focus 的 style。
+    ProbeNotify(bool),
     ClearLive,
     Refresh,
     Scan,
@@ -2151,6 +2208,15 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         if let Some(url) = url {
             dialog::open_url(url);
             return UiFollow::None;
+        }
+    }
+    // 通知自测（本地调试开关）：只发通知，不动激活状态，所以加锁期间也允许点。
+    if NOTIFY_PROBE && matches!(event, ui::Event::Click) {
+        if id == "probe-focus" {
+            return UiFollow::ProbeNotify(false);
+        }
+        if id == "probe-scene" {
+            return UiFollow::ProbeNotify(true);
         }
     }
     if !matches!(event, ui::Event::Click) || locked() {
@@ -2295,6 +2361,7 @@ impl event::Guest for Kovela {
                 host_timeout(1, &format!("{ACCOUNT_PAYLOAD}:{generation}")).await;
             }
             UiFollow::ClearLive => live_clear_any().await,
+            UiFollow::ProbeNotify(scene) => notify_probe(scene).await,
             UiFollow::Refresh => {
                 // 切离线、重新输入订单都会走到这里：顺手撤回实时活动。
                 live_clear_any().await;
@@ -2365,6 +2432,7 @@ impl event_v3::Guest for Kovela {
                     host_timeout(1, &format!("{ACCOUNT_PAYLOAD}:{generation}")).await;
                 }
                 UiFollow::ClearLive => live_clear_any().await,
+                UiFollow::ProbeNotify(scene) => notify_probe(scene).await,
                 UiFollow::Refresh => {
                     live_clear_any().await;
                     begin_scan().await;

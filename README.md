@@ -77,14 +77,14 @@ pnpm --filter @kovela/worker deploy
 
 右上角服务状态徽标在首次打开时通过 `/api/config` 检查服务连通性与配置，每分钟复查；订单查询和激活期间暂缓探测。网络失败、服务端错误或服务配置未就绪时显示红色「服务异常」，点击可展开/收起原因，恢复后自动清除。业务请求的网络和 5xx 错误也会同步到徽标；订单号错误、设备通信错误不作为服务异常。此探测不主动请求爱发电，爱发电运行故障由实际订单请求反映。切到离线激活后不再探测，也不调用订单、签发或回执 API。
 
-### 构建与上架：Level 4 是主版本
+### 构建与上架：只有 Level 4 一份产物
 
-`plugins/astrobox/manifest.json` 是 Level 4 基准（`wasi_version: 3`、`api_level: 4`，权限含 `notification`、`account.profile`、`os.device-id`）。`pnpm build:plugin` 会额外派生一份 Level 2/3 兼容构建，把只有 Level 4 认识的权限去掉后打包；上架入口（仓库根目录 `index.txt`）只列 Level 4 那一份 `plugins/astrobox/dist/kovela-v4`，兼容构建仍产出 `Kovela.abp` 供旧宿主本地导入。
+`plugins/astrobox/manifest.json` 就是 Level 4 清单（`wasi_version: 3`、`api_level: 4`，权限含 `notification`、`account.profile`、`os.device-id`），`pnpm build:plugin` 只出这一份产物到 `plugins/astrobox/dist/kovela/`，上架入口（仓库根目录 `index.txt`）列的也是它。账号资料与设备通知都只有 Level 4 才有，所以不再提供 Level 2/3 兼容构建；AstroBox 2.2 以下的宿主装不了这个插件。
 
-账号资料与设备通知都是 Level 4 才有的宿主能力：
-
-- 主界面第一步可以直接点「用 AstroBox 账号激活」：插件读宿主已登录账号里已确认的爱发电绑定（`account.get-current`），把账号 ID 交给服务端查购买状态，用户不必去翻订单号。宿主安装标识（`os.device-id`，形如 `ab-install-…`，不是硬件序列号、清除应用数据后会变）随请求一起发给服务端，只用于限流。
-- 激活过程用一条实时活动（通知 id 1）在手环上显示四段进度：按相位 `send` 更新（同一 id、`updatable`、递增 `sequence`），失败时改成失败文案，完成后发一条普通通知（id 2）并 `remove` 撤回实时活动。设备不支持小米通知协议、用户没给 `notification` 权限、传输失败、甚至实时活动本身不显示，都不影响激活。`focus` 的 `style` 是协议原值，官方文档要求「使用目标设备已经确认支持的取值」，常量集中在 `plugins/astrobox/src/notify.rs` 的 `FOCUS_STYLE`，真机确认后改这一行。
+- 主界面第一步可以直接点「用 AstroBox 账号激活」：插件读宿主已登录账号里已确认的爱发电绑定（`account.get-current`），把账号 ID 交给服务端查购买状态，用户不必去翻订单号。按钮只在服务端 `/api/config` 报出 `accountActivation` 时显示——老 Worker 上不会出现，也就不会点到必然 404 的接口。读取账号要弹授权、宿主每次实时查询绑定（单项最多 10 秒），所以插件带 20 秒超时兜底：超时会解锁界面并提示改用订单号激活。
+- 宿主安装标识（`os.device-id`，形如 `ab-install-…`，不是硬件序列号、清除应用数据后会变）随账号请求一起发给服务端，只用于限流，读一次即缓存。
+- 激活过程用一条实时活动（通知 id 1）在手环上显示四段进度：按相位 `send` 更新（同一 id、`updatable`、递增 `sequence`），失败时改成失败文案，完成后发一条普通通知（id 2）并 `remove` 撤回实时活动。设备不支持小米通知协议、用户没给 `notification` 权限、传输失败、甚至实时活动本身不显示，都不影响激活。
+- `focus` 的 `style` 与 `focus-v2` 的 `scene` 是协议原值，官方文档明确没有跨型号枚举、要求用目标设备确认过的取值（上游 proto 里就是裸 `uint32`，宿主原样透传）。确认办法：把 `plugins/astrobox/src/lib.rs` 的 `NOTIFY_PROBE` 改成 `true` 重新构建并本地导入，「更多操作」里会多出「样式自测 focus」「场景自测 focus-v2」两项，连接并选中手环后每点一次把编号 +1 发一条实时活动（同一个通知 id，覆盖更新，不会堆一屏）；手环上有变化就记下那个编号，填进 `plugins/astrobox/src/notify.rs` 的 `FOCUS_STYLE`（改用 focus-v2 则换 `live()` 里的 variant 并在 `probe` 里对齐 `scene`）。确认完把 `NOTIFY_PROBE` 改回 `false` 再上架。
 
 本地打包需要 Rust stable 和 `wasm32-wasip2` 目标：
 
@@ -93,24 +93,23 @@ rustup target add wasm32-wasip2
 pnpm build:plugin
 ```
 
-产物是两套：
+产物只有一份：
 
 | 路径 | 用途 |
 | --- | --- |
-| `plugins/astrobox/dist/kovela-v4/` | **上架用**：AstroBox 2.2.0+（wasi 3 / api_level 4），含 `manifest.json`、`kovela_astrobox.wasm`、`icon.png`、`Kovela-v4.abp` |
-| `plugins/astrobox/dist/kovela/` | 兼容构建：AstroBox 2.0.0+（wasi 2 / api_level 3），没有账号资料与设备通知能力，产物里仍有 `Kovela.abp` 供旧宿主本地导入 |
+| `plugins/astrobox/dist/kovela/` | **上架用**：AstroBox 2.2.0+（WASI 3 / api_level 4），含 `manifest.json`、`kovela_astrobox.wasm`、`icon.png`、`Kovela.abp` |
 
-每个目录里的 `.abp` 是给用户本地导入的完整包（不在 `additional_files` 里，商店不会下载它）；其余 `.abp` 仍被 `.gitignore` 排除。
+目录里的 `.abp` 是给用户本地导入的完整包（不在 `additional_files` 里，商店不会下载它）；其余 `.abp` 仍被 `.gitignore` 排除。
 
-推送插件源码，或手动运行 [`.github/workflows/plugin.yml`](.github/workflows/plugin.yml)，Actions 会执行同一条命令，把两套产物提交回 `main` 并上传 `.abp`。
+推送插件源码，或手动运行 [`.github/workflows/plugin.yml`](.github/workflows/plugin.yml)，Actions 会执行同一条命令，把产物提交回 `main` 并上传 `.abp`。
 
 ### 上架 AstroBox 官方插件源
 
 聚合脚本（[`AstroBox-NG-Plugin-Repo`](https://github.com/AstralSightStudios/AstroBox-NG-Plugin-Repo) 的 `generate-index`）每 4 小时按**匿名 raw URL** 抓一次产物，因此仓库必须是公开的，且产物必须提交进 Git：
 
-- 仓库根目录的 [`index.txt`](index.txt) 列出存放 `manifest.json` 的文件夹（当前只列主版本 `plugins/astrobox/dist/kovela-v4`）；空行和 `#` 行会被忽略，兼容构建那一行注释着，需要旧宿主重新上架时再放开。
+- 仓库根目录的 [`index.txt`](index.txt) 列出存放 `manifest.json` 的文件夹（`plugins/astrobox/dist/kovela`）；空行和 `#` 行会被忽略。
 - 上架入口写在上游仓库的 `index.txt` 里：`https://raw.githubusercontent.com/KomoriDev/kovela/refs/heads/main/`。
-- 发版本时只改 `plugins/astrobox/manifest.json` 的 `version`（Level 4 那份直接用它，兼容构建由 `package.py` 降级派生 `wasi_version`/`api_level` 并去掉 Level 4 权限），推上去等 Action 生效即可。
+- 发版本时只改 `plugins/astrobox/manifest.json` 的 `version`，推上去等 Action 生效即可。
 
 ### 合成大西瓜自定义权益
 

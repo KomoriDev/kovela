@@ -6,8 +6,8 @@
   "author": "Komorebi",
   "website": "https://kovela.komoridevs.icu",
   "entry": "kovela_astrobox.wasm",
-  "wasi_version": 2,
-  "api_level": 3,
+  "wasi_version": 3,
+  "api_level": 4,
   "permissions": [
     "network",
     "device",
@@ -16,7 +16,10 @@
     "register_interconnect_recv",
     "timer",
     "clipboard.read",
-    "clipboard.write"
+    "clipboard.write",
+    "notification",
+    "account.profile",
+    "os.device-id"
   ],
   "additional_files": []
 }
