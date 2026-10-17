@@ -79,13 +79,12 @@ pnpm --filter @kovela/worker deploy
 
 ### 构建与上架：只有 Level 4 一份产物
 
-`plugins/astrobox/manifest.json` 就是 Level 4 清单（`wasi_version: 3`、`api_level: 4`，权限含 `notification`、`account.profile`、`os.device-id`），`pnpm build:plugin` 只出这一份产物到 `plugins/astrobox/dist/kovela/`，上架入口（仓库根目录 `index.txt`）列的也是它。账号资料与设备通知都只有 Level 4 才有，所以不再提供 Level 2/3 兼容构建；AstroBox 2.2 以下的宿主装不了这个插件。
+`plugins/astrobox/manifest.json` 就是 Level 4 清单（`wasi_version: 3`、`api_level: 4`，权限含 `account.profile`、`os.device-id`），`pnpm build:plugin` 只出这一份产物到 `plugins/astrobox/dist/kovela/`，上架入口（仓库根目录 `index.txt`）列的也是它。账号资料与宿主安装标识都只有 Level 4 才有，所以不再提供 Level 2/3 兼容构建；AstroBox 2.2 以下的宿主装不了这个插件。
 
 - 主界面第一步直接显示「用 AstroBox 账号激活」，无需等待服务检查。插件读宿主已登录账号里已确认的爱发电绑定（`account.get-current`），把账号 ID 交给服务端查购买状态，用户不必去翻订单号。服务检查只更新状态徽标，不控制账号入口。读取账号要弹授权、宿主每次实时查询绑定（单项最多 10 秒），所以插件带 20 秒超时兜底：超时会解锁界面并提示改用订单号激活。
 - 创作者自用：爱发电不允许创作者购买/兑换自己的商品，所以账号 ID 等于 `AFDIAN_USER_ID` 时，服务端不查订单，直接列出并签发全部可激活应用（任意设备，每台设备一条 `creator:<设备码>` 合成记录，`payment_status=0`，不会混进买家候选订单；回执不发私信），西瓜自定义权益也直接放行。账号路由不认证 HTTP 调用者，而创作者 ID 是公开的，伪造该 ID 即可免费激活——这是已知并接受的取舍。
 - 宿主安装标识（`os.device-id`，形如 `ab-install-…`，不是硬件序列号、清除应用数据后会变）随账号请求一起发给服务端，只用于限流，读一次即缓存。
-- 激活过程用一条实时活动（通知 id 1）在手环上显示四段进度：按相位 `send` 更新（同一 id、`updatable`、递增 `sequence`），失败时改成失败文案，完成后发一条普通通知（id 2）并 `remove` 撤回实时活动。设备不支持小米通知协议、用户没给 `notification` 权限、传输失败、甚至实时活动本身不显示，都不影响激活。
-- `focus` 的 `style` 与 `focus-v2` 的 `scene` 是协议原值，官方文档明确没有跨型号枚举、要求用目标设备确认过的取值（上游 proto 里就是裸 `uint32`，宿主原样透传）。确认办法：把 `plugins/astrobox/src/lib.rs` 的 `NOTIFY_PROBE` 改成 `true` 重新构建并本地导入，「更多操作」里会多出「样式自测 focus」「场景自测 focus-v2」两项，连接并选中手环后每点一次把编号 +1 发一条实时活动（同一个通知 id，覆盖更新，不会堆一屏）；手环上有变化就记下那个编号，填进 `plugins/astrobox/src/notify.rs` 的 `FOCUS_STYLE`（改用 focus-v2 则换 `live()` 里的 variant 并在 `probe` 里对齐 `scene`）。确认完把 `NOTIFY_PROBE` 改回 `false` 再上架。
+- 插件不向手环推送任何通知。实时活动和普通通知在真机上都会让手环整机重启，因此相关代码与 `notification` 权限已整体删除；激活进度与结果只在插件界面显示。
 
 本地打包需要 Rust stable 和 `wasm32-wasip2` 目标：
 

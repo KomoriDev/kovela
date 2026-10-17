@@ -4,12 +4,6 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-/// 通知样式自测：真机上确认 `focus` 的 style / `focus-v2` 的 scene 取值用。
-/// 官方文档明确这两个是协议原值、没有跨型号枚举，只能实测。上架前保持 `false`；
-/// 本地调试时改成 `true` 重新编译，插件「更多操作」里会多出两个自测项，每点一次
-/// 把编号 +1 发一条实时活动（同一个通知 id，会覆盖更新，不会堆一屏）。
-const NOTIFY_PROBE: bool = false;
-
 use astrobox::psys_host_v4::{
     clipboard, device, dialog, interconnect, register, thirdpartyapp, timer, ui,
 };
@@ -26,7 +20,6 @@ mod theme;
 mod icons;
 mod offline;
 mod identity;
-mod notify;
 mod net;
 
 /// 取许可证走哪条路：订单号查询得到的 handoff 凭证，或 AstroBox 账号里绑定的
@@ -132,13 +125,6 @@ struct State {
     account_gen: u32,
     /// 宿主安装标识读一次就够（它属于同一份安装），避免每次重试都再要一次权限。
     host_id: Option<String>,
-    /// 通知自测用：focus 的 style 与 focus-v2 的 scene 各一个递增编号。
-    probe_style: u32,
-    probe_scene: u32,
-    // 实时活动的序号与当前分段：同一 id 反复更新时 sequence 必须递增，
-    // 失败提示要停在失败的那一步（见 live_step / live_note）。
-    notify_seq: u32,
-    notify_step: usize,
     service_status: ServiceStatus,
     service_reason: String,
     service_check_started: bool,
@@ -817,12 +803,7 @@ fn render() {
         2
     };
     let service_error = service_status == ServiceStatus::Unavailable;
-    // 自测入口只在本地调试开关打开时出现（见 NOTIFY_PROBE）。
-    let mut more: Vec<(&str, &str)> = vec![("重新输入订单", "cancel")];
-    if NOTIFY_PROBE {
-        more.push(("样式自测 focus", "probe-focus"));
-        more.push(("场景自测 focus-v2", "probe-scene"));
-    }
+    let more: Vec<(&str, &str)> = vec![("重新输入订单", "cancel")];
     let mut page = theme::page().child(theme::row(theme::space::TWO)
         .child(theme::steps(step))
         .child(theme::service_badge(service_status))
@@ -1453,112 +1434,6 @@ fn finish_account_lookup(generation: u32, result: Result<Vec<Offer>, String>) {
     }
 }
 
-/// 实时活动的 `sequence` 必须在同一通知 id 上递增。插件重载会重置 State，
-/// 所以用墙上时钟的秒数起头：重载后不会从 0 重来，避免设备把更新当成过期。
-fn seed_notify_seq() {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as u32)
-        .unwrap_or(0);
-    STATE.with(|state| state.borrow_mut().notify_seq = seconds);
-}
-
-/// 当前流程的产品名：在线取订单/账号确认的商品，离线取离线目录，兜底「应用」。
-fn product_label() -> String {
-    STATE.with(|state| {
-        let s = state.borrow();
-        s.handoff
-            .as_ref()
-            .map(|handoff| handoff.product_name.clone())
-            .or_else(|| {
-                let local = s.offline.as_ref()?;
-                offline::product_name(&local.product_id).map(str::to_string)
-            })
-            .unwrap_or_else(|| "应用".into())
-    })
-}
-
-/// 阶段推进时同步一次实时活动：同一通知 id 反复更新，`sequence` 递增。
-/// 通知是尽力而为，失败只影响这一条，不影响激活；缺 pending 就跳过。
-async fn live_step(id: &str, step: usize, note: &str) {
-    let target = STATE.with(|state| {
-        let mut s = state.borrow_mut();
-        if !s.pending.as_ref().is_some_and(|p| p.id == id) {
-            return None;
-        }
-        let addr = s.pending.as_ref().map(|p| p.addr.clone())?;
-        s.notify_seq = s.notify_seq.wrapping_add(1);
-        s.notify_step = step;
-        Some((addr, s.notify_seq))
-    });
-    if let Some((addr, sequence)) = target {
-        notify::live(&addr, &product_label(), step, note, sequence).await;
-    }
-}
-
-/// 失败提示：分段停在失败的那一步，只换说明文字。
-async fn live_note(id: &str, note: &str) {
-    let step = STATE.with(|state| state.borrow().notify_step);
-    live_step(id, step, note).await;
-}
-
-/// 失败：先按原样上屏（相位转重试），再把手环上的实时活动改成同一句话。
-async fn fail_live(id: &str, message: impl Into<String>) {
-    let message = message.into();
-    fail(message.clone());
-    live_note(id, &message).await;
-}
-
-/// 调试自测：把当前编号（focus 的 style 或 focus-v2 的 scene）发成一条实时活动，
-/// 并把编号显示在插件界面上。手环上有变化就说明这个编号可用，记下来填进
-/// `notify.rs` 的常量；没反应就再点一次换下一个编号。
-async fn notify_probe(scene: bool) {
-    let target = STATE.with(|state| {
-        let mut s = state.borrow_mut();
-        // 激活进行中用当前 pending 的设备；否则用本页选中的设备。
-        let addr = s
-            .pending
-            .as_ref()
-            .map(|pending| pending.addr.clone())
-            .or_else(|| {
-                let index = s
-                    .selected
-                    .filter(|index| *index < s.devices.len())
-                    .unwrap_or(0);
-                s.devices.get(index).map(|(addr, _)| addr.clone())
-            })?;
-        s.notify_seq = s.notify_seq.wrapping_add(1);
-        let number = if scene {
-            s.probe_scene = s.probe_scene.wrapping_add(1);
-            s.probe_scene
-        } else {
-            s.probe_style = s.probe_style.wrapping_add(1);
-            s.probe_style
-        };
-        Some((addr, s.notify_seq, number))
-    });
-    let Some((addr, sequence, number)) = target else {
-        show("通知自测：请先在 AstroBox 里连接手环，并在本页选中它");
-        return;
-    };
-    notify::probe(&addr, scene, number, sequence).await;
-    show(if scene {
-        format!("已发送 focus-v2：scene={number}（手环上有变化就记下这个数）")
-    } else {
-        format!("已发送 focus：style={number}（手环上有变化就记下这个数）")
-    });
-}
-
-/// 放弃激活（重新输入订单、切换到离线）时撤回实时活动。
-async fn live_clear_any() {
-    let addr = STATE.with(|state| {
-        state.borrow().pending.as_ref().map(|pending| pending.addr.clone())
-    });
-    if let Some(addr) = addr {
-        notify::clear(&addr).await;
-    }
-}
-
 async fn send_install(pending: Pending) {
     let Some(issued) = pending.issued.as_ref() else {
         return;
@@ -1571,13 +1446,12 @@ async fn send_install(pending: Pending) {
         return;
     }
     render();
-    live_step(&pending.id, 2, "许可证已签发，正在写入手环…").await;
     let data=json!({"v":1,"id":pending.id,"type":"install-license","licenseId":issued.license_id,"licenseToken":issued.license_token}).to_string();
     if host_send(&pending.addr, &issued.product_id, &data)
         .await
         .is_err()
     {
-        fail_live(&pending.id, "传输失败，请打开手环应用并保持连接后重试").await;
+        fail("传输失败，请打开手环应用并保持连接后重试");
         return;
     }
     // 宿主对快应用回包的路由可能只认最近一次注册（Daymatter 每次发送前都
@@ -1656,16 +1530,15 @@ async fn start_activation() {
     };
     render();
     // 手环与手机上都先亮出「连接设备」，用户在插件里点完激活就能看到进度。
-    live_step(&id, 0, "正在连接手环，请保持 AstroBox 连接").await;
     if let Err(error) = open_app(&addr, &product_id).await {
-        fail_live(&id, error).await;
+        fail(error);
         return;
     }
     if host_register_recv(&addr, &product_id)
         .await
         .is_err()
     {
-        fail_live(&id, "无法接收设备消息，请授予权限后重试").await;
+        fail("无法接收设备消息，请授予权限后重试");
         return;
     }
     let message = json!({"v":1,"id":id,"type":"hello"}).to_string();
@@ -1673,7 +1546,7 @@ async fn start_activation() {
         .await
         .is_err()
     {
-        fail_live(&id, format!("无法连接{}，请在手环上打开应用", product_name)).await;
+        fail(format!("无法连接{}，请在手环上打开应用", product_name));
         return;
     }
     host_timeout(2_000, &format!("tick:{id}")).await;
@@ -1685,18 +1558,14 @@ async fn report(pending: Pending) {
     };
     if pending.offline {
         if success {
-            // 离线流程没有服务端回执，但手环上的“已激活”通知与手机上撤回
-            // 实时活动一样成立。
-            let product = product_label();
-            notify::activated(&pending.addr, &product).await;
             complete_offline(&pending.id);
         } else {
-            fail_live(&pending.id, "许可证未能写入，请查看手环提示后重试").await;
+            fail("许可证未能写入，请查看手环提示后重试");
         }
         return;
     }
     let Some(receipt_token) = issued.receipt_token.as_deref() else {
-        fail_live(&pending.id, "激活回执凭证缺失，请重新查询订单").await;
+        fail("激活回执凭证缺失，请重新查询订单");
         return;
     };
     if !set_phase(
@@ -1711,21 +1580,6 @@ async fn report(pending: Pending) {
         return;
     }
     render();
-    live_step(
-        &pending.id,
-        3,
-        if success {
-            "手环已激活，正在同步结果…"
-        } else {
-            "激活未完成，正在记录结果…"
-        },
-    )
-    .await;
-    if success {
-        // 结果通知只发一条，发完顺手撤回实时活动（同一个 id 会一直挂在岛上）。
-        let product = product_label();
-        notify::activated(&pending.addr, &product).await;
-    }
     let origin = STATE.with(|state| {
         state
             .borrow()
@@ -1769,11 +1623,7 @@ async fn report(pending: Pending) {
                     };
                 }
                 s.message = if success {
-                    if value["notification"] == "sent" {
-                        "激活成功！感谢您的支持 ❤️"
-                    } else {
-                        "激活成功！感谢您的支持 ❤️"
-                    }
+                    "激活成功！感谢您的支持 ❤️"
                 } else {
                     "激活未完成，请查看手环提示后重试"
                 }
@@ -1781,15 +1631,11 @@ async fn report(pending: Pending) {
             });
             render();
         }
-        _ => fail_live(
-            &pending.id,
-            if success {
-                "设备已激活，但通知未能发送，请保持页面打开并重试，无需重新购买"
-            } else {
-                "激活未完成，结果尚未提交，请重试"
-            },
-        )
-        .await,
+        _ => fail(if success {
+            "设备已激活，但结果未能同步，请保持页面打开并重试，无需重新购买"
+        } else {
+            "激活未完成，结果尚未提交，请重试"
+        }),
     }
 }
 
@@ -1833,12 +1679,12 @@ async fn on_device_message(raw: &str) {
             .and_then(Value::as_str)
             .filter(|id| is_hex(id))
         else {
-            fail_live(&pending.id, "设备未提供有效标识，请检查权限").await;
+            fail("设备未提供有效标识，请检查权限");
             return;
         };
         let expected = STATE.with(|state| target(&state.borrow()).map(|item| item.0));
         if message["productId"].as_str() != expected.as_deref() {
-            fail_live(&pending.id, "连接到的应用不匹配").await;
+            fail("连接到的应用不匹配");
             return;
         }
         let handoff = STATE.with(|state| {
@@ -1862,7 +1708,7 @@ async fn on_device_message(raw: &str) {
             return;
         };
         if message["productId"] != handoff.product_id {
-            fail_live(&pending.id, "连接到的应用不匹配").await;
+            fail("连接到的应用不匹配");
             return;
         }
         set_phase(
@@ -1871,7 +1717,6 @@ async fn on_device_message(raw: &str) {
             "正在为该设备签发许可证…",
         );
         render();
-        live_step(&pending.id, 1, "正在为该设备签发许可证…").await;
         // 两条路只在这一次请求上分叉：订单走 handoff 凭证；账号走宿主已确认
         // 的爱发电账号，服务端会现场复核付款状态后再签发。宿主安装标识只用于
         // 让创作者把同一份 AstroBox 安装上的激活串起来，拿不到就不带。
@@ -1920,8 +1765,8 @@ async fn on_device_message(raw: &str) {
                     send_install(p).await;
                 }
             }
-            Ok(_) => fail_live(&pending.id, "许可证与所选设备不匹配").await,
-            Err(error) => fail_live(&pending.id, error).await,
+            Ok(_) => fail("许可证与所选设备不匹配"),
+            Err(error) => fail(error),
         }
     } else if message["type"] == "activation-result"
         && matches!(pending.phase, Phase::Installing | Phase::Retry)
@@ -2009,7 +1854,7 @@ async fn dispatch_event(kind: EventType, payload: String) {
                     host_timeout(2_000, &format!("tick:{id}")).await;
                 }
                     Some(None) => {
-                        fail_live(id, "连接超时，请在手环应用里点重试，或重新打开应用后再试").await
+                        fail("连接超时，请在手环应用里点重试，或重新打开应用后再试")
                     }
                     None => {}
                 }
@@ -2039,11 +1884,7 @@ async fn dispatch_event(kind: EventType, payload: String) {
                     })
                 });
                 if waiting {
-                    fail_live(
-                        body.strip_prefix("install:").unwrap_or_default(),
-                        "等待设备响应超时，请保持应用打开后重试，本次尚未激活成功",
-                    )
-                    .await;
+                    fail("等待设备响应超时，请保持应用打开后重试，本次尚未激活成功",);
                 }
             }
         }
@@ -2054,9 +1895,6 @@ enum UiFollow {
     None,
     Lookup,
     Account,
-    /// 参数为 true 时自测 focus-v2 的 scene，否则自测 focus 的 style。
-    ProbeNotify(bool),
-    ClearLive,
     Refresh,
     Scan,
     Activate,
@@ -2156,15 +1994,6 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
             return UiFollow::None;
         }
     }
-    // 通知自测（本地调试开关）：只发通知，不动激活状态，所以加锁期间也允许点。
-    if NOTIFY_PROBE && matches!(event, ui::Event::Click) {
-        if id == "probe-focus" {
-            return UiFollow::ProbeNotify(false);
-        }
-        if id == "probe-scene" {
-            return UiFollow::ProbeNotify(true);
-        }
-    }
     if !matches!(event, ui::Event::Click) || locked() {
         return UiFollow::None;
     }
@@ -2201,10 +2030,8 @@ fn dispatch_ui(id: &str, event: ui::Event, payload: &str) -> UiFollow {
         }
     }
     if id == "cancel" {
-        let had_pending = STATE.with(|state| state.borrow().pending.is_some());
         reset_order();
-        // 激活中途放弃：把手环上的实时活动一并撤回，别让进度留在屏幕上。
-        return if had_pending { UiFollow::ClearLive } else { UiFollow::None };
+        return UiFollow::None;
     }
     remember_order(payload);
     let first_step = STATE.with(|state| {
@@ -2280,9 +2107,7 @@ async fn bind_root(id: String) {
 }
 impl lifecycle::Guest for Kovela {
     // 设备列表只在用户动作后读取，加载时不做任何宿主调用。
-    async fn on_load() {
-        seed_notify_seq();
-    }
+    async fn on_load() {}
 }
 impl event::Guest for Kovela {
     async fn on_event(kind: EventType, payload: String) -> String {
@@ -2299,13 +2124,7 @@ impl event::Guest for Kovela {
                 let generation = STATE.with(|state| state.borrow().account_gen);
                 host_timeout(1, &format!("{ACCOUNT_PAYLOAD}:{generation}")).await;
             }
-            UiFollow::ClearLive => live_clear_any().await,
-            UiFollow::ProbeNotify(scene) => notify_probe(scene).await,
-            UiFollow::Refresh => {
-                // 切离线、重新输入订单都会走到这里：顺手撤回实时活动。
-                live_clear_any().await;
-                begin_scan().await;
-            }
+            UiFollow::Refresh => begin_scan().await,
             UiFollow::Scan => load_devices().await,
             // 打开手环应用与握手都是主机调用（一到数秒），先让宿主画完
             // 「连接设备」再执行。

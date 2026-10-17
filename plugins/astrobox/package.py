@@ -57,7 +57,7 @@ for legacy in (
 ):
     (dist / legacy).unlink(missing_ok=True)
 
-# 早前还出过一份 Level 2/3 兼容构建：账号资料、设备通知与实时活动都依赖 Level 4，
+# 早前还出过一份 Level 2/3 兼容构建：账号资料与宿主标识都依赖 Level 4，
 # 现在只保留这一份主产物，旧目录整目录清掉，免得残留被误提交或被商店抓到。
 shutil.rmtree(dist / "kovela-v4", ignore_errors=True)
 
