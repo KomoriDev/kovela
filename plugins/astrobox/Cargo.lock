@@ -359,6 +359,7 @@ name = "kovela-astrobox"
 version = "1.0.0"
 dependencies = [
  "base64",
+ "futures-util",
  "serde",
  "serde_json",
  "url",

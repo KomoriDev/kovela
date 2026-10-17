@@ -33,6 +33,8 @@ test("account skins entitlement uses only the bound Afdian account, rejects refu
   await db.prepare("UPDATE entitlements SET device_id=?,state='activated' WHERE product_id=?").bind("f".repeat(64),product).run();
   assert.deepEqual((await post({afdianUserId:buyer})).body,{productId:product,afdianUserId:buyer,entitled:true});
   assert.equal((await post({afdianUserId:other})).body.entitled,false);
+  // 创作者本人无法在爱发电购买自己的商品：创作者账号直接放行。
+  assert.deepEqual((await post({afdianUserId:env.AFDIAN_USER_ID})).body,{productId:product,afdianUserId:env.AFDIAN_USER_ID,entitled:true});
   assert.equal((await db.prepare("SELECT COUNT(*) AS n FROM sessions").first<{n:number}>())!.n,0);
   const oldLicense = await worker.fetch(new Request(env.PUBLIC_ORIGIN+"/api/activate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({handoffToken:"a".repeat(64),deviceId:"f".repeat(64),productId:product,requestId:"legacy-license-request-0001"})}),{...env,LICENSE_SIGNING_SEED:"c".repeat(64)});
   assert.equal(oldLicense.status,409);

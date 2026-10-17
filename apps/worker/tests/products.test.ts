@@ -791,6 +791,58 @@ test("account activation issues a bound license from a live Afdian check and reu
   );
 });
 
+test("creator account activates every product on any device without an Afdian order", async (t) => {
+  let queries = 0;
+  const { db, env, ok, messages } = await fixture(t, (number) => { queries += 1; return orders[number]; });
+  env.PUBLIC_ORIGIN = origin;
+  env.DEV_MODE = "false";
+  await migrateAll(db);
+  const creator = env.AFDIAN_USER_ID.toUpperCase();
+  const listed = await ok("/api/account/products", { afdianUserId: creator });
+  assert.deepEqual(
+    listed.items.map((item: { productId: string }) => item.productId),
+    products.map((product) => product.productId),
+  );
+  for (const [index, deviceId] of ["1".repeat(64), "2".repeat(64)].entries()) {
+    const requestId = "creator-activate-request-0" + index;
+    const issued = await ok("/api/account/activate", {
+      afdianUserId: creator,
+      productId: products[0].productId,
+      deviceId,
+      requestId,
+    });
+    assert.equal(
+      verifyLicense(issued.licenseToken, publicKey, products[0].productId, deviceId)?.licenseId,
+      issued.licenseId,
+    );
+    const again = await ok("/api/account/activate", {
+      afdianUserId: creator,
+      productId: products[0].productId,
+      deviceId,
+      requestId,
+    });
+    assert.equal(again.licenseToken, issued.licenseToken);
+    assert.equal(
+      (await ok("/api/activation/report", {
+        receiptToken: issued.receiptToken,
+        requestId,
+        deviceId,
+        licenseId: issued.licenseId,
+        result: "activated",
+      })).notification,
+      "sent",
+    );
+  }
+  assert.equal(queries, 0, "创作者不查爱发电订单");
+  assert.equal(messages.length, 0, "不给自己发私信");
+  assert.equal(
+    (await db.prepare("SELECT COUNT(*) AS n FROM outbox").first<{ n: number }>())?.n,
+    0,
+  );
+  // 合成记录不会混进普通买家的候选订单。
+  assert.deepEqual((await ok("/api/account/products", { afdianUserId: buyer })).items, []);
+});
+
 test("admin signing authenticates before orders and shares online device bindings", async (t) => {
   let queries = 0;
   const { db, env, worker, ok } = await fixture(t, (number) => { queries += 1; return orders[number]; });

@@ -168,10 +168,11 @@ const LOOKUP_PAYLOAD: &str = "lookup";
 const ACTIVATE_PAYLOAD: &str = "activate";
 /// 按账号查询的延迟启动载荷：读取宿主账号资料要弹授权、单项最多等 10 秒。
 const ACCOUNT_PAYLOAD: &str = "account";
-/// 账号查询的超时兜底载荷。宿主的绑定查询卡住时，界面不能永远锁在读取中。
-const ACCOUNT_TIMEOUT_PAYLOAD: &str = "account-timeout";
-/// 账号查询的等待上限：官方口径单项最多 10 秒，留出三倍余量给三个绑定项。
-const ACCOUNT_TIMEOUT_MS: u64 = 20_000;
+/// 账号查询的总等待上限。它必须在同一个异步任务内竞速，不能另排一个 timer
+/// 事件——宿主账号接口卡住时，后续事件也可能暂时进不来。
+const ACCOUNT_TIMEOUT: Duration = Duration::from_secs(20);
+/// 签发前读宿主安装标识的等待上限：它只用于限流，等不到就不带，别拖住激活。
+const HOST_ID_TIMEOUT: Duration = Duration::from_secs(3);
 
 async fn host_register_recv(addr: &str, package: &str) -> Result<(), String> {
     register::register_interconnect_recv(addr.to_string(), package.to_string()).await
@@ -1288,16 +1289,48 @@ fn queue_account_lookup() -> u32 {
     })
 }
 
-/// 账号查询超时收场：只有仍在进行的那一代才解锁，迟到的结果由代次挡掉。
-fn account_lookup_timed_out(generation: u32) -> bool {
-    STATE.with(|state| {
-        let mut s = state.borrow_mut();
-        if !s.verifying || s.account_gen != generation {
-            return false;
-        }
-        s.verifying = false;
-        true
+/// 宿主账号资料与安装标识共用一个截止时间；超时后丢弃 future，触发宿主调用取消。
+async fn account_lookup_with_timeout(generation: u32) {
+    account_lookup_with_timeout_after(generation, account_lookup_result(), ACCOUNT_TIMEOUT).await;
+}
+
+async fn account_lookup_with_timeout_after<F>(generation: u32, lookup: F, timeout: Duration)
+where
+    F: Future<Output = Result<Vec<Offer>, String>>,
+{
+    let result = account_lookup_with_deadline(lookup, timeout).await;
+    finish_account_lookup(generation, result);
+}
+
+/// 在同一个任务里让查询与截止时间竞速。
+///
+/// 不能靠另排一个 timer 事件兜底：宿主按插件串行投递事件，账号接口卡住时
+/// 排在后面的 timer 同样进不来，界面就会一直停在「正在读取 AstroBox 账号」。
+/// 宿主 timer 是唯一的定时来源，而它恰好被堵住，所以这里用让出执行权轮询
+/// 单调时钟：每轮 yield 都把控制权交回宿主，宿主那边的账号调用照常推进。
+async fn account_lookup_with_deadline<F>(lookup: F, timeout: Duration) -> Result<Vec<Offer>, String>
+where
+    F: Future<Output = Result<Vec<Offer>, String>>,
+{
+    with_deadline(lookup, timeout).await.unwrap_or_else(|| {
+        Err("读取 AstroBox 账号超时：请确认已授权并检查网络后重试，或改用订单号激活".into())
     })
+}
+
+/// 通用截止时间：到点仍未完成就返回 `None`。丢弃未完成的 future 时，
+/// wit-bindgen 会取消对应的宿主子任务。
+async fn with_deadline<F: Future>(work: F, timeout: Duration) -> Option<F::Output> {
+    let deadline = async move {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            wit_bindgen::yield_async().await;
+        }
+    };
+    futures_util::pin_mut!(work, deadline);
+    match futures_util::future::select(work, deadline).await {
+        futures_util::future::Either::Left((value, _)) => Some(value),
+        futures_util::future::Either::Right(_) => None,
+    }
 }
 
 /// 宿主安装标识：读一次缓存一次（同一份安装内不会变），失败不缓存、下次再试。
@@ -1312,8 +1345,14 @@ async fn host_install_id() -> Option<String> {
     value
 }
 
-async fn account_lookup(generation: u32) {
-    let result = match identity::afdian_user_id().await {
+/// 签发时带的安装标识：只用于服务端限流，拿不到就不带。宿主卡住时不能把
+/// 激活停在「签发许可证」，所以优先用缓存，并给宿主调用设一个短截止时间。
+async fn host_install_id_bounded(timeout: Duration) -> Option<String> {
+    with_deadline(host_install_id(), timeout).await.flatten()
+}
+
+async fn account_lookup_result() -> Result<Vec<Offer>, String> {
+    match identity::afdian_user_id().await {
         Ok(id) => {
             // 宿主安装标识只用于服务端限流，不参与权益判定；两处账号请求都带上。
             let mut body = json!({"afdianUserId": id});
@@ -1324,8 +1363,7 @@ async fn account_lookup(generation: u32) {
                 .and_then(|value| parse_account_products(&value, &id))
         }
         Err(error) => Err(error),
-    };
-    finish_account_lookup(generation, result);
+    }
 }
 
 fn finish_account_lookup(generation: u32, result: Result<Vec<Offer>, String>) {
@@ -1805,7 +1843,7 @@ async fn on_device_message(raw: &str) {
                     "deviceId": id,
                     "requestId": pending.id,
                 });
-                if let Some(host) = identity::host_device_id().await {
+                if let Some(host) = host_install_id_bounded(HOST_ID_TIMEOUT).await {
                     body["hostId"] = Value::String(host);
                 }
                 if let Some(model) = pending.device_model.clone() {
@@ -1905,17 +1943,9 @@ async fn dispatch_event(kind: EventType, payload: String) {
             } else if body == ACTIVATE_PAYLOAD {
                 STATE.with(|state| state.borrow_mut().activation_queued = false);
                 start_activation().await;
-            } else if let Some(generation) = body.strip_prefix("account-timeout:") {
-                // 宿主资料卡住：解锁界面并给出能照做的提示（超时不动已发出的请求）。
-                if generation
-                    .parse::<u32>()
-                    .is_ok_and(account_lookup_timed_out)
-                {
-                    show("读取 AstroBox 账号超时：请检查网络后重试，或改用订单号激活");
-                }
             } else if let Some(generation) = body.strip_prefix("account:") {
                 if let Ok(generation) = generation.parse::<u32>() {
-                    account_lookup(generation).await;
+                    account_lookup_with_timeout(generation).await;
                     if STATE.with(|state| state.borrow().handoff.is_some()) {
                         begin_scan().await;
                     }
@@ -2217,15 +2247,10 @@ impl event::Guest for Kovela {
         match dispatch_ui(&id, event, &payload) {
             UiFollow::Lookup => host_timeout(1, LOOKUP_PAYLOAD).await,
             UiFollow::Account => {
-                // 代次在点击时就已经发放（点击即锁界面），这里补排超时兜底：
-                // 宿主资料卡住时 20 秒后自动解锁并给出可操作的提示。
+                // 代次在点击时就已经发放（点击即锁界面）。超时兜底在查询任务内部
+                // 竞速完成（见 account_lookup_with_deadline），不再另排 timer：
+                // 宿主账号接口卡住时，排在后面的 timer 事件同样送不进来。
                 let generation = STATE.with(|state| state.borrow().account_gen);
-                render();
-                host_timeout(
-                    ACCOUNT_TIMEOUT_MS,
-                    &format!("{ACCOUNT_TIMEOUT_PAYLOAD}:{generation}"),
-                )
-                .await;
                 host_timeout(1, &format!("{ACCOUNT_PAYLOAD}:{generation}")).await;
             }
             UiFollow::ClearLive => live_clear_any().await,
@@ -2473,23 +2498,82 @@ mod tests {
         });
     }
 
+    /// 测试用的最小执行器：反复轮询直到完成（deadline 靠 yield 自唤醒推进）。
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(value) = Future::poll(future.as_mut(), &mut context) {
+                return value;
+            }
+        }
+    }
+
+    #[test]
+    fn account_lookup_deadline_unlocks_a_hung_host_call() {
+        // 宿主账号接口永远不返回：截止时间一到就收场，而不是把界面锁死。
+        let started = std::time::Instant::now();
+        let result = block_on(super::account_lookup_with_deadline(
+            std::future::pending(),
+            std::time::Duration::from_millis(30),
+        ));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+        let error = result.err().expect("hung lookup must time out");
+        assert!(error.contains("超时"), "{error}");
+
+        // 正常返回的结果原样透传，不等截止时间。
+        let started = std::time::Instant::now();
+        let result = block_on(super::account_lookup_with_deadline(
+            async { Err("账号服务暂时不可用".to_string()) },
+            std::time::Duration::from_secs(20),
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(result.err().as_deref(), Some("账号服务暂时不可用"));
+    }
+
+    #[test]
+    fn issuance_host_id_prefers_the_cache_and_never_blocks_activation() {
+        // 宿主调用卡住：截止时间一到就放弃，签发不带安装标识照常进行。
+        assert_eq!(
+            block_on(super::with_deadline(std::future::pending::<u8>(), std::time::Duration::from_millis(10))),
+            None,
+        );
+        // 账号查询时已缓存过：直接用缓存，不再碰宿主。
+        let host = format!("ab-install-{}", "1".repeat(32));
+        super::STATE.with(|state| {
+            *state.borrow_mut() = super::State { host_id: Some(host.clone()), ..Default::default() };
+        });
+        assert_eq!(
+            block_on(super::host_install_id_bounded(std::time::Duration::from_secs(3))),
+            Some(host),
+        );
+        // 没有缓存且宿主拿不到：不带标识。
+        super::STATE.with(|state| *state.borrow_mut() = super::State::default());
+        assert_eq!(block_on(super::host_install_id_bounded(std::time::Duration::from_secs(3))), None);
+    }
+
     #[test]
     fn account_lookup_timeout_unlocks_the_pending_attempt_and_drops_late_results() {
         super::STATE.with(|state| *state.borrow_mut() = super::State::default());
+        let stale = super::queue_account_lookup();
         let generation = super::queue_account_lookup();
+        // 上一代迟到的结果不影响这次尝试。
+        super::finish_account_lookup(stale, Err("旧结果".into()));
         assert!(super::STATE.with(|state| state.borrow().verifying));
-        // 上一代的超时不影响这次尝试。
-        assert!(!super::account_lookup_timed_out(generation.wrapping_sub(1)));
-        assert!(super::STATE.with(|state| state.borrow().verifying));
-        // 当前这一代超时：解锁，界面能再次操作。
-        assert!(super::account_lookup_timed_out(generation));
-        assert!(!super::STATE.with(|state| state.borrow().verifying));
-        // 超时之后迟到的结果直接丢掉，不覆盖界面。
+        // 当前这一代超时：解锁并给出能照做的提示。
+        block_on(super::account_lookup_with_timeout_after(
+            generation,
+            std::future::pending(),
+            std::time::Duration::from_millis(10),
+        ));
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            assert!(!s.verifying);
+            assert!(s.message.contains("超时"), "{}", s.message);
+        });
+        // 超时之后同一代的迟到结果直接丢掉，不覆盖界面。
         super::finish_account_lookup(generation, Err("账号服务暂时不可用".into()));
-        assert_eq!(
-            super::STATE.with(|state| state.borrow().message.clone()),
-            "正在读取 AstroBox 账号…（首次会请求授权）"
-        );
+        assert!(super::STATE.with(|state| state.borrow().message.contains("超时")));
         let next = super::queue_account_lookup();
         super::finish_account_lookup(next, Err("账号服务暂时不可用".into()));
         super::STATE.with(|state| {
