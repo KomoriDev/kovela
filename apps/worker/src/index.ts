@@ -77,6 +77,8 @@ const productIdPattern = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
 // 用户的实际节奏是查询后几秒内点激活；把窗口放长只会让「签发」白等一次
 // 外呼，放短则等于每次激活都重新核对一遍。
 const VERIFIED_SESSION_SECONDS = 120;
+// 创作者自用的合成订单号前缀；真实爱发电订单号只有数字，不会撞上。
+const CREATOR_ORDER_PREFIX = "creator:";
 function oneLine(value: string, maximum = 80) {
   return value
     .replace(/[\u0000-\u001f]/g, " ")
@@ -430,6 +432,37 @@ export function createWorker(
     }
     return null;
   }
+  // 创作者自用：爱发电不允许创作者购买或兑换自己的商品，所以创作者账号
+  // （AFDIAN_USER_ID）走账号激活时不查订单，直接放行全部可激活应用。
+  //
+  // 注意：账号路由只信任插件递上来的 afdianUserId，不认证 HTTP 调用者，而创作者
+  // ID 是公开的——任何人伪造这个 ID 都能走到这里。这是创作者明确接受的取舍。
+  function isCreator(env: Env, afdianUserId: string) {
+    return /^[a-f0-9]{32}$/i.test(env.AFDIAN_USER_ID ?? "") &&
+      env.AFDIAN_USER_ID.toLowerCase() === afdianUserId;
+  }
+  // 创作者每台设备一条合成购买记录（payment_status=0，账号/西瓜候选查询都只认 2，
+  // 不会被当成真实订单拿去问爱发电），每个应用一条授权，复用正常的绑定与回执路径。
+  async function creatorEntitlement(
+    env: Env,
+    afdianUserId: string,
+    product: ProductConfig,
+    deviceId: string,
+  ): Promise<Entitlement | null> {
+    const orderNo = CREATOR_ORDER_PREFIX + deviceId;
+    const time = now();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT OR IGNORE INTO purchases(order_no,buyer_id,plan_id,payment_status,updated_at) VALUES(?,?,?,0,?)",
+      ).bind(orderNo, afdianUserId, product.planIds[0] ?? "creator", time),
+      env.DB.prepare(
+        "INSERT OR IGNORE INTO entitlements(license_id,order_no,product_id,product_name,updated_at) VALUES(?,?,?,?,?)",
+      ).bind(crypto.randomUUID(), orderNo, product.productId, product.productName, time),
+    ]);
+    return env.DB.prepare("SELECT * FROM entitlements WHERE order_no=? AND product_id=?")
+      .bind(orderNo, product.productId)
+      .first<Entitlement>();
+  }
   async function receiptFor(
     env: Env,
     handoffHash: string,
@@ -654,6 +687,7 @@ export function createWorker(
         throw new HttpError(503, "NOT_CONFIGURED", "购买验证服务尚未配置完成。");
       await limit(env, "skin:" + (await digest(ip)), 20, 60);
       await limit(env, "skin-buyer:" + (await digest(afdianUserId)), 20, 60);
+      if (isCreator(env, afdianUserId)) return { productId: product.productId, afdianUserId, entitled: true };
       const candidates = await env.DB.prepare(
         "SELECT p.order_no FROM purchases p JOIN entitlements e ON e.order_no=p.order_no WHERE lower(p.buyer_id)=? AND e.product_id=? AND p.payment_status=2 ORDER BY p.updated_at DESC",
       ).bind(afdianUserId, product.productId).all<{ order_no: string }>();
@@ -811,6 +845,13 @@ export function createWorker(
           ? body.hostId
           : "";
       if (hostId) await limit(env, "account-host:" + (await digest(hostId)), 40, 600);
+      if (isCreator(env, afdianUserId))
+        return {
+          afdianUserId,
+          items: products
+            .filter((product) => product.planIds.length && product.productId !== "com.komoridev.watermelon")
+            .map(({ productId, productName }) => ({ productId, productName, boundDeviceId: null })),
+        };
       const items = [];
       for (const product of products) {
         if (!product.planIds.length || product.productId === "com.komoridev.watermelon")
@@ -846,7 +887,9 @@ export function createWorker(
           : "";
       if (hostId) await limit(env, "account-host:" + (await digest(hostId)), 40, 600);
       const product = availableProduct(products, productId);
-      const order = await accountOrder(env, api, afdianUserId, product, deviceId);
+      const order = isCreator(env, afdianUserId)
+        ? await creatorEntitlement(env, afdianUserId, product, deviceId)
+        : await accountOrder(env, api, afdianUserId, product, deviceId);
       if (!order)
         throw new HttpError(
           404,
@@ -1014,6 +1057,13 @@ export function createWorker(
         .first<Entitlement>();
       if (!order)
         throw new HttpError(401, "INVALID_RECEIPT", "激活回执与授权不匹配。");
+      // 创作者自用：只更新状态，不给自己发爱发电私信（发不出去会一直重试）。
+      if (order.order_no.startsWith(CREATOR_ORDER_PREFIX)) {
+        await env.DB.prepare(
+          "UPDATE entitlements SET state=CASE WHEN state='activated' THEN state ELSE ? END,updated_at=? WHERE license_id=?",
+        ).bind(result, now(), licenseId).run();
+        return { notification: "sent" };
+      }
       const content = activationNotice({
         result,
         productName: order.product_name,
