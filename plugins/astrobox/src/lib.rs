@@ -27,6 +27,7 @@ mod icons;
 mod offline;
 mod identity;
 mod notify;
+mod net;
 
 /// 取许可证走哪条路：订单号查询得到的 handoff 凭证，或 AstroBox 账号里绑定的
 /// 爱发电账号。两条路只在「签发」那一次请求上分叉，写入设备与回执完全一样。
@@ -141,6 +142,8 @@ struct State {
     service_status: ServiceStatus,
     service_reason: String,
     service_check_started: bool,
+    /// 后台服务检查是否在跑：同一时刻只跑一个。
+    service_probe_running: bool,
     service_reason_visible: bool,
     status_clicks: u8,
     last_status_click: Option<Instant>,
@@ -1005,27 +1008,42 @@ async fn scan_tick(id: &str) {
     }
 }
 
-fn post<T: serde::de::DeserializeOwned>(
+/// 业务请求的超时：连接 12 秒，整次请求（含读完响应）20 秒。
+const POST_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+const POST_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+/// 服务检查的超时：它只决定状态徽标，给得更短。
+const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn post<T: serde::de::DeserializeOwned>(
     origin: &str,
     path: &str,
     body: Value,
 ) -> Result<T, String> {
-    let response = waki::Client::new()
-        .post(&format!("{origin}{path}"))
-        .header("Content-Type", "application/json")
-        .connect_timeout(Duration::from_secs(12))
-        .body(serde_json::to_vec(&body).map_err(|_| "请求发送失败")?)
-        .send()
-        .map_err(|_| {
-            let reason = "无法连接服务器，请检查网络后重试".to_string();
+    let body = serde_json::to_vec(&body).map_err(|_| "请求发送失败")?;
+    let reply = net::send(
+        waki::Method::Post,
+        origin,
+        path,
+        Some(&body),
+        POST_CONNECT_TIMEOUT,
+        POST_TOTAL_TIMEOUT,
+    )
+    .await;
+    let (status, result) = match reply {
+        Ok(reply) => (reply.status, parse_response(reply.status, &reply.body)),
+        Err(net::NetError::Body) => return Err("服务器响应不完整，请重试".into()),
+        Err(error) => {
+            let reason = if error == net::NetError::Timeout {
+                "服务器响应超时，请检查网络后重试"
+            } else {
+                "无法连接服务器，请检查网络后重试"
+            }
+            .to_string();
             update_service(Err(reason.clone()));
-            reason
-        })?;
-    let status = response.status_code();
-    let result = response
-        .body()
-        .map_err(|_| "服务器响应不完整，请重试".to_string())
-        .and_then(|bytes| parse_response(status, &bytes));
+            return Err(reason);
+        }
+    };
     match &result {
         Ok(_) => {
             update_service(Ok(()));
@@ -1062,15 +1080,22 @@ struct ServiceConfig {
     verification_enabled: bool,
 }
 
-fn check_service() -> Result<(), String> {
-    let response = waki::Client::new()
-        .get(&format!("{}/api/config", server_origin()))
-        .connect_timeout(Duration::from_secs(8))
-        .send()
-        .map_err(|_| "无法连接服务，请检查网络".to_string())?;
-    let status = response.status_code();
-    let bytes = response.body().map_err(|_| "服务响应不完整".to_string())?;
-    parse_service_config(status, &bytes)
+async fn check_service() -> Result<(), String> {
+    let reply = net::send(
+        waki::Method::Get,
+        server_origin(),
+        "/api/config",
+        None,
+        PROBE_CONNECT_TIMEOUT,
+        PROBE_TOTAL_TIMEOUT,
+    )
+    .await
+    .map_err(|error| match error {
+        net::NetError::Connect => "无法连接服务，请检查网络",
+        net::NetError::Timeout => "服务响应超时，请检查网络",
+        net::NetError::Body => "服务响应不完整",
+    })?;
+    parse_service_config(reply.status, &reply.body)
 }
 
 fn parse_service_config(status: u16, bytes: &[u8]) -> Result<(), String> {
@@ -1137,11 +1162,27 @@ fn status_shortcut(now: Instant) -> bool {
     })
 }
 
+/// 服务检查只更新状态徽标，不能占住事件：交给后台任务跑，事件处理立即返回，
+/// 检查期间「查询订单」「用 AstroBox 账号激活」照常响应。`reschedule` 只在
+/// 定时链路上为真，手动触发（回到在线模式）不再另起一条每分钟的检查链。
+fn spawn_probe(reschedule: bool) {
+    if reschedule {
+        // 先排下一轮：本轮无论多慢、成败，每分钟复查都不会断。
+        let _ = timer::set_timeout(SERVICE_CHECK_DELAY_MS, SERVICE_CHECK_PAYLOAD);
+    }
+    if STATE.with(|state| std::mem::replace(&mut state.borrow_mut().service_probe_running, true)) {
+        return;
+    }
+    wit_bindgen::spawn(async {
+        probe_service().await;
+        STATE.with(|state| state.borrow_mut().service_probe_running = false);
+    });
+}
+
 async fn probe_service() {
-    if should_probe_service() && update_service(check_service()) {
+    if should_probe_service() && update_service(check_service().await) {
         render();
     }
-    host_timeout(SERVICE_CHECK_DELAY_MS, SERVICE_CHECK_PAYLOAD).await;
 }
 
 fn should_probe_service() -> bool {
@@ -1210,7 +1251,7 @@ fn queue_lookup() {
         }),
     }
 }
-fn finish_lookup() {
+async fn finish_lookup() {
     let order = STATE.with(|state| {
         let state = state.borrow();
         if state.verifying {
@@ -1227,7 +1268,9 @@ fn finish_lookup() {
         server_origin(),
         "/api/orders/lookup",
         json!({"orderNo": order}),
-    ) {
+    )
+    .await
+    {
         Ok(value) => match parse_offers(&value) {
             Ok(mut offers) => {
                 offers.retain(|offer| offer.product_id != "com.komoridev.watermelon");
@@ -1360,6 +1403,7 @@ async fn account_lookup_result() -> Result<Vec<Offer>, String> {
                 body["hostId"] = Value::String(host);
             }
             post::<Value>(server_origin(), "/api/account/products", body)
+                .await
                 .and_then(|value| parse_account_products(&value, &id))
         }
         Err(error) => Err(error),
@@ -1702,7 +1746,8 @@ async fn report(pending: Pending) {
             }
             payload
         },
-    );
+    )
+    .await;
     match result {
         Ok(value)
             if matches!(
@@ -1835,7 +1880,8 @@ async fn on_device_message(raw: &str) {
                 &handoff.server_origin,
                 "/api/activate",
                 json!({"handoffToken":handoff_token,"productId":handoff.product_id,"deviceId":id,"requestId":pending.id}),
-            ),
+            )
+            .await,
             Route::Account { afdian_user_id } => {
                 let mut body = json!({
                     "afdianUserId": afdian_user_id,
@@ -1849,7 +1895,7 @@ async fn on_device_message(raw: &str) {
                 if let Some(model) = pending.device_model.clone() {
                     body["deviceModel"] = Value::String(model);
                 }
-                post::<Issued>(&handoff.server_origin, "/api/account/activate", body)
+                post::<Issued>(&handoff.server_origin, "/api/account/activate", body).await
             }
         };
         match issuance {
@@ -1936,7 +1982,7 @@ async fn dispatch_event(kind: EventType, payload: String) {
             if body == LOOKUP_PAYLOAD {
                 // 查询结果决定下一步：商品由订单号带出来，顺手把设备列表也
                 // 读出来，下一步就能直接点激活。
-                finish_lookup();
+                finish_lookup().await;
                 if STATE.with(|state| state.borrow().handoff.is_some()) {
                     begin_scan().await;
                 }
@@ -1951,7 +1997,7 @@ async fn dispatch_event(kind: EventType, payload: String) {
                     }
                 }
             } else if body == SERVICE_CHECK_PAYLOAD {
-                probe_service().await;
+                spawn_probe(true);
             } else if let Some(id) = body.strip_prefix("tick:") {
                 match hello_tick(id) {
                 Some(Some((addr, package))) => {
@@ -2264,7 +2310,7 @@ impl event::Guest for Kovela {
             // 打开手环应用与握手都是主机调用（一到数秒），先让宿主画完
             // 「连接设备」再执行。
             UiFollow::Activate => host_timeout(1, ACTIVATE_PAYLOAD).await,
-            UiFollow::Probe => probe_service().await,
+            UiFollow::Probe => spawn_probe(false),
             UiFollow::OfflineCopy => copy_offline_request().await,
             UiFollow::OfflinePaste => paste_offline_license().await,
             UiFollow::OfflineFile => load_offline_license().await,
