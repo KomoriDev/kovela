@@ -44,6 +44,8 @@ export function createActivation(
   // 补发的 hello 回执让到写盘回调之后（写回调丢失时插件下一轮重发仍能
   // 直接回执，不会永久搁置）。
   let writeInFlight = false;
+  // 残留旧授权串的「本地授权无效」提示是否已上屏（见 adoptToken）。
+  let staleNotified = false;
 
   function snapshot() {
     return {
@@ -97,20 +99,24 @@ export function createActivation(
     }
   }
   // 授权判定为无效时清掉所有缓存，让后续启动给出一致的未激活结论。
+  // 旧授权串键也必须清：只清 v2 与指纹缓存的话，下次读链会再次落到
+  // 「有旧授权串、无指纹」，错误每次重进、每次重试都重新出现，永远消不掉。
   function clearLicenseCaches() {
-    writeLicenseRecord("", "", "", clearLegacyDeviceCache);
-  }
-  function clearLegacyDeviceCache() {
-    try {
-      storage.set({
-        key: LEGACY_DEVICE_KEY,
-        value: "",
-        success: function () {},
-        fail: function () {},
+    writeLicenseRecord("", "", "", function () {
+      clearKey(LEGACY_TOKEN_KEY, function () {
+        clearKey(LEGACY_DEVICE_KEY, null);
       });
+    });
+  }
+  function clearKey(key, done) {
+    const next = function () {
+      if (typeof done === "function") done();
+    };
+    try {
+      storage.set({ key: key, value: "", success: next, fail: next });
     } catch (failure) {
-      // 清不掉也只是下次启动多判一次无效。
-      return;
+      // 清不掉也只是下次启动再静默清一次（见 adoptToken）。
+      next();
     }
   }
 
@@ -250,8 +256,12 @@ export function createActivation(
       }
       if (!cachedDevice) {
         // 有授权串但缺配对指纹（更早版本只写授权串）：本地无法确认，
-        // 重新激活一次即可补全，激活会重写配对记录。
-        error = "本地授权无效，请通过 AstroBox 重新激活";
+        // 重新激活一次即可补全，激活会重写配对记录。提示每个实例只上屏
+        // 一次：清理写盘还没落地时重试会再读到同一份残留，那时静默收场。
+        if (!staleNotified) {
+          staleNotified = true;
+          error = "本地授权无效，请通过 AstroBox 重新激活";
+        }
         clearLicenseCaches();
         conclude(null, "");
         return;
@@ -474,42 +484,43 @@ export function createActivation(
       error = "";
       publish();
       const generation = epoch;
-      try {
-        storage.set({
-          key: LEGACY_TOKEN_KEY,
-          value: value.licenseToken,
-          success() {
-            if (generation !== epoch) return;
-            saving = false;
-            activated = true;
-            linking = false;
-            licenseId = value.licenseId;
-            publish();
-            // 回执先发，不让记录写入拖住插件的重发轮次；v2 记录随后
-            // 串行补写（此时的 deviceId 就是刚通过配对判定的真实指纹）。
-            send(Object.assign(result, { success: true }), true);
-            writeLicenseRecord(
-              value.licenseToken,
-              deviceId,
-              value.licenseId,
-              null,
-            );
-          },
-          fail() {
-            if (generation !== epoch) return;
-            saving = false;
-            linking = false;
-            error = "授权未能保存，请重试";
-            publish();
-            send(Object.assign(result, { error: "STORAGE_FAILED" }), true);
-          },
-        });
-      } catch (failure) {
+      // 一次写入完整的 v2 记录（授权串 + 刚通过配对判定的真实指纹）。以前
+      // 先写裸授权串到旧键、再补写 v2：两次写之间应用被杀或手环重启，就
+      // 会留下「有授权串、无指纹」的残留，之后每次启动都报本地授权无效。
+      writeInFlight = true;
+      const saved = function () {
+        writeInFlight = false;
+        if (generation !== epoch) return;
+        saving = false;
+        activated = true;
+        linking = false;
+        licenseId = value.licenseId;
+        publish();
+        send(Object.assign(result, { success: true }), true);
+        answerWaitingHello();
+      };
+      const failed = function () {
+        writeInFlight = false;
+        if (generation !== epoch) return;
         saving = false;
         linking = false;
         error = "授权未能保存，请重试";
         publish();
         send(Object.assign(result, { error: "STORAGE_FAILED" }), true);
+      };
+      try {
+        storage.set({
+          key: LICENSE_KEY,
+          value: JSON.stringify({
+            token: value.licenseToken,
+            device: deviceId,
+            licenseId: value.licenseId,
+          }),
+          success: saved,
+          fail: failed,
+        });
+      } catch (failure) {
+        failed();
       }
     } catch (failure) {
       // Unrecognized transport payloads are not activation commands.

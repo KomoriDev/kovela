@@ -275,6 +275,24 @@ test("只有旧授权串没有配对指纹：提示重新激活", () => {
   assert.equal(env.pending.id.length, 0);
 });
 
+test("残留旧授权串的错误不会粘住：清理覆盖旧键，重试与重进都会消失", () => {
+  const token = mint(deviceFingerprint(RAW_DEVICE, PRODUCT));
+  const { env, activation, latest } = start({ token });
+  env.serveStorage();
+  assert.match(latest().error, /重新激活/);
+  env.serveSets();
+  assert.equal(env.sets(LEGACY_TOKEN_KEY).at(-1).value, "", "旧授权串键也被清空");
+  assert.equal(env.sets(LEGACY_DEVICE_KEY).at(-1).value, "");
+
+  // 测试存储不回放写入：重读仍会碰到同一份残留，相当于清理还没落地。
+  // 重试（激活页 onShow / 重试按钮）后错误也必须消失。
+  activation.retry();
+  env.serveStorage();
+  assert.equal(latest().ready, true);
+  assert.equal(latest().activated, false);
+  assert.equal(latest().error, "", "清理尚未落地时也只提示一次，不再反复上屏");
+});
+
 test("hello 时按需读取设备标识，读到后再回执", () => {
   const { env, activation, latest } = start({ token: "" });
   env.serveStorage();
@@ -351,10 +369,11 @@ test("安装包在指纹未就绪时回 NOT_READY，就绪后重发即可激活"
     },
   });
   assert.equal(env.pending.set.length, 1, "就绪后同一安装包直接解读落盘");
-  assert.equal(env.pending.set[0].key, LEGACY_TOKEN_KEY);
+  assert.equal(env.pending.set[0].key, LICENSE_KEY, "一次写完整 v2 记录");
   env.pending.set.shift().success();
   assert.equal(latest().activated, true);
-  assert.equal(env.sets().length, 1, "回执后链式补写 v2 记录");
+  assert.equal(env.sets(LEGACY_TOKEN_KEY).length, 0, "不再写旧授权串键，免得中途中断留下残留");
+  assert.equal(env.sets().length, 1);
   assert.deepEqual(JSON.parse(env.sets()[0].value), {
     token: licenseToken,
     device: deviceFingerprint(RAW_DEVICE, PRODUCT),
