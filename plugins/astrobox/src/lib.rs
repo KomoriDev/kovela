@@ -133,6 +133,9 @@ struct State {
     service_reason_visible: bool,
     status_clicks: u8,
     last_status_click: Option<Instant>,
+    /// 重发轮次里被吞掉的宿主错误原文（补注册 / 重发失败不立即报错，
+    /// 但等到超时收场时要带上，否则用户只看到「超时」猜不出原因）。
+    host_error: Option<String>,
 }
 
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
@@ -169,6 +172,31 @@ async fn host_register_recv(addr: &str, package: &str) -> Result<(), String> {
 async fn host_send(addr: &str, package: &str, data: &str) -> Result<(), String> {
     interconnect::send_qaic_message(addr.to_string(), package.to_string(), data.to_string()).await
 }
+/// 宿主错误原文附在提示后面的最大字数：卡片放得下，截图反馈也够定位。
+const HOST_ERROR_LIMIT: usize = 80;
+
+/// v4 宿主接口返回 `result<_, string>`：把原文压成一行、截断后附在面向
+/// 用户的提示后面。原文为空时只给提示本身。
+fn with_detail(message: &str, detail: Option<&str>) -> String {
+    let detail = detail.unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ");
+    if detail.is_empty() {
+        return message.to_string();
+    }
+    let mut short: String = detail.chars().take(HOST_ERROR_LIMIT).collect();
+    if detail.chars().count() > HOST_ERROR_LIMIT {
+        short.push('…');
+    }
+    format!("{message}（详情：{short}）")
+}
+/// 记下本轮被吞掉的宿主错误：多个结果里取第一个失败，全部成功则清空。
+fn remember_host_error(results: &[&Result<(), String>]) {
+    let error = results.iter().find_map(|result| result.as_ref().err().cloned());
+    STATE.with(|state| state.borrow_mut().host_error = error);
+}
+fn host_error() -> Option<String> {
+    STATE.with(|state| state.borrow().host_error.clone())
+}
+
 async fn host_timeout(delay_ms: u64, payload: &str) {
     let _ = timer::set_timeout(delay_ms, payload);
 }
@@ -1447,17 +1475,16 @@ async fn send_install(pending: Pending) {
     }
     render();
     let data=json!({"v":1,"id":pending.id,"type":"install-license","licenseId":issued.license_id,"licenseToken":issued.license_token}).to_string();
-    if host_send(&pending.addr, &issued.product_id, &data)
-        .await
-        .is_err()
-    {
-        fail("传输失败，请打开手环应用并保持连接后重试");
+    if let Err(error) = host_send(&pending.addr, &issued.product_id, &data).await {
+        fail(with_detail("传输失败，请打开手环应用并保持连接后重试", Some(&error)));
         return;
     }
     // 宿主对快应用回包的路由可能只认最近一次注册（Daymatter 每次发送前都
     // 重新注册；回执是 install-license 之后的第二条入站消息），发送完补注
     // 册一次再等回执，手环端回执才不会因无路由被传输层拒收（202）。
-    let _ = host_register_recv(&pending.addr, &issued.product_id).await;
+    // 补注册失败不立即报错（重发轮次会再注册），但记下来，超时收场时带上。
+    let registered = host_register_recv(&pending.addr, &issued.product_id).await;
+    remember_host_error(&[&registered]);
     // 短窗口重发：手环收到重发的安装包且已激活时会同步立即回执——
     // "紧跟下行消息的发送"是实测唯一可靠的回执时机。
     host_timeout(12_000, &format!("install:{}", pending.id)).await;
@@ -1522,6 +1549,7 @@ async fn start_activation() {
             install_retries: 0,
         });
         s.message = "正在获取设备信息…".into();
+        s.host_error = None;
         Some((product_id, product_name, addr, id))
     });
     let Some((product_id, product_name, addr, id)) = selection else {
@@ -1534,19 +1562,16 @@ async fn start_activation() {
         fail(error);
         return;
     }
-    if host_register_recv(&addr, &product_id)
-        .await
-        .is_err()
-    {
-        fail("无法接收设备消息，请授予权限后重试");
+    if let Err(error) = host_register_recv(&addr, &product_id).await {
+        fail(with_detail("无法接收设备消息，请授予权限后重试", Some(&error)));
         return;
     }
     let message = json!({"v":1,"id":id,"type":"hello"}).to_string();
-    if host_send(&addr, &product_id, &message)
-        .await
-        .is_err()
-    {
-        fail(format!("无法连接{}，请在手环上打开应用", product_name));
+    if let Err(error) = host_send(&addr, &product_id, &message).await {
+        fail(with_detail(
+            &format!("无法连接{}，请在手环上打开应用", product_name),
+            Some(&error),
+        ));
         return;
     }
     host_timeout(2_000, &format!("tick:{id}")).await;
@@ -1848,14 +1873,16 @@ async fn dispatch_event(kind: EventType, payload: String) {
                 Some(Some((addr, package))) => {
                     // 每次重发 hello 前补注册：宿主对回包的路由若只认最近
                     // 一次注册，前一条回复会把路由消耗掉。
-                    let _ = host_register_recv(&addr, &package).await;
+                    let registered = host_register_recv(&addr, &package).await;
                     let message = json!({"v":1,"id":id,"type":"hello"}).to_string();
-                    let _ = host_send(&addr, &package, &message).await;
+                    let sent = host_send(&addr, &package, &message).await;
+                    remember_host_error(&[&registered, &sent]);
                     host_timeout(2_000, &format!("tick:{id}")).await;
                 }
-                    Some(None) => {
-                        fail("连接超时，请在手环应用里点重试，或重新打开应用后再试")
-                    }
+                    Some(None) => fail(with_detail(
+                        "连接超时，请在手环应用里点重试，或重新打开应用后再试",
+                        host_error().as_deref(),
+                    )),
                     None => {}
                 }
             } else if let Some(id) = body.strip_prefix("scan:") {
@@ -1884,7 +1911,10 @@ async fn dispatch_event(kind: EventType, payload: String) {
                     })
                 });
                 if waiting {
-                    fail("等待设备响应超时，请保持应用打开后重试，本次尚未激活成功",);
+                    fail(with_detail(
+                        "等待设备响应超时，请保持应用打开后重试，本次尚未激活成功",
+                        host_error().as_deref(),
+                    ));
                 }
             }
         }
@@ -2161,6 +2191,33 @@ mod tests {
     #[test]
     fn rejects_a_lookup_without_products() {
         assert!(parse_offers(&json!({"items":[]})).is_err());
+    }
+
+    #[test]
+    fn host_error_text_is_appended_on_one_short_line() {
+        assert_eq!(super::with_detail("传输失败", None), "传输失败");
+        assert_eq!(super::with_detail("传输失败", Some("  \n ")), "传输失败");
+        assert_eq!(
+            super::with_detail("传输失败", Some("device\n  not found")),
+            "传输失败（详情：device not found）"
+        );
+        let long = "错".repeat(super::HOST_ERROR_LIMIT + 5);
+        let text = super::with_detail("传输失败", Some(&long));
+        assert!(text.ends_with(&format!("{}…）", "错".repeat(super::HOST_ERROR_LIMIT))));
+    }
+
+    #[test]
+    fn swallowed_host_errors_keep_the_first_failure_until_a_clean_round() {
+        super::STATE.with(|state| *state.borrow_mut() = super::State::default());
+        let ok: Result<(), String> = Ok(());
+        let no_route: Result<(), String> = Err("no route".into());
+        let timeout: Result<(), String> = Err("timeout".into());
+        super::remember_host_error(&[&no_route, &timeout]);
+        assert_eq!(super::host_error().as_deref(), Some("no route"));
+        super::remember_host_error(&[&ok, &timeout]);
+        assert_eq!(super::host_error().as_deref(), Some("timeout"));
+        super::remember_host_error(&[&ok, &ok]);
+        assert_eq!(super::host_error(), None);
     }
 
     #[test]

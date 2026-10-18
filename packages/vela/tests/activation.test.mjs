@@ -73,9 +73,15 @@ function environment({ token = "", cachedDevice = "", record = null } = {}) {
     },
     send(options) {
       sent.push(options.data);
+      if (sendFailure) {
+        options.fail(...sendFailure);
+        return;
+      }
       options.success();
     },
   };
+  // 非空时每次发送都以这组参数走 fail(data, code)。
+  let sendFailure = null;
   let outstandingGets = 0;
   let instances = 0;
   const env = {
@@ -87,6 +93,9 @@ function environment({ token = "", cachedDevice = "", record = null } = {}) {
     readyStateCalls: () => readyStateCalls,
     setProbeStatus(status) {
       probeStatus = status;
+    },
+    failSend(...args) {
+      sendFailure = args.length ? args : null;
     },
     ports: {
       device: {
@@ -338,6 +347,45 @@ test("设备标识读取失败不回执，错误上屏且允许下次再试", ()
   assert.equal(env.sent.length, 1, "读到指纹后正常回执");
 });
 
+test("回执发送失败时上屏固件错误码与原文，链路恢复后提示自动撤掉", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { env, activation, latest } = start({ token: "" });
+  env.serveStorage();
+  activation.retry();
+  env.serveStorage();
+  env.failSend("CONNECT_TIMEOUT", 204);
+  env.connection.onmessage({ data: { v: 1, id: HELLO_ID, type: "hello" } });
+  env.pending.id.shift().success({ deviceId: RAW_DEVICE });
+  for (let i = 0; i < 3; i += 1) t.mock.timers.tick(300);
+  assert.equal(env.sent.length, 4, "首发加 3 次快重试");
+  const failed = latest();
+  assert.equal(failed.connected, false);
+  assert.equal(
+    failed.error,
+    "回执发送失败（204 连接超时：CONNECT_TIMEOUT），请保持 AstroBox 在前台、手环靠近手机后重试",
+  );
+
+  env.failSend();
+  env.connection.onmessage({ data: { v: 1, id: HELLO_ID, type: "hello" } });
+  assert.equal(latest().connected, true);
+  assert.equal(latest().error, "", "下一次发送成功即撤掉发送失败提示");
+});
+
+test("发送失败文本兼容官方示例的 {data, code} 形态与异常对象", async () => {
+  const { sendFailureText } = await import("../src/index.js");
+  assert.equal(
+    sendFailureText({ data: "link lost", code: 1006 }),
+    "回执发送失败（1006 连接断开：link lost），请重新连接手环后在 AstroBox 重试",
+  );
+  assert.equal(
+    sendFailureText(new Error("boom")),
+    "回执发送失败（boom），请在 AstroBox 重试",
+  );
+  assert.equal(sendFailureText(undefined, 999), "回执发送失败（999），请在 AstroBox 重试");
+  assert.equal(sendFailureText(), "回执发送失败，请在 AstroBox 重试");
+  assert.match(sendFailureText("x".repeat(100), 204), /x{40}…）/, "原文截断，手环屏幕放得下");
+});
+
 test("安装包在指纹未就绪时回 NOT_READY，就绪后重发即可激活", () => {
   const { env, activation, latest } = start({ token: "" });
   env.serveStorage();
@@ -486,6 +534,56 @@ test("同一许可证的重复安装包直接回执，不重写存储", () => {
   assert.equal(env.sets().length, 0, "已激活且编号一致，不写盘");
   const receipt = env.sent[env.sent.length - 1];
   assert.equal(receipt.success, true);
+});
+
+test("本机已激活时回执发送失败不上屏：手环已激活，插件会重发安装包补回执", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const fingerprint = deviceFingerprint(RAW_DEVICE, PRODUCT);
+  const token = mint(fingerprint);
+  const licenseId = "license-0000000001";
+  const { env, activation, latest } = start({
+    record: { token, device: fingerprint, licenseId },
+  });
+  env.serveStorage();
+  activation.retry();
+  env.failSend({ data: "CONNECT_TIMEOUT", code: 204 });
+  env.connection.onmessage({
+    data: { v: 1, id: HELLO_ID, type: "install-license", licenseId, licenseToken: token },
+  });
+  for (let i = 0; i < 3; i += 1) t.mock.timers.tick(300);
+  assert.equal(env.sent.length, 4, "重复安装包的同步回执：首发加 3 次快重试");
+  assert.equal(latest().activated, true);
+  assert.equal(latest().error, "", "已激活的屏幕上不挂回执失败");
+});
+
+test("旧重试链迟到的失败不覆盖更晚一次成功的发送", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { env, activation, latest } = start({ token: "" });
+  env.serveStorage();
+  activation.retry();
+  env.serveStorage();
+  env.connection.onmessage({ data: { v: 1, id: HELLO_ID, type: "hello" } });
+  env.failSend({ data: "CONNECT_TIMEOUT", code: 204 });
+  env.pending.id.shift().success({ deviceId: RAW_DEVICE });
+  // 旧回复还在重试中，插件重发的 hello 得到一次成功的回复。
+  env.failSend();
+  env.connection.onmessage({ data: { v: 1, id: HELLO_ID, type: "hello" } });
+  env.failSend({ data: "CONNECT_TIMEOUT", code: 204 });
+  for (let i = 0; i < 3; i += 1) t.mock.timers.tick(300);
+  assert.equal(latest().error, "", "更新的发送已送达，旧链失败不再上屏");
+});
+
+test("固件只给 {data, code} 一个参数时也能显示错误码", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { env, activation, latest } = start({ token: "" });
+  env.serveStorage();
+  activation.retry();
+  env.serveStorage();
+  env.failSend({ data: "CONNECT_TIMEOUT", code: 204 });
+  env.connection.onmessage({ data: { v: 1, id: HELLO_ID, type: "hello" } });
+  env.pending.id.shift().success({ deviceId: RAW_DEVICE });
+  for (let i = 0; i < 3; i += 1) t.mock.timers.tick(300);
+  assert.match(latest().error, /^回执发送失败（204 连接超时：CONNECT_TIMEOUT）/);
 });
 
 test("应用启动不碰 interconnect，激活页重试时才连接", () => {

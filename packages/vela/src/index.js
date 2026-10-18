@@ -1,5 +1,50 @@
 import { decodeLicense, deviceFingerprint } from "@kovela/license";
 
+// connect.send 的 fail 只有两个文档码（iot.mi.com/vela/quickapp
+// features/network/interconnect）：204 链接超时、1006 连接断开。202 是通用
+// 参数错误，实测在手机端没有接收路由时也会出现。
+const SEND_FAILURES = {
+  202: { label: "被拒收", hint: "请在 AstroBox 重试" },
+  204: {
+    label: "连接超时",
+    hint: "请保持 AstroBox 在前台、手环靠近手机后重试",
+  },
+  1006: { label: "连接断开", hint: "请重新连接手环后在 AstroBox 重试" },
+};
+const SEND_DETAIL_LIMIT = 40;
+
+// 固件 fail 回调的第一个参数按文档是错误信息字符串，官方示例却当成
+// {data, code} 来读；异常路径拿到的是 Error。三种形态都取出原文。
+function failureMessage(value) {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return "";
+  if (typeof value.data === "string") return value.data;
+  if (typeof value.message === "string") return value.message;
+  return "";
+}
+
+export function sendFailureText(data, code) {
+  if (code === undefined && data && typeof data === "object") {
+    code = data.code;
+  }
+  const known = SEND_FAILURES[code];
+  let detail = failureMessage(data).replace(/\s+/g, " ").trim();
+  if (detail.length > SEND_DETAIL_LIMIT) {
+    detail = detail.slice(0, SEND_DETAIL_LIMIT) + "…";
+  }
+  const parts = [];
+  if (code !== undefined && code !== null && code !== "") {
+    parts.push(known ? code + " " + known.label : String(code));
+  }
+  if (detail) parts.push(detail);
+  return (
+    "回执发送失败" +
+    (parts.length ? "（" + parts.join("：") + "）" : "") +
+    "，" +
+    (known ? known.hint : "请在 AstroBox 重试")
+  );
+}
+
 // One isolated authorization state machine per application instance.
 // 激活判定只解读许可证并确认它属于本机，不做签名校验：真机上一次 Ed25519
 // 验签要十几秒，代价与恢复方式见 README「激活链路的等待时间」。签发仍在
@@ -46,6 +91,11 @@ export function createActivation(
   let writeInFlight = false;
   // 残留旧授权串的「本地授权无效」提示是否已上屏（见 adoptToken）。
   let staleNotified = false;
+  // 最近一次发送失败上屏的提示：之后发送成功时只撤这一条，不误伤其他错误。
+  let sendFailure = "";
+  // 发送序号：sendSeq 是最近一次发起的发送，deliveredSeq 是成功送达的最大序号。
+  let sendSeq = 0;
+  let deliveredSeq = 0;
 
   function snapshot() {
     return {
@@ -370,28 +420,51 @@ export function createActivation(
   // patient 模式用于回应 install-license 的回执：紧跟插件下行消息或稍作
   // 退避后重试（插件侧 12s 一轮的安装包重发是兜底恢复路径）；其余发送
   // （如 device 回复，插件有 2s×10 的 hello 重发兜底）立即发送 + 少量快重试。
+  //
+  // 发送失败只在「确实需要用户处理」时上屏：
+  // - 本机授权已落盘时不报。回执只是告诉插件结果，手环本身已经激活；
+  //   插件会重发安装包，已激活的手环收到后同步再回执。iOS 上固件常判超时
+  //   而消息其实已送达，以前这里会在激活成功的屏幕上挂一条吓人的失败。
+  // - 更晚发起的发送已经成功时不报：旧重试链迟到的失败不能盖过新结果。
   function send(payload, patient) {
     if (!connection) return;
     const attempts = patient ? 5 : 3;
     const spacing = patient ? 2000 : 300;
+    const seq = ++sendSeq;
     let attempt = 0;
+    function giveUp(message, code) {
+      if (deliveredSeq > seq) return;
+      connected = false;
+      if (activated) {
+        publish();
+        return;
+      }
+      error = sendFailure = sendFailureText(message, code);
+      publish();
+    }
     function deliver() {
       try {
         connection.send({
           data: payload,
-          success: function () {},
+          success: function () {
+            if (seq > deliveredSeq) deliveredSeq = seq;
+            // 之后任何一次发送成功，就说明链路恢复了：撤掉旧的发送失败提示。
+            if (sendFailure) {
+              const stale = error === sendFailure;
+              sendFailure = "";
+              if (stale) {
+                error = "";
+                publish();
+              }
+            }
+          },
           fail(data2, code) {
             if (attempt < attempts) {
               attempt += 1;
               setTimeout(deliver, spacing);
               return;
             }
-            connected = false;
-            error =
-              "回执发送失败" +
-              (code === undefined ? "" : "（" + code + "）") +
-              "，请在 AstroBox 重试";
-            publish();
+            giveUp(data2, code);
           },
         });
       } catch (failure) {
@@ -400,8 +473,7 @@ export function createActivation(
           setTimeout(deliver, spacing);
           return;
         }
-        connected = false;
-        publish();
+        giveUp(failure, undefined);
       }
     }
     deliver();
