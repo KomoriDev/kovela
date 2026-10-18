@@ -112,7 +112,7 @@ function purchaseGuide(names: string[], orderNo: string) {
     list,
     "",
     ...(names.includes("合成大西瓜图片自定义")
-      ? ["合成大西瓜：打开 AstroBox 的合成大西瓜换肤插件，登录并绑定购买商品的爱发电账号，验证后即可导入自定义图片；内置皮肤和传输免费。",
+      ? ["合成大西瓜：打开 AstroBox 的「合成大西瓜自定义工具」插件，登录并绑定购买商品的爱发电账号，验证后即可导入自定义图片。",
         ...(names.some((name) => name !== "合成大西瓜图片自定义") ? ["其他应用请在 Kovela 插件中输入订单号完成激活。"] : [])]
       : ["请打开 AstroBox 的 Kovela 插件，选择对应应用并输入订单号完成激活。"]),
     "",
@@ -709,7 +709,7 @@ export function createWorker(
       const orderNo = requireString(body, "orderNo", /^\d{16,32}$/);
       const productId = requireString(body, "productId", productIdPattern);
       if (productId === "com.komoridev.watermelon")
-        throw new HttpError(409, "PLUGIN_ENTITLEMENT", "合成大西瓜自定义是插件账号权益，无需手环许可证，请使用独立换肤插件验证。");
+        throw new HttpError(409, "PLUGIN_ENTITLEMENT", "合成大西瓜自定义是插件账号权益，无需手环许可证，请在「合成大西瓜自定义工具」插件中验证。");
       const deviceId = requireString(body, "deviceId", /^[a-f0-9]{64}$/);
       if (body.deviceModel !== undefined && (typeof body.deviceModel !== "string" || [...body.deviceModel].length > 80 || /[\u0000-\u001f\u007f]/.test(body.deviceModel)))
         throw new HttpError(400, "INVALID_INPUT", "设备型号格式不正确。");
@@ -875,7 +875,7 @@ export function createWorker(
         throw new HttpError(
           409,
           "PLUGIN_ENTITLEMENT",
-          "合成大西瓜换肤传输免费，自定义请在独立插件中验证当前爱发电账号。",
+          "合成大西瓜自定义无需手环许可证，请在「合成大西瓜自定义工具」插件中验证当前爱发电账号。",
         );
       const deviceId = requireString(body, "deviceId", /^[a-f0-9]{64}$/);
       const requestId = requireString(body, "requestId", /^[A-Za-z0-9_-]{16,80}$/);
@@ -937,7 +937,7 @@ export function createWorker(
       const deviceId = requireString(body, "deviceId", /^[a-f0-9]{64}$/);
       const productId = requireString(body, "productId", productIdPattern);
       if (productId === "com.komoridev.watermelon")
-        throw new HttpError(409, "PLUGIN_ENTITLEMENT", "合成大西瓜换肤传输免费，自定义请在独立插件中验证当前爱发电账号。");
+        throw new HttpError(409, "PLUGIN_ENTITLEMENT", "合成大西瓜自定义无需手环许可证，请在「合成大西瓜自定义工具」插件中验证当前爱发电账号。");
       const requestId = requireString(
         body,
         "requestId",

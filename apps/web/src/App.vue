@@ -344,7 +344,7 @@ onBeforeUnmount(() => {
                 >
               </div>
               <p v-if="hasWatermelon" class="text-xs leading-6 text-muted-foreground">
-                合成大西瓜：打开独立换肤插件，登录并绑定购买商品的爱发电账号后验证自定义权益。内置皮肤和手环传输免费，无需激活手环。
+                合成大西瓜：打开「合成大西瓜自定义工具」插件，登录并绑定购买商品的爱发电账号后验证自定义权益，无需激活手环。
               </p>
               <p v-if="hasDeviceActivation" class="text-xs leading-6 text-muted-foreground">
                 {{

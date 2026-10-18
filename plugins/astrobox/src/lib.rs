@@ -1285,7 +1285,7 @@ async fn finish_lookup() {
                 offers.retain(|offer| offer.product_id != "com.komoridev.watermelon");
                 if offers.is_empty() {
                     STATE.with(|state| state.borrow_mut().verifying = false);
-                    show("合成大西瓜自定义图片已迁移，请使用独立的合成大西瓜换肤插件并验证当前爱发电账号");
+                    show("合成大西瓜自定义图片已迁移，请使用「合成大西瓜自定义工具」插件并验证当前爱发电账号");
                     return;
                 }
                 // 订单号本身就决定了商品：只有一个就直接接管，多于一个才让用户挑。
