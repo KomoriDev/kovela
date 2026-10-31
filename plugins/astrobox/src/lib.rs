@@ -577,6 +577,8 @@ fn render_offline(root: &str) {
                 active || s.selected.is_none()));
         }
         if !importing && ready.is_none() { page = page.child(gate(theme::link("已有许可证", "offline-next"), active)); }
+        // 离线流程同样要连手环：取设备码和导入许可证时都提示 iOS 的蓝牙冲突。
+        if ready.is_none() || importing { page = page.child(ios_hint()); }
         page
     });
     ui::render(root, theme::shell().child(page).child(theme::footer(&[("爱发电", PURCHASE_EVENT), ("官群", COMMUNITY_EVENT)])));
@@ -740,6 +742,16 @@ fn offer_card(offer: &Offer, index: usize) -> ui::Element {
         .child(theme::outlined_button("确认", &format!("offer:{index}")))
 }
 
+/// iOS 上小米运动健康会和 AstroBox 抢手环的蓝牙连接，连不上时多半是它占着。
+/// 文案与合成大西瓜自定义工具、口袋台球的 AstroBox 应用介绍一致。
+fn ios_hint() -> ui::Element {
+    theme::card()
+        .child(theme::section("iOS 连接提示"))
+        .child(theme::label(
+            "小米运动健康会和 AstroBox 抢占手环的蓝牙连接。请打开 iPhone「设置」，找到「小米运动健康」，关闭其中的「蓝牙」权限，然后在后台划掉小米运动健康，再回到 AstroBox 连接手环。",
+        ))
+}
+
 /// 激活已经走到第几段（0 起算，等于段数表示全部走完）。
 fn activation_step(pending: Option<&Pending>) -> usize {
     match pending.map(|item| item.phase) {
@@ -898,6 +910,10 @@ fn render() {
                         }
                     } else {
                         page = page.child(device_control(&devices, selected, &device_note, scanning, ui_locked));
+                    }
+                    // 还没连上手环时（选设备、握手、或从握手重试）提示 iOS 的蓝牙冲突。
+                    if !complete && (pending.is_none() || activation_step(pending.as_ref()) == 0) {
+                        page = page.child(ios_hint());
                     }
                     if !complete {
                         let action = if phase == Some(Phase::Retry) {

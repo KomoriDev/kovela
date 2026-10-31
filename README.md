@@ -77,6 +77,8 @@ pnpm --filter @kovela/worker deploy
 
 右上角服务状态徽标在首次打开时通过 `/api/config` 检查服务连通性与配置，每分钟复查；订单查询和激活期间暂缓探测。网络失败、服务端错误或服务配置未就绪时显示红色「服务异常」，点击可展开/收起原因，恢复后自动清除。业务请求的网络和 5xx 错误也会同步到徽标；订单号错误、设备通信错误不作为服务异常。此探测不主动请求爱发电，爱发电运行故障由实际订单请求反映。切到离线激活后不再探测，也不调用订单、签发或回执 API。
 
+iOS 上小米运动健康会和 AstroBox 抢手环的蓝牙连接：在线激活还没连上手环时（选设备、握手、从握手重试），以及离线取设备码和导入许可证时，插件会显示「iOS 连接提示」卡片，请用户在 iPhone「设置」→「小米运动健康」中关闭「蓝牙」权限并从后台划掉它。文案与合成大西瓜自定义工具一致。
+
 ### 构建与上架：只有 Level 4 一份产物
 
 `plugins/astrobox/manifest.json` 就是 Level 4 清单（`wasi_version: 3`、`api_level: 4`，权限含 `account.profile`、`os.device-id`），`pnpm build:plugin` 只出这一份产物到 `plugins/astrobox/dist/kovela/`，上架入口（仓库根目录 `index.txt`）列的也是它。账号资料与宿主安装标识都只有 Level 4 才有，所以不再提供 Level 2/3 兼容构建；AstroBox 2.2 以下的宿主装不了这个插件。
