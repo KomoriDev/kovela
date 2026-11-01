@@ -18,7 +18,7 @@ Kovela 验证爱发电订单，并为小米 Vela 应用签发设备绑定许可�
 
 手环应用位于本仓库之外。共享激活代码变更后，在本仓库运行 `pnpm prepare:vela`，再构建对应应用。
 
-`pnpm build:vela` 会生成并构建 `../billiard` 和 `../tank-turmoil`。共享激活代码只在 `packages/vela/src/` 修改，不直接编辑各应用的 `src/activation/index.js`。合成大西瓜换肤已独立到 `../kovela-watermelon`，游戏从其 `wearable/src/` 生成免费通信模块。
+`pnpm build:vela` 会生成并构建 `../billiard`、`../tank-turmoil` 和 `../angrybirds`（愤怒的小鸟：前 4 关免费，其余关卡需激活）。共享激活代码只在 `packages/vela/src/` 修改，不直接编辑各应用的 `src/activation/index.js`。合成大西瓜换肤已独立到 `../kovela-watermelon`，游戏从其 `wearable/src/` 生成免费通信模块。
 
 ## 本地开发
 
@@ -146,7 +146,7 @@ V4 `account.get-current` 提供实时绑定资料，不提供可供后端验证�
 
 许可证文件不包含会话、回执令牌或签名私钥。离线导入不提交服务器回执，因此网页保留「已签发」及设备绑定，不会冒充已经确认安装；也不会发送服务端激活成功私信。已签发的永久离线许可证不支持实时退款撤销。
 
-离线产品目录目前包含口袋台球、坦克动荡和合成大西瓜图片自定义；新增商品时同步维护 `plugins/astrobox/src/offline.rs`。生成的申请和许可证含订单/设备信息，不应提交到公共仓库。
+离线产品目录目前包含口袋台球、坦克动荡、愤怒的小鸟和合成大西瓜图片自定义；新增商品时同步维护 `plugins/astrobox/src/offline.rs`。生成的申请和许可证含订单/设备信息，不应提交到公共仓库。
 
 ## 激活链路的等待时间
 
@@ -166,7 +166,7 @@ V4 `account.get-current` 提供实时绑定资料，不提供可供后端验证�
 
 服务端仍用 `LICENSE_SIGNING_SEED` 签发带 Ed25519 签名的令牌，`pnpm license:issue`、Worker 测试与 `packages/license` 的 `verifyLicense` 继续做完整校验。因此**恢复验签只需两步**：把 `packages/vela/src/index.js` 里的 `decodeLicense` 换回 `verifyLicense`（并把公钥参数接回 `scripts/prepare-vela.mjs` 与 `createActivation`），然后重新发布手环应用；不需要轮换密钥或更换令牌格式。想在设备上重新加一道门槛，可先确认 `@system.crypto` 的 RSA-SHA256 验签在本机型可用（原生秒级），再决定是否改用该原语。
 
-手环侧改动只需改 `packages/vela/src/index.js`，运行 `pnpm prepare:vela` 会重新生成 `../billiard`、`../tank-turmoil` 的 `src/activation/index.js`。`packages/vela/src/public-key.js` 已不再进入手环产物，只服务于 `pnpm license:issue` 的自检与将来恢复验签。
+手环侧改动只需改 `packages/vela/src/index.js`，运行 `pnpm prepare:vela` 会重新生成 `../billiard`、`../tank-turmoil`、`../angrybirds` 的 `src/activation/index.js`。`packages/vela/src/public-key.js` 已不再进入手环产物，只服务于 `pnpm license:issue` 的自检与将来恢复验签。
 
 ### 账号维度激活
 

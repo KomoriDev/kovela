@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 pub(crate) const PRODUCTS: &[(&str, &str)] = &[
     ("com.komoridev.billiard", "口袋台球"),
     ("com.komoridev.tankturmoil", "坦克动荡"),
+    ("com.komoridev.angrybirds", "愤怒的小鸟"),
 ];
 
 pub(crate) fn product_name(product_id: &str) -> Option<&'static str> {

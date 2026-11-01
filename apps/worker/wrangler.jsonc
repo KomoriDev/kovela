@@ -54,6 +54,13 @@
         "planIds": ["3187fe28c08a11f1805c52540025c377"],
         "skuIds": [],
       },
+      {
+        "productId": "com.komoridev.angrybirds",
+        "productName": "愤怒的小鸟",
+        "purchaseUrl": "https://afdian.com/item/d6c41a82d55411f184b3525400c8052f",
+        "planIds": ["d6c41a82d55411f184b3525400c8052f"],
+        "skuIds": [],
+      },
     ],
     "AFDIAN_USER_ID": "9c2257f6628d11edb5e652540025c377",
     "TURNSTILE_SITE_KEY": "0x4AAAAAAEyF9L78iJGDnnH2",
