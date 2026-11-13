@@ -186,12 +186,13 @@ export default class AfdianService extends Service {
 
   async sendMessage(recipient: string, content: string): Promise<void> {
     // 爱发电会以 ec 400001 拒收含尖括号或控制字符的私信。历史文案用 `>` 做引用，
-    // 2026-11 起整批私信就是这样静默失败的；这里兜底清洗，队列里存量的旧文案
-    // 也能照常发出去。
+    // 2026-11 起整批私信就是这样静默失败的。队列里存量的旧文案先还原成 `·`，
+    // 否则清洗完只剩下行首的空格，气泡里看不出这里本来是个引用行。
     await this.call("send-msg", {
       recipient,
       content: content
         .replace(/\r\n?/g, "\n")
+        .replace(/^[ \t]*>[ \t]?/gm, "· ")
         .replace(/[\u0000-\u0009\u000b\u000c\u000e-\u001f<>]/g, ""),
     });
   }

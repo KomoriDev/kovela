@@ -82,10 +82,10 @@ test("queued DMs are stripped of the angle brackets Afdian rejects, and a reject
       .run();
 
   // 2026-11 之前发出去的教学私信都用 `>` 做引用，爱发电后来开始拒收这类内容，
-  // 队列里存量的旧文案必须照样能发出去（换行等结构要保留）。
+  // 队列里存量的旧文案要还原成 `·` 再发（换行等结构要保留）。
   await enqueue("guide:legacy", "【Kovela】\n> 售后群：<993666186>\n结束");
   await worker.scheduled({ cron: "* * * * *" } as ScheduledController, env);
-  assert.deepEqual(received, ["【Kovela】\n 售后群：993666186\n结束"]);
+  assert.deepEqual(received, ["【Kovela】\n· 售后群：993666186\n结束"]);
   const sent = await db
     .prepare("SELECT state,last_error FROM outbox WHERE id=?")
     .bind("guide:legacy")
