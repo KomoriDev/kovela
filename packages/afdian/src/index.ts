@@ -22,10 +22,22 @@ export interface AfdianOrder {
   sku_detail?: { sku_id: string; count: number }[];
 }
 export class AfdianError extends Error {
-  constructor(public readonly code: string) {
+  constructor(
+    public readonly code: string,
+    // 上游原话（ec/em 或 HTTP 状态），只用于落库排查，不进用户可见文案：
+    // 爱发电拒收私信的理由（比如内容带尖括号）就藏在这里。
+    public readonly detail = "",
+  ) {
     super("爱发电服务暂时不可用，请稍后重试。");
     this.name = "AfdianError";
   }
+}
+function upstreamDetail(value: unknown) {
+  if (!value || typeof value !== "object") return "";
+  const { ec, em } = value as { ec?: unknown; em?: unknown };
+  return `ec=${String(ec ?? "")} ${typeof em === "string" ? em : ""}`
+    .trim()
+    .slice(0, 200);
 }
 // 订单既可能来自 Webhook 的 data.order，也可能来自列表接口的 data.list[i]。
 // 金额有时是数字、有时是字符串，这里统一成接口用到的形态；解析不了的条目返回
@@ -117,7 +129,8 @@ export default class AfdianService extends Service {
     } catch {
       throw new AfdianError("UPSTREAM_NETWORK");
     }
-    if (!response.ok) throw new AfdianError("UPSTREAM_HTTP");
+    if (!response.ok)
+      throw new AfdianError("UPSTREAM_HTTP", "HTTP " + response.status);
     let value;
     try {
       value = await response.json();
@@ -131,7 +144,7 @@ export default class AfdianService extends Service {
       value.ec !== 200 ||
       !("data" in value)
     )
-      throw new AfdianError("UPSTREAM_REJECTED");
+      throw new AfdianError("UPSTREAM_REJECTED", upstreamDetail(value));
     return value.data;
   }
 
@@ -172,7 +185,15 @@ export default class AfdianService extends Service {
   }
 
   async sendMessage(recipient: string, content: string): Promise<void> {
-    await this.call("send-msg", { recipient, content });
+    // 爱发电会以 ec 400001 拒收含尖括号或控制字符的私信。历史文案用 `>` 做引用，
+    // 2026-11 起整批私信就是这样静默失败的；这里兜底清洗，队列里存量的旧文案
+    // 也能照常发出去。
+    await this.call("send-msg", {
+      recipient,
+      content: content
+        .replace(/\r\n?/g, "\n")
+        .replace(/[\u0000-\u0009\u000b\u000c\u000e-\u001f<>]/g, ""),
+    });
   }
 }
 

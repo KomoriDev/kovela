@@ -97,6 +97,17 @@ function oneLine(value: string, maximum = 80) {
     .trim()
     .slice(0, maximum);
 }
+// 私信发不出去要留下能查的痕迹：错误码加上游原话。爱发电把拒收理由放在 em 里
+// （例如「私信内容不能包含尖括号」），只看 attempts 永远猜不到。
+function failureDetail(error: unknown) {
+  const text =
+    error instanceof AfdianError
+      ? error.code + (error.detail ? ": " + error.detail : "")
+      : error instanceof Error
+        ? error.name + ": " + error.message
+        : "UNKNOWN";
+  return text.slice(0, 200);
+}
 function chinaTime(unix: number) {
   return new Intl.DateTimeFormat("sv-SE", {
     timeZone: "Asia/Shanghai",
@@ -129,9 +140,10 @@ function purchaseGuide(names: string[], orderNo: string) {
     "",
     "--------",
     "",
-    "> 售后群：993666186",
-    "> 更多商品：https://afdian.com/a/komoridev",
-    "> 作者开学中，若不能及时回复请耐心等待，没有跑路的风险",
+    // 爱发电拒收含尖括号的私信（ec 400001），所以这里和激活回执都不用 `>` 引用。
+    "· 售后群：993666186",
+    "· 更多商品：https://afdian.com/a/komoridev",
+    "· 作者开学中，若不能及时回复请耐心等待，没有跑路的风险",
   ].join("\n");
 }
 function activationNotice(input: {
@@ -152,11 +164,11 @@ function activationNotice(input: {
     "",
     `感谢您使用 Kovela 激活系统，你已成功激活 ${productName}`,
     "",
-    `> 软件名称：${productName}`,
-    `> 激活时间：${chinaTime(input.activatedAt)}`,
-    `> 设备型号：${input.deviceModel || "未上报"}`,
-    `> 设备码：${input.deviceId}`,
-    `> 操作IP：${input.ip}`,
+    `· 软件名称：${productName}`,
+    `· 激活时间：${chinaTime(input.activatedAt)}`,
+    `· 设备型号：${input.deviceModel || "未上报"}`,
+    `· 设备码：${input.deviceId}`,
+    `· 操作IP：${input.ip}`,
     "",
     "温馨提示：若本次操作非本人执行，请及时核查账号与设备安全",
   ].join("\n");
@@ -403,41 +415,67 @@ export function createWorker(
     products: ProductConfig[],
   ) {
     let remaining = RECONCILE_LIMIT;
-    for (let page = 1; page <= RECONCILE_PAGES && remaining > 0; page += 1) {
-      const orders = await api.listOrders(page);
-      const paid = orders.filter(
-        (order) =>
-          /^\d{16,32}$/.test(order.out_trade_no) &&
-          order.status === 2 &&
-          /^\d+(?:\.\d{1,2})?$/.test(order.total_amount) &&
-          products.some((product) => matchesProduct(order, product)),
-      );
-      if (!paid.length) return;
-      const known = new Set(
-        (
-          await env.DB.prepare(
-            "SELECT order_no FROM purchases WHERE order_no IN (" +
-              paid.map(() => "?").join(",") +
-              ")",
-          )
-            .bind(...paid.map((order) => order.out_trade_no))
-            .all<{ order_no: string }>()
-        ).results.map((row) => row.order_no),
-      );
-      const missing = paid.filter((order) => !known.has(order.out_trade_no));
-      // 这一页没有漏单就停：分页按创建时间倒序，更旧的页只可能是更早的成交，
-      // 而更早的成交上一轮已经扫过。
-      if (!missing.length) return;
-      for (const order of missing.slice(0, remaining)) {
-        await deliverPurchaseGuide(
-          env,
-          api,
-          order,
-          products.filter((product) => matchesProduct(order, product)),
+    let pages = 0;
+    let seen = 0;
+    let backfilled = 0;
+    try {
+      for (let page = 1; page <= RECONCILE_PAGES && remaining > 0; page += 1) {
+        const orders = await api.listOrders(page);
+        pages += 1;
+        seen += orders.length;
+        const paid = orders.filter(
+          (order) =>
+            /^\d{16,32}$/.test(order.out_trade_no) &&
+            order.status === 2 &&
+            /^\d+(?:\.\d{1,2})?$/.test(order.total_amount) &&
+            products.some((product) => matchesProduct(order, product)),
         );
-        remaining -= 1;
+        if (!paid.length) break;
+        const known = new Set(
+          (
+            await env.DB.prepare(
+              "SELECT order_no FROM purchases WHERE order_no IN (" +
+                paid.map(() => "?").join(",") +
+                ")",
+            )
+              .bind(...paid.map((order) => order.out_trade_no))
+              .all<{ order_no: string }>()
+          ).results.map((row) => row.order_no),
+        );
+        const missing = paid.filter((order) => !known.has(order.out_trade_no));
+        // 这一页没有漏单就停：分页按创建时间倒序，更旧的页只可能是更早的成交，
+        // 而更早的成交上一轮已经扫过。
+        if (!missing.length) break;
+        for (const order of missing.slice(0, remaining)) {
+          await deliverPurchaseGuide(
+            env,
+            api,
+            order,
+            products.filter((product) => matchesProduct(order, product)),
+          );
+          remaining -= 1;
+          backfilled += 1;
+        }
       }
+    } catch (error) {
+      await recordSweep(env, failureDetail(error), pages, seen, backfilled);
+      throw error;
     }
+    await recordSweep(env, "", pages, seen, backfilled);
+  }
+  // 补单没人盯着：跑没跑、看见多少单、补了几单，事后只能靠这张单行表回答。
+  async function recordSweep(
+    env: Env,
+    error: string,
+    pages: number,
+    seen: number,
+    backfilled: number,
+  ) {
+    await env.DB.prepare(
+      "INSERT INTO reconcile_runs(id,ran_at,pages,seen,backfilled,error) VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET ran_at=excluded.ran_at,pages=excluded.pages,seen=excluded.seen,backfilled=excluded.backfilled,error=excluded.error",
+    )
+      .bind(now(), pages, seen, backfilled, error)
+      .run();
   }
   async function bindLicense(env: Env, order: Entitlement, deviceId: string): Promise<Entitlement> {
     const issuedAt = now();
@@ -577,17 +615,19 @@ export function createWorker(
       try {
         await api.sendMessage(message.recipient, message.content);
         await env.DB.prepare(
-          "UPDATE outbox SET state='sent',sent_at=?,lease_until=0 WHERE id=? AND lease_token=?",
+          "UPDATE outbox SET state='sent',sent_at=?,lease_until=0,last_error=NULL WHERE id=? AND lease_token=?",
         )
           .bind(now(), message.id, lease)
           .run();
-      } catch {
+      } catch (error) {
         // Afdian has no documented idempotency key. A lost response may cause a duplicate on retry.
+        // 失败原因（含爱发电的原话）留在行上：整批私信静默失败时，只能靠它事后定位。
         await env.DB.prepare(
-          "UPDATE outbox SET state='pending',next_attempt=?,lease_until=0 WHERE id=? AND lease_token=?",
+          "UPDATE outbox SET state='pending',next_attempt=?,lease_until=0,last_error=? WHERE id=? AND lease_token=?",
         )
           .bind(
             now() + Math.min(3600, 30 * 2 ** Math.min(message.attempts, 7)),
+            failureDetail(error),
             message.id,
             lease,
           )

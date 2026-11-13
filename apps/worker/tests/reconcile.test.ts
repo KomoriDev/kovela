@@ -124,6 +124,14 @@ test("a webhook that never arrives is backfilled by the 15-minute order sweep", 
   assert.equal(messages.length, 1, "补单发出一条教学私信");
   assert.equal(messages[0].split("\n")[0], buyer);
   assert.ok(messages[0].includes(paid.out_trade_no), "私信要带上订单号");
+  // 爱发电拒收含尖括号的私信（ec 400001），教学私信不能踩这条线。
+  assert.ok(!/[<>]/.test(messages[0]), "私信内容不能含尖括号");
+  // 补单跑过就要留下心跳：翻了几页、看见几单、补了几单。
+  const sweep = await db
+    .prepare("SELECT pages,seen,backfilled,error FROM reconcile_runs WHERE id=1")
+    .first<{ pages: number; seen: number; backfilled: number; error: string }>();
+  // 第 1 页补完一单后还会翻第 2 页确认没有更旧的漏单，所以是 2 页。
+  assert.deepEqual({ ...sweep }, { pages: 2, seen: 3, backfilled: 1, error: "" });
   assert.equal(
     (
       await db.prepare("SELECT payment_status FROM purchases WHERE order_no=?")
