@@ -27,6 +27,36 @@ export class AfdianError extends Error {
     this.name = "AfdianError";
   }
 }
+// 订单既可能来自 Webhook 的 data.order，也可能来自列表接口的 data.list[i]。
+// 金额有时是数字、有时是字符串，这里统一成接口用到的形态；解析不了的条目返回
+// null，让列表接口能跳过单条脏数据，而不是把整页结果废掉。
+function normalizeOrder(value: unknown): AfdianOrder | null {
+  if (!value || typeof value !== "object") return null;
+  const { sku_detail: rawSku, ...order } = value as Record<string, unknown>;
+  const status = Number(order.status);
+  const totalAmount =
+    typeof order.total_amount === "number" && Number.isFinite(order.total_amount)
+      ? order.total_amount.toFixed(2)
+      : order.total_amount;
+  if (
+    typeof order.out_trade_no !== "string" ||
+    typeof order.user_id !== "string" ||
+    !/^[a-f0-9]{32}$/i.test(order.user_id) ||
+    typeof order.plan_id !== "string" ||
+    !Number.isInteger(status) ||
+    typeof totalAmount !== "string"
+  )
+    return null;
+  return {
+    ...order,
+    status,
+    total_amount: totalAmount,
+    // 型号明细只接受数组：校验订单商品时要按 sku 过滤，格式不对就当没有。
+    ...(Array.isArray(rawSku)
+      ? { sku_detail: rawSku as AfdianOrder["sku_detail"] }
+      : {}),
+  } as unknown as AfdianOrder;
+}
 export interface AfdianConfig {
   userId: string;
   token: string;
@@ -122,21 +152,23 @@ export default class AfdianService extends Service {
         item.out_trade_no === orderNo,
     );
     if (!order) return null;
-    const status = Number(order.status);
-    const totalAmount =
-      typeof order.total_amount === "number" &&
-      Number.isFinite(order.total_amount)
-        ? order.total_amount.toFixed(2)
-        : order.total_amount;
+    const normalized = normalizeOrder(order);
+    if (!normalized) throw new AfdianError("UPSTREAM_SCHEMA");
+    return normalized;
+  }
+
+  // 按订单创建时间倒序分页，第 1 页是最新的一页；爱发电没有按时间区间筛选的
+  // 参数，补单只能从最新一页往回翻。
+  async listOrders(page: number): Promise<AfdianOrder[]> {
+    const data = await this.call("query-order", { page });
     if (
-      typeof order.user_id !== "string" ||
-      !/^[a-f0-9]{32}$/i.test(order.user_id) ||
-      typeof order.plan_id !== "string" ||
-      !Number.isInteger(status) ||
-      typeof totalAmount !== "string"
+      !data ||
+      typeof data !== "object" ||
+      !("list" in data) ||
+      !Array.isArray(data.list)
     )
       throw new AfdianError("UPSTREAM_SCHEMA");
-    return { ...order, status, total_amount: totalAmount };
+    return data.list.flatMap((item: unknown) => normalizeOrder(item) ?? []);
   }
 
   async sendMessage(recipient: string, content: string): Promise<void> {

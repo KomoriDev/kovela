@@ -263,7 +263,8 @@ test("real D1 transaction binds once, retries idempotently, verifies webhook and
     assert.equal(state.notification, "pending");
     messagesFail = false;
     await db.prepare("UPDATE outbox SET next_attempt=0").run();
-    await worker.scheduled({} as ScheduledController, env);
+    // 每分钟的触发器只重试私信，不跑补单（补单挂在 15 分钟的触发器上）。
+    await worker.scheduled({ cron: "* * * * *" } as ScheduledController, env);
     assert.equal(sent, 2);
     await post("/api/activation/report", report);
     assert.equal(sent, 2, "repeat ACK must not create another notification");

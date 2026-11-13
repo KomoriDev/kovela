@@ -79,6 +79,17 @@ const productIdPattern = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
 const VERIFIED_SESSION_SECONDS = 120;
 // 创作者自用的合成订单号前缀；真实爱发电订单号只有数字，不会撞上。
 const CREATOR_ORDER_PREFIX = "creator:";
+// 爱发电的 Webhook 官方说明「如果服务器异常，不保证能及时推送」。丢一单就少了
+// 购买记录、教学私信，账号激活也看不到商品，所以另起一个 15 分钟（wrangler.jsonc
+// 里的第二个触发器）的定时任务，把爱发电那边已经成立的订单重放一遍，走的仍是
+// Webhook 那条落库路径。
+// 每分钟的触发器只做私信重试与清理：补单挂在上面等于每分钟问一次订单列表。
+const OUTBOX_CRON = "* * * * *";
+// 一页 50 单，一页就够覆盖本店的成交节奏；第二页是忙时的余量。
+const RECONCILE_PAGES = 2;
+// 单次补单上限：一次 cron 的请求数有上限，私信还有频率限制，剩下的下一轮接着
+// 补。正常节奏下每轮也就一两单。
+const RECONCILE_LIMIT = 20;
 function oneLine(value: string, maximum = 80) {
   return value
     .replace(/[\u0000-\u001f]/g, " ")
@@ -379,6 +390,54 @@ export function createWorker(
       ),
     ]);
     await flushOutbox(env, api);
+  }
+  // 补单：把爱发电上最近成交、但本地没有购买记录的订单补成正常订单。Webhook
+  // 丢一单就少一条 purchases/entitlements 和一条教学私信，买家不上报订单号就
+  // 永远拿不到货；这里从爱发电的订单列表把漏掉的补回来。
+  //
+  // 复用 deliverPurchaseGuide，所以和 Webhook 重复处理是安全的：purchases 与
+  // entitlements 都是幂等写入，私信 outbox 主键是 guide:<订单号>，先到先得。
+  async function reconcileOrders(
+    env: Env,
+    api: AfdianService,
+    products: ProductConfig[],
+  ) {
+    let remaining = RECONCILE_LIMIT;
+    for (let page = 1; page <= RECONCILE_PAGES && remaining > 0; page += 1) {
+      const orders = await api.listOrders(page);
+      const paid = orders.filter(
+        (order) =>
+          /^\d{16,32}$/.test(order.out_trade_no) &&
+          order.status === 2 &&
+          /^\d+(?:\.\d{1,2})?$/.test(order.total_amount) &&
+          products.some((product) => matchesProduct(order, product)),
+      );
+      if (!paid.length) return;
+      const known = new Set(
+        (
+          await env.DB.prepare(
+            "SELECT order_no FROM purchases WHERE order_no IN (" +
+              paid.map(() => "?").join(",") +
+              ")",
+          )
+            .bind(...paid.map((order) => order.out_trade_no))
+            .all<{ order_no: string }>()
+        ).results.map((row) => row.order_no),
+      );
+      const missing = paid.filter((order) => !known.has(order.out_trade_no));
+      // 这一页没有漏单就停：分页按创建时间倒序，更旧的页只可能是更早的成交，
+      // 而更早的成交上一轮已经扫过。
+      if (!missing.length) return;
+      for (const order of missing.slice(0, remaining)) {
+        await deliverPurchaseGuide(
+          env,
+          api,
+          order,
+          products.filter((product) => matchesProduct(order, product)),
+        );
+        remaining -= 1;
+      }
+    }
   }
   async function bindLicense(env: Env, order: Entitlement, deviceId: string): Promise<Entitlement> {
     const issuedAt = now();
@@ -1191,7 +1250,7 @@ export function createWorker(
         await ctx.stop();
       }
     },
-    async scheduled(_event: ScheduledController, env: Env): Promise<void> {
+    async scheduled(event: ScheduledController, env: Env): Promise<void> {
       if (
         !env.AFDIAN_TOKEN ||
         !/^[a-f0-9]{32}$/i.test(env.AFDIAN_USER_ID ?? "")
@@ -1199,7 +1258,8 @@ export function createWorker(
         return;
       const ctx = new Context();
       try {
-        await flushOutbox(env, provider(env, ctx));
+        const api = provider(env, ctx);
+        await flushOutbox(env, api);
         await env.DB.batch([
           env.DB.prepare(
             "DELETE FROM sessions WHERE status_expires_at<? AND (receipt_expires_at IS NULL OR receipt_expires_at<?)",
@@ -1208,6 +1268,11 @@ export function createWorker(
             now(),
           ),
         ]);
+        // 补单放在最后：它最容易被爱发电抖动打中，失败了也不该连累私信重试和
+        // 清理，15 分钟后的下一轮会接着补。wrangler.jsonc 的两个触发器靠
+        // event.cron 区分：不是「每分钟」的那个就是补单。
+        if ((event.cron ?? "").trim() !== OUTBOX_CRON)
+          await reconcileOrders(env, api, catalog(env));
       } finally {
         await ctx.stop();
       }

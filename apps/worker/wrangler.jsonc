@@ -19,7 +19,8 @@
     },
   ],
   "triggers": {
-    "crons": ["* * * * *"],
+    // 每分钟：私信重试与过期清理；每 15 分钟：Webhook 丢单后补单。
+    "crons": ["* * * * *", "*/15 * * * *"],
   },
   "observability": {
     "enabled": false,
