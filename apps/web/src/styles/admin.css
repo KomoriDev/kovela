@@ -1,0 +1,245 @@
+/* Admin console: a light, utilitarian surface kept apart from the public site. */
+
+.admin {
+  color-scheme: light;
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  min-height: 100dvh;
+  background:
+    radial-gradient(90% 60% at 50% -10%, #e7f4ed 0%, #f5f8f6 58%),
+    #f5f8f6;
+  color: #18231d;
+}
+.admin header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: min(1120px, calc(100% - 40px));
+  height: 82px;
+  margin-inline: auto;
+}
+.admin header a {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: inherit;
+  font-size: 13.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-decoration: none;
+}
+.admin header img {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+}
+.admin header button {
+  height: 38px;
+}
+.admin main {
+  width: min(1120px, calc(100% - 40px));
+  margin-inline: auto;
+  padding: 6px 0 90px;
+}
+.admin main > .alert {
+  margin-bottom: 18px;
+}
+.admin h1 {
+  margin: 10px 0 26px;
+  font-size: clamp(1.5rem, 2.4vw, 2rem);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+.admin h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #24322a;
+}
+.admin-grid {
+  display: grid;
+  gap: 24px;
+}
+.admin .split {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  min-width: 0;
+  padding: clamp(18px, 2.2vw, 26px);
+  border: 1px solid #e2eae5;
+  border-radius: 20px;
+  background: #fff;
+  box-shadow: 0 30px 60px -50px rgba(23, 26, 32, 0.4);
+}
+.admin .gate {
+  max-width: 440px;
+  margin: 32px auto 0;
+  padding: clamp(18px, 2.2vw, 26px);
+  border: 1px solid #e2eae5;
+  border-radius: 20px;
+  background: #fff;
+  box-shadow: 0 30px 60px -50px rgba(23, 26, 32, 0.4);
+}
+.admin .gate,
+.admin form {
+  display: grid;
+  gap: 14px;
+}
+.admin label {
+  display: grid;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: #5b6b62;
+}
+.admin input,
+.admin textarea,
+.admin select {
+  width: 100%;
+  border: 1px solid #dde7e1;
+  border-radius: 12px;
+  background: #fff;
+  padding: 11px 14px;
+  color: #18231d;
+  font-size: 14px;
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.2s ease,
+    background 0.2s ease;
+}
+.admin input:focus,
+.admin textarea:focus,
+.admin select:focus {
+  border-color: #34b27d;
+  background: #fff;
+  outline: none;
+  box-shadow: 0 0 0 4px rgba(52, 178, 125, 0.12);
+}
+.admin textarea {
+  min-height: 104px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+.admin .row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.admin .check {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-weight: 500;
+  line-height: 1.5;
+  color: #33463c;
+}
+.admin .check input {
+  width: auto;
+  margin-top: 3px;
+  accent-color: #10b981;
+}
+.admin button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 42px;
+  padding: 0 16px;
+  border: 1px solid #dbe5df;
+  border-radius: 12px;
+  background: #fff;
+  color: #1c2a22;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  transition:
+    background 0.2s ease,
+    border-color 0.2s ease,
+    transform 0.2s var(--ease);
+}
+.admin button:hover:not(:disabled) {
+  border-color: #c2d4ca;
+  background: #f4f8f5;
+}
+.admin button.primary {
+  border-color: transparent;
+  background: linear-gradient(135deg, #2fbf82, #0f9d63);
+  box-shadow: 0 16px 30px -16px rgba(16, 185, 129, 0.55);
+  color: #fff;
+}
+.admin button.primary:hover:not(:disabled) {
+  filter: brightness(1.03);
+}
+.admin button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+.admin .key {
+  position: relative;
+  display: grid;
+}
+.admin .key input {
+  padding-right: 76px;
+  font-family: var(--font-mono);
+}
+.admin .key button {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  height: 34px;
+  border: 0;
+  background: transparent;
+  color: #7a8a80;
+  font-size: 12px;
+}
+.admin .key button:hover {
+  background: transparent;
+  color: #18231d;
+}
+.admin .sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+.admin .alert {
+  margin: 0;
+  padding: 12px 16px;
+  border: 1px solid #f2c9c4;
+  border-radius: 12px;
+  background: #fdf3f1;
+  color: #a3372d;
+}
+.admin .ok {
+  margin: 0;
+  color: #0f7a4d;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.admin .muted {
+  margin: 0;
+  color: #6d7d74;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.admin .mono {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: #2f4237;
+}
+.admin .split textarea[readonly] {
+  min-height: 220px;
+}
+@media (min-width: 960px) {
+  .admin-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 22px;
+  }
+}
