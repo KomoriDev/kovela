@@ -10,7 +10,7 @@ import { revealGate } from "../stores/ui";
 
 const root = ref<HTMLElement>();
 const statement =
-  "Kovela 是独立开发者 KomoriDev 为小米 Vela 应用打造的授权服务。" +
+  "Kovela 是为小米 Vela 应用打造的授权服务。" +
   "它核验你在爱发电的订单，为你的手环签发一份专属许可证——只属于这一块手环，" +
   "保存之后，便不再依赖手机与网络。";
 
@@ -68,10 +68,10 @@ const links = [
     href: "https://abox.run/docs",
   },
   {
-    eyebrow: "Source",
-    title: "源代码",
-    text: "Kovela 服务端、插件与激活协议。",
-    href: "https://github.com/KomoriDev/kovela",
+    eyebrow: "Community",
+    title: "官方 QQ 群",
+    text: "交流游戏、反馈问题、获取激活帮助。",
+    href: "https://qm.qq.com/q/WRPKz0HsQQ",
   },
 ];
 
