@@ -1,92 +1,322 @@
 # Kovela
 
-Kovela 验证爱发电订单，并为小米 Vela 应用签发设备绑定许可证。买家在 AstroBox 的 Kovela 插件里输入订单号；插件向服务端核验后，把手环标识传给服务端。手环确认令牌属于本机后保存，即可离线使用。令牌仍带 Ed25519 签名，但手环侧不再校验（原因、代价与恢复方式见「激活链路的等待时间」）。网页按订单号查询订单信息，并留给以后的登录能力。
+Kovela 是为小米 Vela 穿戴设备打造的小游戏与授权服务，由三部分组成：
 
-线上站点：<https://kovela.komoridevs.icu/>
+- **网站**：游戏展示页。每款游戏都能一键跳转 AstroBox 安装；付费内容跳转爱发电支持。
+- **服务端**：Cloudflare Worker，负责核验爱发电订单、绑定设备、签发许可证、发送私信。
+- **AstroBox 插件**：买家在插件里用 AstroBox 账号或订单号激活，许可证经蓝牙写入手环。保存成功后，手环离线可用。
 
-## 工作区
+线上站点：<https://kovela.komoridevs.icu/> · 官方 QQ 群：<https://qm.qq.com/q/WRPKz0HsQQ>
+
+## 工作原理
+
+1. 买家在网站点「在 AstroBox 获取」，在 AstroBox 里把游戏装到手环。免费游戏到这一步就能玩。
+2. 想解锁付费内容，就在爱发电支持。订单完成后，爱发电 Webhook 通知服务端，服务端记下购买，并私信订单号和激活引导。
+3. 买家打开 AstroBox 的 Kovela 插件，用 AstroBox 账号（已绑定爱发电）或订单号验证，再选择手环。
+4. 服务端向爱发电复核付款，把订单中的应用绑定到这台手环，用 Ed25519 私钥签发 `KV1` 许可证令牌。
+5. 插件通过蓝牙把令牌写入手环。手环确认令牌属于本机后保存并回执，服务端再私信激活结果。
+
+服务端连不上时，有离线激活兜底，见[离线激活](#离线激活)。
+
+## 仓库结构
 
 | 路径 | 作用 |
 | --- | --- |
-| `apps/web` | Vue 游戏宣传页 |
-| `apps/worker` | Cloudflare Worker、D1 与爱发电接口 |
-| `packages/license` | Ed25519 许可证签发、令牌解析，以及手环侧已停用的离线验签 |
+| `apps/web` | 网站：游戏展示（`/`、`/about`）与管理员签发（`/admin`） |
+| `apps/worker` | Cloudflare Worker、D1 数据库、定时任务 |
+| `packages/afdian` | 爱发电订单查询、私信发送、Webhook 验签 |
+| `packages/license` | Ed25519 许可证签发、令牌解析与完整验签 |
 | `packages/vela` | 手环激活状态机；只解读令牌，不校验签名 |
-| `packages/afdian` | 爱发电订单查询、私信与 Webhook 验签 |
-| `plugins/astrobox` | 通用应用激活插件源码 |
-| `scripts` | 构建手环激活包、生成图标，以及仅在全新环境创建签发密钥 |
+| `packages/client` | Worker 接口的 TypeScript 客户端（目前只有 `/admin` 使用） |
+| `packages/protocol` | Worker、`packages/client` 与 `/admin` 共用的接口类型 |
+| `plugins/astrobox` | AstroBox 通用激活插件（Rust → WASI） |
+| `scripts` | 品牌图标、手环激活代码生成、密钥生成、离线签发 |
+| `assets/kovela.png` | 品牌图标源文件 |
 
-手环应用位于本仓库之外。共享激活代码变更后，在本仓库运行 `pnpm prepare:vela`，再构建对应应用。
+手环应用都在本仓库之外，与本仓库同级：
 
-`pnpm build:vela` 会生成并构建 `../billiard`、`../tank-turmoil` 和 `../angrybirds`（愤怒的小鸟：前 4 关免费，其余关卡需激活）。共享激活代码只在 `packages/vela/src/` 修改，不直接编辑各应用的 `src/activation/index.js`。合成大西瓜换肤已独立到 `../kovela-watermelon`，游戏从其 `wearable/src/` 生成免费通信模块。
+| 仓库 | 说明 |
+| --- | --- |
+| `../angrybirds` | 愤怒的小鸟。第一章免费，激活后解锁全部 40 关 |
+| `../billiard` | 口袋台球，需激活 |
+| `../tank-turmoil` | 坦克动荡，需激活 |
+| `../projectile` | 抛，完全免费，不接入激活 |
+| `../kovela-watermelon` | 合成大西瓜换肤插件、皮肤资源、图片转换器，以及游戏用的免费通信模块 |
 
 ## 本地开发
 
-需要 Node.js 22、pnpm 10.28.2。
+需要 Node.js 22 和 pnpm 10.28.2。
 
 ```bash
 pnpm install
 cp apps/worker/.dev.vars.example apps/worker/.dev.vars
-pnpm --filter @kovela/worker db:local
-pnpm dev:worker
-pnpm dev
+pnpm --filter @kovela/worker db:local   # 应用本地 D1 迁移
+pnpm dev:worker                          # Worker：http://127.0.0.1:8787
+pnpm dev                                 # 网站：http://127.0.0.1:5173
 ```
 
-网页默认在 <http://127.0.0.1:5173/>，并把 `/api` 代理到 Worker 的 `8787` 端口。
+网站开发服务器把 `/api` 代理到 `8787`（可用 `KOVELA_WORKER_ORIGIN` 覆盖）。展示页不调用接口，不启动 Worker 也能开发；只有 `/admin` 和插件联调需要 Worker。
 
-`.dev.vars` 至少需要爱发电创作者 ID、API Token 和与现有应用公钥匹配的 `LICENSE_SIGNING_SEED`（恢复手环验签时必须沿用同一把密钥，换掉它会让已签发的令牌再也通不过完整校验）。已有签发环境不要运行 `pnpm keys:create`；该命令只用于全新环境，并会在发现已有密钥时拒绝覆盖。
+`.dev.vars` 至少要填以下几项：
 
-## 生产部署
+- 爱发电创作者 ID（`AFDIAN_USER_ID`）和 API Token（`AFDIAN_TOKEN`）。
+- `LICENSE_SIGNING_SEED`：从未跟踪的 `.secrets/worker-license.vars` 复制，必须与现有应用公钥匹配。
 
-公开配置在 `apps/worker/wrangler.jsonc`。以下值只放在 Cloudflare Secrets，不进入 Git：
+各字段的说明见 `apps/worker/.dev.vars.example`。
 
-- `AFDIAN_TOKEN`
-- `LICENSE_SIGNING_SEED`
-- `WEBHOOK_TOKEN`
-- `TURNSTILE_SECRET_KEY`
-- `ADMIN_KEY`：独立的 32 字节随机访问密钥，仅用于 `/admin`，不能使用许可证签名私钥
+> **不要重新生成签名密钥。** `pnpm keys:create` 只用于全新环境，发现已有密钥时会拒绝覆盖。换掉 `LICENSE_SIGNING_SEED` 会让已签发的令牌再也通不过完整校验。
 
-部署前先应用远程迁移：
+## 网站（`apps/web`）
+
+### 页面
+
+| 路径 | 内容 |
+| --- | --- |
+| `/` 总览 | 首屏、四款游戏介绍、实机画面、三步上手 |
+| `/about` 关于 | Kovela 是什么、四条原则、激活的四个环节、常见问题 |
+| `/admin` | 管理员签发，见[管理员签发](#管理员签发) |
+
+`main.ts` 按路径分流。`/admin` 单独加载，用浅色后台样式 `styles/admin.css`，也是唯一启动 Kovela 客户端、调用接口的页面。展示页是纯静态的：不请求 `/api`，订单查询直接跳转爱发电订单页 <https://afdian.com/dashboard/order>。
+
+Worker 以 SPA 模式托管 `apps/web/dist`（`not_found_handling: single-page-application`），所以直接访问 `/about` 也能打开。
+
+### 技术与动效
+
+- Vue 3 + vue-router。动效用 GSAP（ScrollTrigger），平滑滚动用 Lenis，二者通过 GSAP ticker 同步。
+- 动效相关代码集中在 `src/motion/`：`useGsap` 把动画限定在组件内，卸载时自动清理；`reveal.ts` 提供滚动入场和底色渐变；`directives.ts` 提供磁吸按钮和聚光效果。
+- 页面入场要等开场加载或换页幕布结束才播放，由 `stores/ui.ts` 协调。
+- 系统开启「减少动态效果」时，动效、平滑滚动和开场加载都会关闭。
+- 浅色主题。颜色、字体、间距都定义在 `src/styles/base.css` 的 CSS 变量里，整体调色只改这里。
+
+### 内容与素材
+
+游戏数据在 `src/data/games.ts`，常见问题在 `src/data/faq.ts`。
+
+- **主按钮**：链接由 `astroboxUrl(productId)` 生成，格式为 `https://abox.run/open?source=resv2&id=<包名>&provider=OfficialV2`。
+- **次按钮**：游戏有 `purchase` 时出现，跳转爱发电；不填即视为完全免费，只显示 AstroBox 按钮。
+- **素材**：放在 `public/games/<id>/`。
+
+| 素材 | 规格 |
+| --- | --- |
+| `cover.png` | 1200×800 商店封面 |
+| `logo.png` | 方形图标 |
+| 截图 | 手环原始分辨率：竖屏 `frame: "port"` 用 212×520，横屏 `frame: "land"` 用 520×212 |
+
+新增一款游戏：
+
+1. 把素材放进 `public/games/<id>/`，在 `games.ts` 里加一项。
+2. 首屏统计会自动跟着游戏数量变，但「四款游戏」标题和滚动文字带要手动改（`pages/OverviewPage.vue`）。
+3. 如果需要激活，另外按[新增付费商品](#新增付费商品)更新服务端和插件。网站不读取 Worker 的商品配置，两边要分别维护。
+
+站点图标由 `pnpm brand:build` 从 `assets/kovela.png` 生成：网站 Logo、favicon、apple-touch-icon 和插件图标。
+
+## 服务端（`apps/worker`）
+
+### 配置与密钥
+
+公开配置在 `apps/worker/wrangler.jsonc`：
+
+- `PUBLIC_ORIGIN`
+- `PRODUCTS`：可激活商品目录
+- `AFDIAN_USER_ID`
+- `TURNSTILE_SITE_KEY`
+- `DEV_MODE`
+
+以下值只放在 Cloudflare Secrets，不进 Git：
+
+| Secret | 说明 |
+| --- | --- |
+| `AFDIAN_TOKEN` | 爱发电 API Token |
+| `LICENSE_SIGNING_SEED` | 许可证签名私钥 |
+| `WEBHOOK_TOKEN` | 爱发电 Webhook 校验 |
+| `TURNSTILE_SECRET_KEY` | Cloudflare Turnstile |
+| `ADMIN_KEY` | `/admin` 专用的 32 字节随机密钥，不能与签名私钥相同 |
+
+### 部署
+
+推送到 `main` 后，[`deploy.yml`](.github/workflows/deploy.yml) 会依次执行：类型检查、测试、生成品牌图标、构建网站、应用远程 D1 迁移、部署 Worker。仓库需要两个 Actions secret：
+
+- `CLOUDFLARE_API_TOKEN`：需有 Workers 脚本、路由和 D1 写权限
+- `CLOUDFLARE_ACCOUNT_ID`
+
+手动部署时，先迁移、再部署：
 
 ```bash
+pnpm brand:build
 pnpm --filter @kovela/web build
 pnpm --filter @kovela/worker db:remote
 pnpm --filter @kovela/worker deploy
 ```
 
-`main` 分支推送后，[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) 会执行类型检查、测试、数据库迁移和 Worker 部署。仓库需要这两个 Actions secrets：
+### 接口
 
-- `CLOUDFLARE_API_TOKEN`：包含 Workers 脚本、路由和 D1 写权限
-- `CLOUDFLARE_ACCOUNT_ID`
+| 接口 | 调用方 | 作用 |
+| --- | --- | --- |
+| `GET /api/config` | 插件、`/admin`、`license:issue` | 商品目录与服务状态 |
+| `POST /api/orders/lookup` | 插件、`license:issue` | 按订单号列出应用与绑定状态 |
+| `POST /api/activate` | 插件、`license:issue` | 绑定设备并签发许可证 |
+| `POST /api/activation/report` | 插件 | 手环保存后的安装回执 |
+| `POST /api/activation/status` | 插件 | 查询激活状态 |
+| `POST /api/account/products` | 插件 | 按爱发电账号列出已购商品 |
+| `POST /api/account/activate` | 插件 | 按爱发电账号签发 |
+| `POST /api/watermelon/entitlement` | 合成大西瓜换肤插件 | 查询自定义图片权益 |
+| `POST /api/webhooks/afdian` | 爱发电 | 订单通知 |
+| `POST /api/admin/session` | `/admin` | 校验管理员密钥 |
+| `POST /api/admin/licenses` | `/admin` | 管理员签发 |
+| `POST /api/orders/verify` | 当前无客户端调用 | 核单；非本地请求要求 Turnstile 令牌 |
 
-网页与 Worker 的商品目录由 `apps/worker/wrangler.jsonc` 中的 `PRODUCTS` 统一提供，网页读取 `/api/config` 展示，无需单独硬编码。合成大西瓜图片自定义使用 `com.komoridev.watermelon` 和爱发电 item `3187fe28c08a11f1805c52540025c377`（<https://afdian.com/item/3187fe28c08a11f1805c52540025c377>）。该配置必须部署 Worker 才会生效；本次服务端商品配置不包含插件或手环产物发布。
+### 订单规则
 
-更换签发私钥会使已签发的令牌再也通不过完整校验（`pnpm license:issue` 的自检会直接失败），必须同时更新 `packages/vela/src/public-key.js`。手环当前不校验签名，所以换密钥只影响自检，以及将来恢复验签后旧令牌的可用性。
+- 已完成的付费订单和零元兑换订单都可以激活，但必须匹配对应应用的爱发电方案或 SKU。
+- 同一订单里的每个应用只绑定第一台设备。同一设备可以重复激活、重新传输许可证；换设备会被拒绝。
+- 查询订单时得到的爱发电核验结论会记进 `sessions.verified_at`。签发（`/api/activate`）在 120 秒内直接复用这个结论，超时才重新核对付款状态，这样一次激活只需请求一次爱发电。
+- 插件只连接 `https://kovela.komoridevs.icu`。本地调试时，编译插件前设置 `KOVELA_ORIGIN=http://127.0.0.1:8787`。
+
+### 定时任务
+
+触发器在 `wrangler.jsonc`，`src/index.ts` 根据 `event.cron` 区分：
+
+- `* * * * *`：私信重试与过期清理。改这条表达式时，要同步改 `OUTBOX_CRON`。
+- `*/15 * * * *`：补单，见下节。
+
+### Webhook 丢单与补单
+
+爱发电文档写明「服务器异常时不保证及时推送」。丢一单不只是少一条私信：`purchases` 里没有记录，账号激活就看不到这个商品，买家只剩手里的订单号。
+
+所以服务端每 15 分钟主动扫一遍爱发电订单列表（`query-order`，按创建时间倒序）：
+
+- 把已付款、命中商品方案、但本地没有记录的订单补录进来。
+- 补录和私信走 Webhook 同一条路径（`deliverPurchaseGuide`），所以补单和 Webhook 谁先到、重复推送都安全：`purchases` 和 `entitlements` 幂等写入，私信 `outbox` 的主键是 `guide:<订单号>`，先到先得。
+- 每轮最多看最新两页，翻到一页里没有待补订单就停。单轮最多补 20 单（私信有频率限制），剩下的下一轮接着补。部署后的第一轮也会补回窗口内此前漏掉的订单。
+- 未付款的订单本轮跳过，成交后由之后的扫描补上。
+
+### 私信限制与投递诊断
+
+爱发电会以 `ec 400001` 拒收含尖括号（`<`、`>`）或控制字符的私信。2026-11 起平台开始执行这条规则，当时的私信文案用 `>` 做引用，整批私信因此静默失败了三天。现在的处理：
+
+- 文案改用 `·`。
+- `AfdianService.sendMessage` 发送前会兜底清除尖括号和控制字符（保留换行），队列里的旧文案也能正常发出。
+- 仍然失败时，错误码和爱发电原话写进 `outbox.last_error`。
+
+补单每次运行记在 `reconcile_runs`（单行表，`id=1`）：扫描时刻、翻了几页、看到几单、补了几单、失败原因。怀疑补单没跑或私信没发时，先查 `reconcile_runs` 和 `outbox.last_error`。
+
+### 新增付费商品
+
+1. 在 `wrangler.jsonc` 的 `PRODUCTS` 里加商品：应用包名、名称、爱发电链接，以及方案 ID 或 SKU ID。部署 Worker 后才生效。
+2. 离线激活的商品目录写在 `plugins/astrobox/src/offline.rs` 里，需同步更新。
+3. 在 `scripts/prepare-vela.mjs` 的默认目标里加上手环应用，生成激活代码。
+4. 在网站 `apps/web/src/data/games.ts` 里给游戏加 `purchase`。
+
+## 激活
+
+### 订单号与账号激活
+
+插件主界面第一步是「用 AstroBox 账号激活」，不必等服务检查：
+
+- **流程**：插件读取宿主已登录账号中已确认的爱发电绑定（`account.get-current`），把爱发电用户 ID 交给 `/api/account/products` 查购买情况，再用 `/api/account/activate` 签发。买家不用去翻订单号。
+- **超时兜底**：读取账号要弹授权，宿主每次实时查询绑定（单项最多 10 秒）。插件设了 20 秒超时，超时就解锁界面，提示改用订单号激活。
+- **复核与回执**：两个账号接口都不返回订单详情。服务端每次都向爱发电现场复核付款状态和商品匹配；回执、状态查询和私信沿用订单号激活的同一套流程。
+- **多份订单**：同一订单只绑定第一台设备，账号买过多份时，可以继续用下一份订单激活另一台设备。
+- **限流**：宿主安装标识（`os.device-id`，形如 `ab-install-…`）随账号请求发给服务端，只用于限流。它不是硬件序列号，清除应用数据后会变。
+
+> **信任边界**：`afdianUserId` 由插件提供，服务端无法验证调用者就是这个账号的主人。知道某个买家的爱发电用户 ID，就能用他还没绑定的订单激活一台设备。接口为此按 IP、账号和安装标识限流，并限制每份订单只绑一台设备。要彻底关掉这条路，删掉两个账号接口和插件里的账号激活按钮即可。
+
+**创作者自用**：爱发电不允许创作者购买自己的商品，所以账号 ID 等于 `AFDIAN_USER_ID` 时，服务端不查订单，直接列出并签发全部可激活应用。
+
+- 任意设备都可以，每台设备生成一条 `creator:<设备码>` 合成记录（`payment_status=0`），不会混进买家的订单；回执不发私信。
+- 合成大西瓜的自定义权益也直接放行。
+- 创作者 ID 是公开的，伪造它就能免费激活，这是已知并接受的取舍。
+
+### 离线激活
+
+买家的网络连不上 Kovela 时使用。买家这边只通过蓝牙和手环通信，由创作者在可用网络上核单签发；签发写入同一份设备绑定记录，令牌格式（`KV1`）和密钥都不变。
+
+1. **买家取设备码**：在服务异常提示里选「离线激活」，或连续点击服务状态徽标 5 次进入。输入订单号、选择应用、连接手环后点「获取设备码」。设备码来自手环应用的握手，不是蓝牙 MAC。
+2. **买家发申请**：点「复制申请」，把申请 JSON 通过爱发电私信等渠道发给创作者。申请里的订单号不是身份凭证，创作者仍须确认对方就是订单买家。
+3. **创作者签发**：在 `/admin` 导入申请并签发；也可以把申请存成 `request.json`，在仓库里运行：
+
+   ```bash
+   pnpm license:issue --request request.json --output license.json
+   ```
+
+   命令通过 `/api/config`、`/api/orders/lookup`、`/api/activate` 核实付款状态、商品和设备绑定，默认访问线上域名：
+   - 可用 `--origin` 指定可信代理；本地验证允许回环 HTTP。
+   - 已有的输出文件不会被覆盖。同一设备重发时换个文件名，服务端返回原许可证。
+   - 不同设备、未完成订单、商品不符或签名异常时，都不会导出许可证。
+4. **买家导入**：选择 `license.json`，或粘贴文件内容、原始 `KV1` 授权串，点「导入并激活」。手环核对应用和设备指纹，确认属于本机后保存。
+
+几点限制：
+
+- **权限**：剪贴板操作用宿主的 `clipboard.read` 和 `clipboard.write` 权限，选文件用 `dialog.pick_file`。
+- **内容**：许可证文件不含会话、回执令牌或签名私钥。
+- **回执**：离线导入不提交服务器回执，所以服务端只记录「已签发」，不会当作已安装，也不发激活成功私信。
+- **撤销**：已签发的离线许可证无法远程撤销。
+- **隐私**：申请和许可证含订单与设备信息，不要提交到公开仓库。
 
 ### 管理员签发
 
-访问 `/admin`，验证管理员密钥后可粘贴或上传买家的申请 JSON，也可填写订单号、应用及设备码。确认买家身份后核单并签发，下载许可证 JSON 或复制授权串。页面只在内存中保留访问密钥，刷新或退出后需重新输入；密钥不进入 URL、本地存储或产物。
+访问 `/admin`，输入管理员密钥后，可以粘贴或上传买家的申请 JSON，也可以手填订单号、应用和设备码。确认买家身份后核单签发，再下载许可证 JSON 或复制授权串。
 
-运行 `pnpm admin:key` 生成独立访问密钥，保存在未跟踪的 `.secrets/admin-key.vars`；已有文件不会被覆盖，已有许可证公钥不变。本地 `.dev.vars` 尚无 `ADMIN_KEY` 时会自动追加。生产环境在 `apps/worker` 目录执行 `pnpm exec wrangler secret put ADMIN_KEY`，输入该文件中的值；随后正常部署网页和 Worker。
+- **密钥保管**：密钥只保存在页面内存里，刷新或退出后要重新输入；不会出现在 URL、本地存储或构建产物里。
+- **接口**：`POST /api/admin/session`、`POST /api/admin/licenses`，请求头带 `Authorization: Bearer <ADMIN_KEY>`。
+- **签发规则**：签发同样核实订单已完成、商品匹配，并沿用在线激活的设备绑定。同一设备重发返回原许可证，不同设备拒绝，也不提交安装回执。
 
-管理员接口为 `POST /api/admin/session` 和 `POST /api/admin/licenses`，使用 `Authorization: Bearer <ADMIN_KEY>`。签发仍核实已完成订单和对应商品，复用在线激活的原子设备绑定；同设备重发返回原许可证，不同设备拒绝签发，不提交安装成功回执。
+生成密钥：运行 `pnpm admin:key`，密钥保存在未跟踪的 `.secrets/admin-key.vars`，已有文件不会被覆盖。
 
-## AstroBox 插件
+- 本地 `.dev.vars` 里还没有 `ADMIN_KEY` 时，会自动追加进去。
+- 生产环境在 `apps/worker` 下执行 `pnpm exec wrangler secret put ADMIN_KEY`，填入该文件里的值。
 
-插件 UI 走 Material Design 3（深色）令牌，配色、圆角、间距与字号集中在 `plugins/astrobox/src/theme.rs`；宿主把插件页面固定在 `#191919` 深色容器里渲染，所以不跟随宿主应用级主题。通用插件只处理应用激活与离线许可证，西瓜换肤 UI 和图片转换器已移出。
+### 合成大西瓜自定义权益
 
-右上角服务状态徽标在首次打开时通过 `/api/config` 检查服务连通性与配置，每分钟复查；订单查询和激活期间暂缓探测。网络失败、服务端错误或服务配置未就绪时显示红色「服务异常」，点击可展开/收起原因，恢复后自动清除。业务请求的网络和 5xx 错误也会同步到徽标；订单号错误、设备通信错误不作为服务异常。此探测不主动请求爱发电，爱发电运行故障由实际订单请求反映。切到离线激活后不再探测，也不调用订单、签发或回执 API。
+游戏本体、内置皮肤、图片传输和手环保存都免费，购买只解锁换肤插件里的自定义图片导入。换肤插件在独立仓库 `../kovela-watermelon`；通用 Kovela 插件查到西瓜订单时，只提示使用换肤插件，不给手环装许可证。商品 ID `com.komoridev.watermelon` 和爱发电商品 `3187fe28c08a11f1805c52540025c377` 保持不变。
 
-iOS 上小米运动健康会和 AstroBox 抢手环的蓝牙连接：在线激活还没连上手环时（选设备、握手、从握手重试），以及离线取设备码和导入许可证时，插件会显示「iOS 连接提示」卡片，请用户在 iPhone「设置」→「小米运动健康」中关闭「蓝牙」权限并从后台划掉它。文案与合成大西瓜自定义工具一致。
+`POST /api/watermelon/entitlement`：
 
-### 构建与上架：只有 Level 4 一份产物
+- **请求与响应**：接收 `{afdianUserId}`，返回 `{productId, afdianUserId, entitled}`。
+- **判定方式**：从 `purchases.buyer_id` 找到这个爱发电用户的 `entitlements`，再向爱发电核对付款状态。旧的设备绑定不影响账号权益。
+- **不返回的内容**：订单详情、签名许可证和设备信息都不返回。
+- **信任边界**：和账号激活一样不认证调用者。换肤插件只信任宿主返回的已绑定爱发电 ID，每次导入和确认都复查。将来如果需要服务端资源授权，可以接入爱发电 OAuth。
 
-`plugins/astrobox/manifest.json` 就是 Level 4 清单（`wasi_version: 3`、`api_level: 4`，权限含 `account.profile`、`os.device-id`），`pnpm build:plugin` 只出这一份产物到 `plugins/astrobox/dist/kovela/`，上架入口（仓库根目录 `index.txt`）列的也是它。账号资料与宿主安装标识都只有 Level 4 才有，所以不再提供 Level 2/3 兼容构建；AstroBox 2.2 以下的宿主装不了这个插件。
+### 手环侧不做签名校验
 
-- 主界面第一步直接显示「用 AstroBox 账号激活」，无需等待服务检查。插件读宿主已登录账号里已确认的爱发电绑定（`account.get-current`），把账号 ID 交给服务端查购买状态，用户不必去翻订单号。服务检查只更新状态徽标，不控制账号入口。读取账号要弹授权、宿主每次实时查询绑定（单项最多 10 秒），所以插件带 20 秒超时兜底：超时会解锁界面并提示改用订单号激活。
-- 创作者自用：爱发电不允许创作者购买/兑换自己的商品，所以账号 ID 等于 `AFDIAN_USER_ID` 时，服务端不查订单，直接列出并签发全部可激活应用（任意设备，每台设备一条 `creator:<设备码>` 合成记录，`payment_status=0`，不会混进买家候选订单；回执不发私信），西瓜自定义权益也直接放行。账号路由不认证 HTTP 调用者，而创作者 ID 是公开的，伪造该 ID 即可免费激活——这是已知并接受的取舍。
-- 宿主安装标识（`os.device-id`，形如 `ab-install-…`，不是硬件序列号、清除应用数据后会变）随账号请求一起发给服务端，只用于限流，读一次即缓存。
-- 插件不向手环推送任何通知。实时活动和普通通知在真机上都会让手环整机重启，因此相关代码与 `notification` 权限已整体删除；激活进度与结果只在插件界面显示。
+手环只解读 `KV1` 令牌的结构、应用和设备指纹（`packages/license` 的 `decodeLicense`），不校验签名。
+
+**代价**：任何能向手环发 interconnect 消息的人（改过的插件、自己写的插件），都能推送一份字段合法但没付费的令牌，手环会照单收下。付费墙不再由设备端强制。
+
+**为什么还签名**：服务端仍签发带 Ed25519 签名的令牌，`pnpm license:issue`、Worker 测试和 `verifyLicense` 照常做完整校验。
+
+**恢复验签**只需两步，不用换密钥或令牌格式：
+
+1. 把 `packages/vela/src/index.js` 里的 `decodeLicense` 换回 `verifyLicense`，并把公钥参数接回 `scripts/prepare-vela.mjs` 和 `createActivation`。
+2. 重新生成并发布手环应用。
+
+想在设备上加一道更轻的门槛，可以先确认 `@system.crypto` 的 RSA-SHA256 验签在目标机型上可用（原生秒级完成）。
+
+`packages/vela/src/public-key.js` 目前不进入手环产物，只用于 `license:issue` 自检和将来恢复验签。更换签名私钥时必须同步更新它，否则自检会失败。
+
+### 激活链路的等待时间
+
+一次激活要经过插件、Worker、手环三段，每段的等待都算在用户头上。实现上遵循两条原则：先出界面再发请求；已知的结论不重复外呼。
+
+- **插件**：点击处理器只改状态并渲染，网络和宿主调用交给定时事件（`LOOKUP_PAYLOAD`、`ACTIVATE_PAYLOAD`）。宿主要等导出函数返回后才绘制，就地发请求会让画面卡在点击前一到数秒。
+- **手环收到 hello**：结论未出时先记下，读出结论立刻回执，不让插件白等一个 2 秒的重发周期。`retry()` 在途超过 1.5 秒才放弃重来，健康但慢的读取不受影响。
+- **手环读取顺序**：指纹读取和机型读取串行进行。`getDeviceId`/`getInfo` 和存储请求并发时，真机系统服务可能约半分钟不响应。机型只用于回执标注，所以先发回执，读不到就用宿主连接名。
+- **激活页看门狗**：每节 2.5 秒、共四节。页面可见时应用级定时器不运行，存储回调丢失时只能靠页面驱动重读。
+- **写入窗口**：安装包写入等待 4 轮 × 12 秒。手环落盘前要读指纹、写存储，窗口太窄会把正在写入的激活误判为超时。
+- **`NOT_READY`**：手环回这个状态，只表示还没轮到（指纹未就绪，或上一个安装包正在落盘）。插件继续等下一轮，不算失败，也不发失败私信。
+
+## AstroBox 插件（`plugins/astrobox`）
+
+### 界面与行为
+
+- **界面**：遵循 Material Design 3 深色规范，颜色、圆角、间距、字号集中在 `src/theme.rs`。宿主把插件固定渲染在 `#191919` 深色容器里，所以不跟随宿主主题。
+- **服务状态徽标**：打开插件时请求 `/api/config` 检查连通性，之后每分钟复查，查订单和激活期间暂停。网络失败、服务端错误或配置未就绪时显示红色「服务异常」，点击可展开原因，恢复后自动消失。业务请求的网络错误和 5xx 也会同步到徽标；订单号错误、设备通信错误不算服务异常。切到离线激活后停止探测。
+- **iOS 连接提示**：iOS 上小米运动健康会和 AstroBox 抢手环的蓝牙。在线激活连上手环之前，以及离线取设备码、导入许可证时，插件显示「iOS 连接提示」：请用户在 iPhone「设置 → 小米运动健康」中关闭蓝牙权限，并从后台划掉它。
+- **不推送通知**：实时活动和普通通知在真机上都会让手环重启，相关代码和 `notification` 权限已整体删除，激活进度只在插件界面显示。
+
+### 构建
+
+只出一份 Level 4 产物：`manifest.json` 为 `wasi_version: 3`、`api_level: 4`，权限包括 `account.profile` 和 `os.device-id`。账号资料和宿主安装标识只有 Level 4 才提供，所以不再做 Level 2/3 兼容构建，AstroBox 2.2 以下装不了。
 
 本地打包需要 Rust stable 和 `wasm32-wasip2` 目标：
 
@@ -95,100 +325,30 @@ rustup target add wasm32-wasip2
 pnpm build:plugin
 ```
 
-产物只有一份：
+产物在 `plugins/astrobox/dist/kovela/`：`manifest.json`、`kovela_astrobox.wasm`、`icon.png`、`Kovela.abp`。其中 `.abp` 是给用户本地导入的完整包，不在 `additional_files` 里，商店不会下载它；其他 `.abp` 由 `.gitignore` 排除。
 
-| 路径 | 用途 |
-| --- | --- |
-| `plugins/astrobox/dist/kovela/` | **上架用**：AstroBox 2.2.0+（WASI 3 / api_level 4），含 `manifest.json`、`kovela_astrobox.wasm`、`icon.png`、`Kovela.abp` |
+推送插件源码，或手动运行 [`plugin.yml`](.github/workflows/plugin.yml)，Actions 会执行同一条构建命令，把产物提交回 `main` 并上传 `.abp`。
 
-目录里的 `.abp` 是给用户本地导入的完整包（不在 `additional_files` 里，商店不会下载它）；其余 `.abp` 仍被 `.gitignore` 排除。
+### 上架官方插件源
 
-推送插件源码，或手动运行 [`.github/workflows/plugin.yml`](.github/workflows/plugin.yml)，Actions 会执行同一条命令，把产物提交回 `main` 并上传 `.abp`。
+官方插件源的聚合脚本（[AstroBox-NG-Plugin-Repo](https://github.com/AstralSightStudios/AstroBox-NG-Plugin-Repo) 的 `generate-index`）每 4 小时通过匿名 raw URL 抓取一次产物，所以仓库必须公开，产物必须提交进 Git。
 
-### 上架 AstroBox 官方插件源
+- 根目录的 [`index.txt`](index.txt) 列出存放 `manifest.json` 的目录（`plugins/astrobox/dist/kovela`）；空行和 `#` 开头的行会被忽略。
+- 上游仓库的 `index.txt` 里登记的入口是 `https://raw.githubusercontent.com/KomoriDev/kovela/refs/heads/main/`。
+- 发版只需修改 `plugins/astrobox/manifest.json` 的 `version` 并推送，等 Action 跑完即可。
 
-聚合脚本（[`AstroBox-NG-Plugin-Repo`](https://github.com/AstralSightStudios/AstroBox-NG-Plugin-Repo) 的 `generate-index`）每 4 小时按**匿名 raw URL** 抓一次产物，因此仓库必须是公开的，且产物必须提交进 Git：
+## 手环应用
 
-- 仓库根目录的 [`index.txt`](index.txt) 列出存放 `manifest.json` 的文件夹（`plugins/astrobox/dist/kovela`）；空行和 `#` 行会被忽略。
-- 上架入口写在上游仓库的 `index.txt` 里：`https://raw.githubusercontent.com/KomoriDev/kovela/refs/heads/main/`。
-- 发版本时只改 `plugins/astrobox/manifest.json` 的 `version`，推上去等 Action 生效即可。
+共享激活代码只在 `packages/vela/src/` 修改，不要直接编辑各应用的 `src/activation/index.js`：
 
-### 合成大西瓜自定义权益
+```bash
+pnpm prepare:vela   # 生成 ../billiard、../tank-turmoil、../angrybirds 的激活代码
+pnpm build:vela     # 生成后依次构建这三个应用
+```
 
-换肤插件、皮肤资源、图片转换器和免费手环模块位于独立仓库 `../kovela-watermelon`。原商品 `com.komoridev.watermelon` 和爱发电 item `3187fe28c08a11f1805c52540025c377` 保持不变。内置皮肤、图片传输与手环保存均免费；购买只解锁插件内的自定义图片导入。通用 Kovela 插件查询到西瓜订单时提示使用独立换肤插件，不再给手环安装西瓜许可证。
+`prepare:vela` 也可以带路径参数，只生成指定的应用。合成大西瓜的免费通信模块从 `../kovela-watermelon` 的 `wearable/src/` 生成，不经过这里。
 
-`POST /api/watermelon/entitlement` 接收 `{afdianUserId}`，返回 `{productId, afdianUserId, entitled}`。`purchases.buyer_id` 已保存爱发电用户 ID，查询关联原商品的 `entitlements`，再向爱发电核对有效支付状态；旧设备绑定不影响账号自定义权益。该接口不返回订单详情、handoff、签名许可证或设备信息。
-
-V4 `account.get-current` 提供实时绑定资料，不提供可供后端验证的 token。插件只信任宿主返回的 `linked` 爱发电 ID，每次导入和确认应用都复查；未登录、未绑定、绑定查询失败、账号切换或服务器响应 ID 不符时拒绝导入。此接口是本地付费功能的权益查询，不是对任意 HTTP 调用者的身份认证。若以后需要服务端资源授权，可增加独立爱发电 OAuth。
-
-发布前应用 `0004_buyer_entitlements.sql` 并部署 Worker，再分别发布独立 V4 插件和合成大西瓜 1.2.0；只更新插件无法让旧手环应用免费传输。既有购买记录、商品配置和图片持久文件无需搬迁。
-
-## 订单与私信
-
-已完成的付费订单和零元兑换订单都可以验证，但必须匹配对应应用的爱发电方案或 SKU。爱发电私信会带上订单号，买家在 AstroBox 的 Kovela 插件里输入即可。插件只连接 `https://kovela.komoridevs.icu`；本地调试可在编译插件时设置 `KOVELA_ORIGIN=http://127.0.0.1:8787`。验证成功后的激活回执仍由服务端发送。查询订单时核过的爱发电结论会随会话记进 `sessions.verified_at`（`0005_session_verified.sql`），签发（`/api/activate`）在 120 秒内直接复用它，超过窗口才重新核对付款状态；同一次激活不必为同一个结论付两次爱发电往返。同一订单的每个应用只绑定第一台设备。网页可按订单号查询订单包含的应用与绑定状态。
-
-### Webhook 丢单与补单
-
-爱发电的 Webhook 文档写明「如果服务器异常，不保证能及时推送」。丢一单的代价不只是没有教学私信：`purchases` 里没有记录，账号激活（`/api/account/products`）也就看不到这个商品，买家只剩手里那个订单号。
-
-服务端因此每 15 分钟主动扫一遍爱发电的订单列表（`query-order` 按订单创建时间倒序分页），把已付款、命中商品方案、本地却没有购买记录的订单补成正常订单。落库和发私信都走 Webhook 那条 `deliverPurchaseGuide` 路径，所以先补后到、重复推送都是安全的：`purchases`/`entitlements` 幂等写入，私信 `outbox` 主键是 `guide:<订单号>`，先到先得。扫描从最新一页往回翻，翻到没有待补单的一页就停，单轮最多补 20 单（私信有频率限制），剩下的下一轮接着补；窗口是最新两页，所以部署后的第一轮也会把窗口内此前漏掉的订单补回来。还没付款的订单在这轮跳过，等它成交后自然会被下一次扫描捡到。
-
-触发器在 `apps/worker/wrangler.jsonc`：`* * * * *` 仍只做私信重试与过期清理，`*/15 * * * *` 多跑一次补单；`apps/worker/src/index.ts` 靠 `event.cron` 区分两者，改每分钟那条表达式时要同步 `OUTBOX_CRON`。
-
-### 私信内容限制与投递诊断
-
-爱发电会以 `ec 400001` 拒收含尖括号（`<`、`>`）或控制字符的私信。平台在 2026-11 开始执行这条规则，而当时的教学私信和激活回执都用 `>` 做引用，整批私信因此静默失败了三天——`outbox` 里只有 `attempts` 在涨，看不出原因。现在文案改用 `·`，`AfdianService.sendMessage` 还会在发送前兜底清洗尖括号与控制字符（换行保留），所以队列里存量的旧文案也能照常发出去；仍然失败时，错误码和爱发电原话会写进 `outbox.last_error`。
-
-补单的心跳记在 `reconcile_runs`（单行表，`id=1`）：最近一次扫描的时刻、翻了几页、看见多少单、补了几单、失败原因。怀疑补单没跑或私信没发时，先查 `reconcile_runs` 和 `outbox` 的这两列，不需要再靠猜。
-
-### 离线激活
-
-插件支持网络异常时的离线激活，适用于买家无法连接 Kovela 服务的网络。用户端只通过蓝牙与手环通信；创作者在可用网络上核单并签发，使用现有 Worker/D1 的同一份设备绑定记录，不另建台账。手环沿用现有 `KV1` 令牌的结构与存储流程，不需要更换密钥或格式。
-
-剪贴板操作分别使用宿主的 `clipboard.read` 和 `clipboard.write` 权限，首次操作时按系统提示授权。选择许可证文件走 `dialog.pick_file` 的一次性读取句柄，取消选择保留原许可证输入。
-
-1. 买家在服务异常询问中选择「离线激活」，或连续点击服务状态徽标 5 次进入。输入订单号并选择应用，连接手环后点「获取设备码」。设备码来自该手环应用的握手，不是蓝牙 MAC；在线流程已取得的设备码会保留。
-2. 点「复制申请」，将申请 JSON 通过爱发电私信等渠道发给创作者。创作者仍须确认发起者是订单买家；申请里的订单号不是身份凭证。
-3. 创作者在 `/admin` 验证密钥，导入申请、确认买家身份并签发下载 `license.json`。也可将申请保存为 `request.json`，在仓库运行：
-
-   ```bash
-   pnpm license:issue --request request.json --output license.json
-   ```
-
-   命令通过现有 `/api/config`、`/api/orders/lookup`、`/api/activate` 核实当前付款状态、商品和设备绑定；默认访问线上域名。可用 `--origin https://你的代理域名` 指定可信代理；本地验证允许回环 HTTP。已有输出文件会被拒绝覆盖；同一设备重发可指定新的输出文件名，服务端返回原许可证。不同设备、未完成订单、错误商品或签名异常不会导出许可证。
-4. 创作者将 `license.json` 发给买家。买家点「选择文件」导入，或粘贴整个文件内容/原始 `KV1` 授权串，点「导入并激活」。手环比对令牌里的应用与设备指纹，确认属于本机后保存并返回回执，插件显示离线激活完成。
-
-许可证文件不包含会话、回执令牌或签名私钥。离线导入不提交服务器回执，因此网页保留「已签发」及设备绑定，不会冒充已经确认安装；也不会发送服务端激活成功私信。已签发的永久离线许可证不支持实时退款撤销。
-
-离线产品目录目前包含口袋台球、坦克动荡、愤怒的小鸟和合成大西瓜图片自定义；新增商品时同步维护 `plugins/astrobox/src/offline.rs`。生成的申请和许可证含订单/设备信息，不应提交到公共仓库。
-
-## 激活链路的等待时间
-
-一次激活要跨越插件、Worker 与手环三段，任何一段的等待都会算在用户头上。当前实现按「先出界面、再发请求」和「不让已知结论重复外呼」组织：
-
-- 插件的点击处理器只改状态并渲染，网络与主机调用交给定时事件（`LOOKUP_PAYLOAD`、`ACTIVATE_PAYLOAD`）。宿主在导出返回后才绘制，就地查询订单或打开手环应用会让画面停在点击前的样子一到数秒。
-- 手环在结论未出时收到 hello 会先记账，读链一出结论立刻回执，不让插件白等一个 2 秒重发轮次；`retry()`（激活页 onShow 与「重新连接」）在途超过 1.5 秒就放弃读链重来，健康但慢的读取不动。
-- 手环的指纹读取与机型读取串行：`getDeviceId`/`getInfo` 与存储请求并发会把真机系统服务挤到约半分钟不响应。机型只用于回执标注，回执先发，读不到就退回宿主连接名。激活页也把 `device.getInfo` 排在授权结论之后，并用默认屏参先立布局。
-- 激活页带 2.5 秒一节、共四节的看门狗兜底：app 上下文的定时器在页面可见时不跑，状态机自己的 8 秒看门狗不会响，存储回调被丢时只有页面能驱动重读。
-- 安装包写入的等待窗口是 4 轮 × 12 秒。手环落盘前要读指纹、写存储，叠加系统服务拥堵，窗口太窄会把已经在写入的激活误判成超时。
-- 手环回 `NOT_READY`（指纹未就绪或上一条安装包正在落盘）只表示还没轮到：插件继续等下一轮重发，不当作失败上报，也不给买家发失败私信。
-- 签发复用查询订单时的爱发电结论（见上文），同一次激活只付一次爱发电往返。
-
-### 手环侧不做签名校验
-
-激活判定只解读 `KV1` 令牌：结构、产品与设备指纹（`packages/license` 的 `decodeLicense`）。**代价要说清楚**：任何能向手环发 interconnect 消息的人（改过的插件、自写插件）都能推送一份字段合法但未付费的令牌，手环会照单收下并激活——付费墙不再由设备端强制。此前这道判定能挡住"手打一段令牌"和"改本地记录"这类做法，只挡不住"重打包应用再侧载"；现在前者也放开了。
-
-服务端仍用 `LICENSE_SIGNING_SEED` 签发带 Ed25519 签名的令牌，`pnpm license:issue`、Worker 测试与 `packages/license` 的 `verifyLicense` 继续做完整校验。因此**恢复验签只需两步**：把 `packages/vela/src/index.js` 里的 `decodeLicense` 换回 `verifyLicense`（并把公钥参数接回 `scripts/prepare-vela.mjs` 与 `createActivation`），然后重新发布手环应用；不需要轮换密钥或更换令牌格式。想在设备上重新加一道门槛，可先确认 `@system.crypto` 的 RSA-SHA256 验签在本机型可用（原生秒级），再决定是否改用该原语。
-
-手环侧改动只需改 `packages/vela/src/index.js`，运行 `pnpm prepare:vela` 会重新生成 `../billiard`、`../tank-turmoil`、`../angrybirds` 的 `src/activation/index.js`。`packages/vela/src/public-key.js` 已不再进入手环产物，只服务于 `pnpm license:issue` 的自检与将来恢复验签。
-
-### 账号维度激活
-
-Level 4 插件另有两条接口：`POST /api/account/products` 用宿主确认的 `afdianUserId` 列出该账号已完成的商品与绑定状态，`POST /api/account/activate` 用同一账号加设备码签发许可证。两者都不返回订单详情，服务端每次重新用爱发电现场复核付款状态与商品匹配，签发后回执、状态查询与私信通知都沿用在线激活那条路径（`sessions` 记录把这次核对标成 `verified_at`）。同一订单仍然只绑定第一台设备，所以账号买过多份时可以继续用下一份订单。
-
-信任边界要说清楚：`afdianUserId` 由插件提供，和 `/api/watermelon/entitlement` 一样，这不是对任意 HTTP 调用者的身份认证——知道某个买家的爱发电用户 ID，就能用该账号尚未绑定的订单激活一台设备。接口为此按 IP、按账号、按宿主安装标识限流，并把绑定限制在每订单一台；要彻底关掉这条路，删掉这两条接口与插件里的「用 AstroBox 账号激活」按钮即可。
-
-## 检查
+## 提交前检查
 
 ```bash
 pnpm typecheck
