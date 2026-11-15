@@ -24,6 +24,8 @@ export interface Game {
   tagline: string;
   description: string;
   facts: string[];
+  /** Short pricing label, e.g. 免费 or 第一章免费. */
+  pricing: string;
   purchase?: Purchase;
   cover: string;
   logo: string;
@@ -58,6 +60,7 @@ export const games: Game[] = [
     description:
       "经典弹弓物理，适配全部小米 Vela 穿戴设备，手环上横屏开打。按住后拖拉开弹弓、松手发射，飞行中再点一下放技能。5 章 40 关、10 种小鸟，木、冰、石、TNT 各有克制。第一章免费体验，激活后解锁全部 40 关。",
     facts: ["5 章 40 关", "10 种小鸟", "手环横屏", "第一章免费"],
+    pricing: "第一章免费",
     purchase: {
       label: "解锁全部关卡",
       url: "https://afdian.com/item/d6c41a82d55411f184b3525400c8052f",
@@ -83,6 +86,7 @@ export const games: Game[] = [
     description:
       "八球、追分、练习三种玩法，适配胶囊屏、矩形屏与圆屏。球桌上滑动瞄准，按住蓄力，松手出杆；沿屏幕边缘的弧形轨道还能精细微调。两人共用一台设备对战，也能和电脑对打。",
     facts: ["八球 · 追分 · 练习", "双人同屏", "人机对战", "战绩记录"],
+    pricing: "付费",
     purchase: {
       label: "爱发电支持",
       url: "https://afdian.com/item/034b2c98b83c11f1a14452540025c377",
@@ -108,6 +112,7 @@ export const games: Game[] = [
     description:
       "小球绕环转动，点按沿切线抛出。落回同一个环可以继续，接住前方新环按前进距离计分，落出边界即结束。一指操作，越抛越远。",
     facts: ["极简物理", "单指操作", "横屏", "免费"],
+    pricing: "免费",
     cover: "/games/projectile/cover.png",
     logo: "/games/projectile/logo.png",
     frame: "land",
@@ -128,6 +133,7 @@ export const games: Game[] = [
     description:
       "11 种水果层层合成，竖屏单手即玩。游戏、内置皮肤与图片传输全部免费；支持后可在插件中导入自定义图片，把水果换成你喜欢的样子。",
     facts: ["11 种水果", "竖屏", "免费游玩", "自定义图片"],
+    pricing: "免费 · 自定义付费",
     purchase: {
       label: "解锁自定义图片",
       url: "https://afdian.com/item/3187fe28c08a11f1805c52540025c377",
