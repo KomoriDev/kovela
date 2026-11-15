@@ -46,6 +46,9 @@ function isEnvelope(data: unknown): data is Envelope {
 
 /* ---------- theme & transparency ---------- */
 
+let markConfigured: () => void = () => {};
+const configured = new Promise<void>((resolve) => (markConfigured = resolve));
+
 function applyConfig(message: Envelope) {
   const root = document.documentElement;
   if (message.theme === "light" || message.theme === "dark") {
@@ -53,7 +56,22 @@ function applyConfig(message: Envelope) {
     root.style.colorScheme = message.theme;
   }
   root.classList.toggle("astrobox-transparent", message.transparent === true);
+  markConfigured();
   if (message.requestResize === true) reportHeight(true);
+}
+
+/**
+ * Resolves once the App has sent its theme, or after `timeoutMs` (the App may be
+ * old, or the page may be open in a plain browser). Chromium paints an opaque
+ * canvas behind an iframe whose color scheme differs from its host's, so the page
+ * should not be revealed until the theme is applied.
+ */
+export function themeSettled(timeoutMs: number): Promise<void> {
+  if (!embedded) return Promise.resolve();
+  return Promise.race([
+    configured,
+    new Promise<void>((resolve) => window.setTimeout(resolve, timeoutMs)),
+  ]);
 }
 
 /* ---------- auto height ---------- */
@@ -61,10 +79,17 @@ function applyConfig(message: Envelope) {
 let heightFrame = 0;
 let lastHeight = 0;
 let forceReport = false;
+/** The App reveals the frame on the first resize, so hold it until we are ready. */
+let heightEnabled = false;
+
+export function enableHeightReports(): void {
+  heightEnabled = true;
+  reportHeight(true);
+}
 
 export function reportHeight(force = false): void {
   forceReport ||= force;
-  if (heightFrame || !embedded) return;
+  if (heightFrame || !embedded || !heightEnabled) return;
   heightFrame = requestAnimationFrame(() => {
     heightFrame = 0;
     const shouldForce = forceReport;

@@ -1,9 +1,26 @@
 import { games, type Game } from "../data/games";
-import { embedded, openResource, reportHeight, resourceHref, startBridge } from "./bridge";
-import "./style.css";
+import {
+  embedded,
+  enableHeightReports,
+  openResource,
+  resourceHref,
+  startBridge,
+  themeSettled,
+} from "./bridge";
+// Inlined into the bundle rather than linked, so no render-blocking stylesheet
+// request delays the boot skeleton painted from index.html.
+import css from "./style.css?inline";
+
+// Listen for the App's config before doing anything else; it may already be retrying.
+startBridge();
+document.head.append(Object.assign(document.createElement("style"), { textContent: css }));
 
 const AUTOPLAY_MS = 5200;
 const IDLE_RESUME_MS = 9000;
+/** Longest wait for the App's theme before revealing anyway. */
+const THEME_WAIT_MS = 600;
+/** Longest the skeleton waits for the first covers before handing over. */
+const COVER_WAIT_MS = 1200;
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 /* ---------- tiny DOM helper (textContent only, no HTML injection) ---------- */
@@ -42,7 +59,7 @@ function hero(): HTMLElement {
     h(
       "div",
       { class: "brand reveal", style: "--d: 0" },
-      h("img", { src: "/brand/kovela-mark.png", alt: "", width: "36", height: "36" }),
+      h("img", { src: "/astrobox/mark.webp", alt: "", width: "36", height: "36" }),
       h("span", { class: "brand-name" }, "Kovela"),
       h("span", { class: "brand-tag" }, h("i", { "aria-hidden": "true" }), "MI-VELA GAMES"),
     ),
@@ -102,13 +119,15 @@ function card(game: Game, index: number): HTMLElement {
     h(
       "div",
       { class: "art" },
+      // All four covers are small (16–61 KB) and a lazy image inside a sideways
+      // scroller in an iframe may never be fetched, so load them all eagerly.
       h("img", {
         src: `/astrobox/covers/${game.id}.webp`,
         alt: "",
         width: "720",
         height: "480",
         decoding: "async",
-        loading: index < 2 ? "eager" : "lazy",
+        fetchpriority: index === 0 ? "high" : undefined,
       }),
       h("span", { class: "badge" }, game.pricing),
       h("span", { class: "shine", "aria-hidden": "true" }),
@@ -116,7 +135,18 @@ function card(game: Game, index: number): HTMLElement {
     h(
       "div",
       { class: "meta" },
-      h("img", { class: "logo", src: game.logo, alt: "", width: "48", height: "48" }),
+      h(
+        "span",
+        { class: "logo-wrap" },
+        h("img", {
+          class: "logo",
+          src: `/astrobox/logos/${game.id}.webp`,
+          alt: "",
+          width: "48",
+          height: "48",
+          decoding: "async",
+        }),
+      ),
       h(
         "div",
         { class: "meta-text" },
@@ -159,6 +189,13 @@ function mountCarousel(rail: HTMLElement, tabList: HTMLElement) {
     tabList.scrollTo({ left, behavior: reducedMotion ? "auto" : "smooth" });
   }
 
+  function updateTabEdges() {
+    const max = tabList.scrollWidth - tabList.clientWidth;
+    tabList.classList.toggle("has-more-start", tabList.scrollLeft > 2);
+    tabList.classList.toggle("has-more-end", tabList.scrollLeft < max - 2);
+  }
+  tabList.addEventListener("scroll", updateTabEdges, { passive: true });
+
   function setActive(index: number) {
     if (index === active && cards[index].classList.contains("is-active")) return;
     active = index;
@@ -172,7 +209,11 @@ function mountCarousel(rail: HTMLElement, tabList: HTMLElement) {
 
   function scrollToCard(index: number) {
     const target = cards[index];
-    const left = target.offsetLeft - (rail.clientWidth - target.offsetWidth) / 2;
+    // Phones snap cards to the centre; wide boards snap them to the left gutter.
+    const startAligned = getComputedStyle(target).scrollSnapAlign.includes("start");
+    const left = startAligned
+      ? target.offsetLeft - (parseFloat(getComputedStyle(rail).scrollPaddingLeft) || 0)
+      : target.offsetLeft - (rail.clientWidth - target.offsetWidth) / 2;
     rail.scrollTo({ left, behavior: reducedMotion ? "auto" : "smooth" });
   }
 
@@ -244,13 +285,50 @@ function mountCarousel(rail: HTMLElement, tabList: HTMLElement) {
   document.addEventListener("visibilitychange", arm);
   window.addEventListener("resize", () => {
     movePill();
+    updateTabEdges();
     scrollToCard(active);
   });
 
   cards[0].classList.add("is-active");
-  document.fonts?.ready.then(movePill);
+  document.fonts?.ready.then(() => {
+    movePill();
+    updateTabEdges();
+  });
   movePill();
+  updateTabEdges();
   arm();
+}
+
+/* ---------- images ---------- */
+
+/** Marks each image's wrapper loaded (fading it in over its shimmer). */
+function mountImages(root: HTMLElement) {
+  root.querySelectorAll<HTMLImageElement>(".art img, .logo").forEach((img) => {
+    const wrap = img.parentElement!;
+    const done = () => wrap.classList.add("is-loaded");
+    if (img.complete && img.naturalWidth) done();
+    else {
+      img.addEventListener("load", done, { once: true });
+      // A failed image should stop shimmering rather than look "still loading".
+      img.addEventListener("error", done, { once: true });
+    }
+  });
+}
+
+/** Resolves when the given images have loaded (or failed), capped at `timeoutMs`. */
+function imagesReady(images: HTMLImageElement[], timeoutMs: number): Promise<void> {
+  const loads = images.map((img) =>
+    img.complete
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => {
+          img.addEventListener("load", () => resolve(), { once: true });
+          img.addEventListener("error", () => resolve(), { once: true });
+        }),
+  );
+  return Promise.race([
+    Promise.all(loads).then(() => undefined),
+    new Promise<void>((resolve) => window.setTimeout(resolve, timeoutMs)),
+  ]);
 }
 
 /* ---------- open & toast ---------- */
@@ -282,7 +360,15 @@ function mountOpening(rail: HTMLElement, toast: HTMLElement) {
 
 /* ---------- boot ---------- */
 
-function mount() {
+/**
+ * Loading sequence, all behind the skeleton painted straight from index.html:
+ *   1. Build the real page invisibly, so its final height is known up front.
+ *   2. Wait for the App's theme, then report the height; the App reveals the frame
+ *      already themed, showing the skeleton.
+ *   3. Once the first covers are in (or after a short cap), cross-fade the
+ *      skeleton into the page and play the entrance.
+ */
+async function boot() {
   const root = document.getElementById("profile")!;
   const rail = h(
     "div",
@@ -294,13 +380,20 @@ function mount() {
   root.append(hero(), tabList, rail, footer(), toast);
 
   document.documentElement.classList.toggle("is-embedded", embedded);
-  startBridge();
+  mountImages(root);
   mountCarousel(rail, tabList);
   mountOpening(rail, toast);
-  requestAnimationFrame(() => {
-    document.documentElement.classList.add("is-ready");
-    reportHeight(true);
-  });
+
+  await themeSettled(THEME_WAIT_MS);
+  enableHeightReports();
+
+  const firstCovers = Array.from(rail.querySelectorAll<HTMLImageElement>(".art img")).slice(0, 2);
+  await imagesReady(firstCovers, COVER_WAIT_MS);
+
+  document.documentElement.classList.add("is-ready");
+  root.removeAttribute("aria-busy");
+  const skeleton = document.querySelector(".boot");
+  window.setTimeout(() => skeleton?.remove(), reducedMotion ? 0 : 600);
 }
 
-mount();
+void boot();
