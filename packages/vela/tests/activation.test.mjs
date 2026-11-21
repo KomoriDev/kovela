@@ -25,13 +25,14 @@ const publicKey = createPublicKey(signingKey)
   .subarray(12)
   .toString("hex");
 
-function mint(deviceId, licenseId = "license-0000000001") {
+function mint(deviceId, licenseId = "license-0000000001", edition) {
   const payload = {
     v: 1,
     licenseId,
     productId: PRODUCT,
     deviceId,
     issuedAt: 1790000000000,
+    ...(edition === undefined ? {} : { edition }),
   };
   const body =
     "KV1." +
@@ -258,6 +259,7 @@ test("旧版迁移：v1 授权串与指纹缓存也能立即出结论", () => {
     token,
     device: fingerprint,
     licenseId: "",
+    edition: "",
   });
 });
 
@@ -426,7 +428,9 @@ test("安装包在指纹未就绪时回 NOT_READY，就绪后重发即可激活"
     token: licenseToken,
     device: deviceFingerprint(RAW_DEVICE, PRODUCT),
     licenseId,
+    edition: "",
   });
+  assert.equal(latest().edition, "", "没有型号的许可证，edition 为空串");
   const finalReceipt = env.sent[env.sent.length - 1];
   assert.equal(finalReceipt.type, "activation-result");
   assert.equal(finalReceipt.success, true);
@@ -661,4 +665,138 @@ test("读链卡死超过 1.5 秒后 retry() 放弃在途读链重来", (t) => {
   env.serveStorage();
   assert.equal(latest().ready, true, "重读后照样出结论");
   assert.equal(latest().error, "");
+});
+
+test("型号：安装带 edition 的许可证后快照与记录都带型号，hello 回执附上型号", () => {
+  const { env, activation, latest } = start({ token: "" });
+  env.serveStorage();
+  assert.equal(latest().edition, "", "未激活时 edition 为空串");
+  activation.retry();
+  env.serveStorage();
+  const fingerprint = deviceFingerprint(RAW_DEVICE, PRODUCT);
+  const licenseId = "license-online-0001";
+  const licenseToken = mint(fingerprint, licenseId, "online");
+  env.connection.onmessage({ data: { v: 1, id: HELLO_ID, type: "hello" } });
+  env.pending.id.shift().success({ deviceId: RAW_DEVICE });
+  env.connection.onmessage({
+    data: { v: 1, id: HELLO_ID, type: "install-license", licenseId, licenseToken },
+  });
+  env.pending.set.shift().success();
+  assert.equal(latest().activated, true);
+  assert.equal(latest().edition, "online", "型号取自解读出的载荷");
+  assert.deepEqual(JSON.parse(env.sets().at(-1).value), {
+    token: licenseToken,
+    device: fingerprint,
+    licenseId,
+    edition: "online",
+  });
+  env.connection.onmessage({ data: { v: 1, id: HELLO_ID, type: "hello" } });
+  const reply = env.sent.filter((item) => item.type === "device").at(-1);
+  assert.equal(reply.activated, true);
+  assert.equal(reply.edition, "online", "hello 回执附上当前型号，仅供展示");
+});
+
+test("型号：v2 记录里的 edition 直接采信，启动不碰设备、不写盘", () => {
+  const fingerprint = deviceFingerprint(RAW_DEVICE, PRODUCT);
+  const token = mint(fingerprint, "license-0000000001", "online");
+  const { env, latest } = start({
+    record: { token, device: fingerprint, licenseId: "license-0000000001", edition: "online" },
+  });
+  env.serveStorage();
+  assert.equal(latest().activated, true);
+  assert.equal(latest().edition, "online");
+  assert.equal(env.pending.id.length, 0);
+  assert.equal(env.sets().length, 0);
+});
+
+test("型号：没有 edition 键的旧记录从令牌载荷补出型号，不验签、不写盘", () => {
+  const fingerprint = deviceFingerprint(RAW_DEVICE, PRODUCT);
+  const token = mint(fingerprint, "license-0000000001", "standard");
+  const { env, latest } = start({
+    record: { token, device: fingerprint, licenseId: "license-0000000001" },
+  });
+  env.serveStorage();
+  assert.equal(latest().activated, true);
+  assert.equal(latest().edition, "standard");
+  assert.equal(env.pending.id.length, 0, "补型号不碰设备服务");
+  assert.equal(env.pending.info.length, 0);
+  assert.equal(env.sets().length, 0, "启动不写盘");
+});
+
+test("型号：旧记录里的令牌解不出载荷时不抛错，型号回落为空串", () => {
+  const fingerprint = deviceFingerprint(RAW_DEVICE, PRODUCT);
+  for (const token of ["KV1.@@@.x", "not-a-token", "KV1." + Buffer.from("{").toString("base64url") + ".x"]) {
+    const { env, latest } = start({
+      record: { token, device: fingerprint, licenseId: "license-0000000001" },
+    });
+    env.serveStorage();
+    assert.equal(latest().ready, true);
+    assert.equal(latest().activated, true, "启动照旧采信本机记录");
+    assert.equal(latest().edition, "");
+  }
+  // 旧版键迁移同样补型号，并把型号写进 v2 记录。
+  const token = mint(fingerprint, "license-0000000001", "online");
+  const migrated = start({ token, cachedDevice: fingerprint });
+  migrated.env.serveStorage();
+  assert.equal(migrated.latest().edition, "online");
+  assert.equal(JSON.parse(migrated.env.sets().at(-1).value).edition, "online");
+});
+
+test("型号升级：已激活普通版时 hello 回 activated:true，新编号的联机版许可证照常解读并覆盖旧记录", () => {
+  const fingerprint = deviceFingerprint(RAW_DEVICE, PRODUCT);
+  const standard = mint(fingerprint, "license-standard-01", "standard");
+  const { env, activation, latest } = start({
+    record: { token: standard, device: fingerprint, licenseId: "license-standard-01", edition: "standard" },
+  });
+  env.serveStorage();
+  assert.equal(latest().edition, "standard");
+  activation.retry();
+  env.connection.onmessage({ data: { v: 1, id: HELLO_ID, type: "hello" } });
+  const hello = env.sent.at(-1);
+  assert.equal(hello.activated, true);
+  assert.equal(hello.edition, "standard");
+
+  const online = mint(fingerprint, "license-online-0001", "online");
+  env.connection.onmessage({
+    data: { v: 1, id: HELLO_ID, type: "install-license", licenseId: "license-online-0001", licenseToken: online },
+  });
+  assert.equal(env.pending.set.length, 1, "编号不同就不是重发：解读后落盘");
+  assert.equal(latest().edition, "standard", "落盘完成前仍是旧型号");
+  env.pending.set.shift().success();
+  assert.equal(latest().activated, true);
+  assert.equal(latest().licenseId, "license-online-0001");
+  assert.equal(latest().edition, "online");
+  assert.deepEqual(JSON.parse(env.sets().at(-1).value), {
+    token: online,
+    device: fingerprint,
+    licenseId: "license-online-0001",
+    edition: "online",
+  });
+  const receipt = env.sent.at(-1);
+  assert.equal(receipt.type, "activation-result");
+  assert.equal(receipt.licenseId, "license-online-0001");
+  assert.equal(receipt.success, true);
+});
+
+test("型号：dispose 清空型号；格式不对的 edition 让令牌整体无效", async () => {
+  const fingerprint = deviceFingerprint(RAW_DEVICE, PRODUCT);
+  const token = mint(fingerprint, "license-0000000001", "online");
+  const { env, activation } = start({
+    record: { token, device: fingerprint, licenseId: "license-0000000001", edition: "online" },
+  });
+  env.serveStorage();
+  assert.equal(activation.snapshot().edition, "online");
+  activation.dispose();
+  assert.equal(activation.snapshot().edition, "");
+
+  const { decodeLicense, licenseEdition } = await import("@kovela/license");
+  assert.equal(decodeLicense(token, PRODUCT, fingerprint)?.edition, "online");
+  assert.equal(decodeLicense(mint(fingerprint), PRODUCT, fingerprint)?.edition, undefined);
+  for (const bad of ["Online", "1x", "", "a".repeat(33), 3]) {
+    assert.equal(decodeLicense(mint(fingerprint, "license-0000000001", bad), PRODUCT, fingerprint), null, String(bad));
+  }
+  assert.equal(licenseEdition(token), "online");
+  assert.equal(licenseEdition(mint(fingerprint)), "");
+  assert.equal(licenseEdition(undefined), "");
+  assert.equal(licenseEdition(mint(fingerprint, "license-0000000001", "BAD")), "");
 });

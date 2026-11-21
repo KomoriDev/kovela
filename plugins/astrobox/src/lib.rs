@@ -2378,6 +2378,52 @@ mod tests {
     }
 
     #[test]
+    fn activated_device_still_gets_a_new_license_for_edition_upgrades() {
+        // 型号升级：手环已激活普通版，hello 回执带 activated:true 和当前型号。
+        // 插件不能据此判定「已激活、无事可做」，必须照常签发并下发新的
+        // 联机版许可证（服务端按升级规则把关）。设备回执的处理（on_device_message
+        // 的 device 分支）从不读取 activated / edition；在线与离线只在记下设备码
+        // 之后才分叉（在线去签发，离线等导入）。测试环境发不了网络请求（waki
+        // 在本机目标上直接中止），所以用离线分支验证这段共用的判定。
+        let mut pending = pending_at(super::Phase::Hello, None, false);
+        pending.issued = None;
+        pending.offline = true;
+        super::STATE.with(|state| {
+            *state.borrow_mut() = super::State {
+                order_no: "0000000000000001".into(),
+                offline: Some(super::OfflineState {
+                    product_id: "com.komoridev.landlord".into(),
+                    ..Default::default()
+                }),
+                pending: Some(pending),
+                ..Default::default()
+            };
+        });
+        let device = "a".repeat(64);
+        let reply = json!({
+            "v": 1,
+            "id": "pending",
+            "type": "device",
+            "productId": "com.komoridev.landlord",
+            "deviceId": device,
+            "activated": true,
+            "edition": "standard",
+        })
+        .to_string();
+        let mut future = std::pin::pin!(super::on_device_message(&reply));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(Future::poll(future.as_mut(), &mut context), std::task::Poll::Ready(())));
+        super::STATE.with(|state| {
+            let s = state.borrow();
+            let p = s.pending.as_ref().unwrap();
+            assert_eq!(p.device_id.as_deref(), Some(device.as_str()));
+            // 继续等待安装新许可证，而不是直接判定完成。
+            assert!(p.phase == super::Phase::AwaitingLicense, "{}", s.message);
+            assert!(p.ack.is_none());
+        });
+    }
+
+    #[test]
     fn online_not_ready_receipt_keeps_waiting_instead_of_reporting_failure() {
         super::STATE.with(|state| {
             *state.borrow_mut() = super::State {

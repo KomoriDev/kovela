@@ -5,7 +5,8 @@ import path from "node:path";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const targets = process.argv.slice(2);
-if (!targets.length) targets.push("../billiard", "../tank-turmoil", "../angrybirds");
+if (!targets.length)
+  targets.push("../billiard", "../tank-turmoil", "../angrybirds", "../landlord");
 for (const directory of targets) {
   const application = path.resolve(root, directory);
   const manifest = JSON.parse(

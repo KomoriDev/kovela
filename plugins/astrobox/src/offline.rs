@@ -6,6 +6,9 @@ pub(crate) const PRODUCTS: &[(&str, &str)] = &[
     ("com.komoridev.billiard", "口袋台球"),
     ("com.komoridev.tankturmoil", "坦克动荡"),
     ("com.komoridev.angrybirds", "愤怒的小鸟"),
+    // 斗地主按型号（普通版 / 联机版）出售：型号写在许可证载荷的 edition 字段里，
+    // 由服务端签发、手环解读；离线导入只做路由检查，不关心型号。
+    ("com.komoridev.landlord", "斗地主"),
 ];
 
 pub(crate) fn product_name(product_id: &str) -> Option<&'static str> {
@@ -166,6 +169,11 @@ mod tests {
         }
         let raw = token(payload());
         assert!(parse_license(&(raw.clone() + "=")).is_err());
+        // 带型号（edition）的许可证照常导入：载荷里多出的字段不影响路由检查。
+        let mut edition = payload();
+        edition["productId"] = json!("com.komoridev.landlord");
+        edition["edition"] = json!("online");
+        assert_eq!(parse_license(&token(edition)).unwrap().product_id, "com.komoridev.landlord");
         assert!(parse_license(&raw.rsplit_once('.').unwrap().0.to_string()).is_err());
         assert!(parse_license(&"x".repeat(8193)).is_err());
     }

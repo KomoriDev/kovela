@@ -40,6 +40,7 @@ Kovela 是为小米 Vela 穿戴设备打造的小游戏与授权服务，由三�
 | `../angrybirds` | 愤怒的小鸟。第一章免费，激活后解锁全部 40 关 |
 | `../billiard` | 口袋台球，需激活 |
 | `../tank-turmoil` | 坦克动荡，需激活 |
+| `../landlord` | 斗地主，按型号出售：普通版、联机版，见[型号](#型号付费档位) |
 | `../projectile` | 抛，完全免费，不接入激活 |
 | `../kovela-watermelon` | 合成大西瓜换肤插件、皮肤资源、图片转换器，以及游戏用的免费通信模块 |
 
@@ -203,9 +204,63 @@ pnpm --filter @kovela/worker deploy
 ### 新增付费商品
 
 1. 在 `wrangler.jsonc` 的 `PRODUCTS` 里加商品：应用包名、名称、爱发电链接，以及方案 ID 或 SKU ID。部署 Worker 后才生效。
-2. 离线激活的商品目录写在 `plugins/astrobox/src/offline.rs` 里，需同步更新。
-3. 在 `scripts/prepare-vela.mjs` 的默认目标里加上手环应用，生成激活代码。
-4. 在网站 `apps/web/src/data/games.ts` 里给游戏加 `purchase`。
+2. 同一应用按档位卖（一件爱发电商品、多个型号）时，再配 `editions`，见[型号](#型号付费档位)；手环应用读激活快照的 `edition` 决定解锁内容。
+3. 离线激活的商品目录写在 `plugins/astrobox/src/offline.rs` 里，需同步更新，并给插件 `manifest.json` 升版本。
+4. 在 `scripts/prepare-vela.mjs` 的默认目标里加上手环应用（`package.json` 的 `build:vela` 也加上），生成激活代码。
+5. 有新迁移（`apps/worker/migrations`）时，先 `db:remote` 再部署。
+6. 在网站 `apps/web/src/data/games.ts` 里给游戏加 `purchase`。
+
+### 型号（付费档位）
+
+一款应用可以在爱发电上作为**一件商品、多个型号（SKU）**出售，例如斗地主：
+
+| 爱发电型号 | 价格 | 签发的型号 |
+| --- | --- | --- |
+| 普通版 | ¥3 | `standard` |
+| 联机版 | ¥6 | `online` |
+| 普通版升级联机版 | ¥3 | `online`（升级，只能装到已激活普通版的设备上） |
+
+`productId` 仍等于应用包名（插件用它做 interconnect 目标和 `open_app`），所以档位不是不同商品：型号写在签名许可证载荷的可选字段 `edition` 里。没有配置 `editions` 的商品一切照旧，许可证里没有这个字段。
+
+配置写在商品上，`editions` 按档位**从低到高**排列：
+
+```jsonc
+{
+  "productId": "com.komoridev.landlord",
+  "productName": "斗地主",
+  "purchaseUrl": "https://afdian.com/item/a9dc39f0e08511f1bddc52540025c377",
+  "planIds": ["a9dc39f0e08511f1bddc52540025c377"],
+  "skuIds": [],
+  "editions": [
+    { "id": "standard", "name": "普通版", "skuIds": [], "skuNames": ["普通版"] },
+    { "id": "online", "name": "联机版", "skuIds": [], "skuNames": ["联机版"],
+      "upgradeSkuIds": [], "upgradeSkuNames": ["普通版升级联机版"] }
+  ]
+}
+```
+
+- **校验**：`id` 符合 `/^[a-z][a-z0-9-]{0,31}$/` 且不重复；`name` 非空、不超过 20 字（「商品名（型号名）」总长不超过 80 字）；四个 SKU 数组都可省略，ID 与方案 ID 同规则，名称非空、不超过 40 字；每个型号至少有一个 SKU；第一个型号不能有升级 SKU。不合规时整个商品目录报 `NOT_CONFIGURED`。
+- **SKU 匹配**：订单 `sku_detail` 里数量大于 0 的条目，`sku_id` 在 `skuIds` 里，或 `name`（去首尾空白）与 `skuNames` 中某项全等，即命中。按名称匹配是因为创作者不能购买自己的商品，拿不到 `sku_id`。**在爱发电上改型号名称会让名称匹配失效**，从真实订单里拿到 `sku_id` 后填进 `skuIds` / `upgradeSkuIds` 更稳。
+- **订单型号**：配了 `editions` 的商品，订单必须命中某个型号的 SKU 才算买了它。型号取命中的最高档位；最高档位只经由升级 SKU 命中时是升级授权（同一单里还买了更低档位的普通 SKU 时，基础就在这单里，按普通授权处理）。
+- **Webhook 兜底**：推送签名不覆盖 `sku_detail`，所以型号商品和 SKU 商品一样，`query-order` 查到订单后才落库。
+- **展示名**：`entitlements.product_name`、订单查询、账号商品列表、签发结果和私信里的商品名都带型号，如「斗地主（联机版）」。升级订单的购买私信会提示「请在已激活普通版的同一台手环上激活」。
+- **存储**：迁移 `0007_editions.sql` 给 `entitlements` 加了 `edition`（可空）和 `upgrade`（0/1）。只在还没签发时随订单刷新：已签发的令牌里写死了型号。
+
+签发规则（订单号激活、账号激活、管理员签发、`license:issue` 都走同一条路径）：
+
+- **升级**：升级授权首次绑定时，这台设备必须已绑定同一应用更低型号的授权，且那份授权的订单已付款（或是创作者记录）。否则 409 `UPGRADE_REQUIRES_BASE`：「升级型号需要这台设备先激活普通版，请先用普通版订单激活」。检查在占用激活凭证之前，买家先激活普通版后，可以直接重试升级。
+- **防降级**：设备已持有更高型号时，不再签发更低型号，同一份普通版授权的重发也不行（手环只存一份许可证，装上普通版会覆盖联机版）。409 `EDITION_DOWNGRADE`：「这台设备已激活更高版本（联机版），无需再激活普通版」。已有联机版的设备再用升级订单同样拒绝。其余情况下同一授权对同一设备重发照常返回原许可证。
+- **账号激活**：候选订单先在 D1 里排除绑定了其他设备的，按型号从高到低、已绑定本机的优先排序，再预先跳过会被上面两条拒绝的；最多向爱发电复核 3 单。新设备上只有「普通版 + 升级」时先签普通版，再激活一次拿到联机版。全部候选都因型号规则被跳过时，返回对应的 409 而不是「没有可用授权」。
+- **创作者**：直接拿最高型号。
+- 插件把服务端的错误文案原样显示，不需要额外映射。
+
+手环侧（`packages/vela`）：
+
+- 激活快照 `snapshot()` 多了 `edition`：已激活且许可证带型号时是型号编号（如 `"online"`），否则为 `""`。应用按 `activated && edition === "online"` 之类的条件解锁内容。
+- 安装许可证时型号取自解读出的载荷，写进 v2 记录 `{token, device, licenseId, edition}`。
+- 型号字段之前写的旧记录没有 `edition` 键，启动时只把令牌载荷做 base64url → JSON 解码取出型号（不验签、不碰设备服务、不写盘），读不出就是 `""`。
+- 已激活普通版时收到编号不同的联机版许可证，照常解读、落盘并覆盖旧记录；hello 回执在有型号时附带 `edition`（只供展示，插件不据此跳过安装）。
+- `packages/license` 的 `validPayload` 接受可选 `edition`，出现时必须是符合上述格式的字符串，否则整份令牌无效。
 
 ## 激活
 
@@ -342,8 +397,8 @@ pnpm build:plugin
 共享激活代码只在 `packages/vela/src/` 修改，不要直接编辑各应用的 `src/activation/index.js`：
 
 ```bash
-pnpm prepare:vela   # 生成 ../billiard、../tank-turmoil、../angrybirds 的激活代码
-pnpm build:vela     # 生成后依次构建这三个应用
+pnpm prepare:vela   # 生成 ../billiard、../tank-turmoil、../angrybirds、../landlord 的激活代码
+pnpm build:vela     # 生成后依次构建这四个应用
 ```
 
 `prepare:vela` 也可以带路径参数，只生成指定的应用。合成大西瓜的免费通信模块从 `../kovela-watermelon` 的 `wearable/src/` 生成，不经过这里。

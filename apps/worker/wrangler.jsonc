@@ -62,6 +62,27 @@
         "planIds": ["d6c41a82d55411f184b3525400c8052f"],
         "skuIds": [],
       },
+      {
+        "productId": "com.komoridev.landlord",
+        "productName": "斗地主",
+        "purchaseUrl": "https://afdian.com/item/a9dc39f0e08511f1bddc52540025c377",
+        "planIds": ["a9dc39f0e08511f1bddc52540025c377"],
+        "skuIds": [],
+        // 型号按档位从低到高排列，型号编号写进许可证的 edition 字段。
+        // SKU 暂按名称匹配（创作者不能购买自己的商品，拿不到 sku_id）：在爱发电
+        // 改了型号名称就会匹配失败。拿到 sku_id 后填进 skuIds / upgradeSkuIds 更稳。
+        "editions": [
+          { "id": "standard", "name": "普通版", "skuIds": [], "skuNames": ["普通版"] },
+          {
+            "id": "online",
+            "name": "联机版",
+            "skuIds": [],
+            "skuNames": ["联机版"],
+            "upgradeSkuIds": [],
+            "upgradeSkuNames": ["普通版升级联机版"],
+          },
+        ],
+      },
     ],
     "AFDIAN_USER_ID": "9c2257f6628d11edb5e652540025c377",
     "TURNSTILE_SITE_KEY": "0x4AAAAAAEyF9L78iJGDnnH2",

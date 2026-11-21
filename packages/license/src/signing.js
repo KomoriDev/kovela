@@ -14,6 +14,8 @@ export function signLicense(payload, seedHex) {
           productId: payload.productId,
           deviceId: payload.deviceId,
           issuedAt: payload.issuedAt,
+          // 没有型号的商品不带这个键，令牌与改动前逐字节相同。
+          ...(payload.edition === undefined ? {} : { edition: payload.edition }),
         }),
       ),
     );

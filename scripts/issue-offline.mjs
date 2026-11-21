@@ -75,11 +75,16 @@ export async function issueOfflineLicense(input, {
   if (!payload || payload.licenseId !== issued.licenseId || issued.productId !== request.productId || issued.deviceId !== request.deviceId) {
     throw new Error("The issued license failed signature or device validation; no license was exported.");
   }
+  // 查询结果里的商品名带型号（如「斗地主（联机版）」）；型号本身随签名令牌走，
+  // 这里只影响文件里给人看的名称。
+  const label = typeof item.productName === "string" && item.productName.trim() && item.productName.length <= 120
+    ? item.productName
+    : product.productName;
   return {
     v: 1,
     type: "kovela-offline-license",
     productId: request.productId,
-    productName: product.productName,
+    productName: label,
     deviceId: request.deviceId,
     licenseId: issued.licenseId,
     licenseToken: issued.licenseToken,

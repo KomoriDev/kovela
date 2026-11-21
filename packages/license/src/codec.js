@@ -59,6 +59,9 @@ export function decodeBase64(value) {
   return bytes;
 }
 
+// 型号（付费档位）编号：可选字段，只在配置了 editions 的商品上出现。
+export const EDITION_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
+
 export function validPayload(value) {
   return (
     value !== null &&
@@ -75,6 +78,8 @@ export function validPayload(value) {
     typeof value.issuedAt === "number" &&
     value.issuedAt > 0 &&
     value.issuedAt <= Number.MAX_SAFE_INTEGER &&
-    Math.floor(value.issuedAt) === value.issuedAt
+    Math.floor(value.issuedAt) === value.issuedAt &&
+    (value.edition === undefined ||
+      (typeof value.edition === "string" && EDITION_PATTERN.test(value.edition)))
   );
 }

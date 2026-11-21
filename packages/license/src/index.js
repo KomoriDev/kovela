@@ -1,5 +1,11 @@
 import nacl from "tweetnacl";
-import { asciiBytes, decodeBase64, hexBytes, validPayload } from "./codec.js";
+import {
+  EDITION_PATTERN,
+  asciiBytes,
+  decodeBase64,
+  hexBytes,
+  validPayload,
+} from "./codec.js";
 
 // Device addresses are transport routing, not license identity. Hash the device's own ID.
 export function deviceFingerprint(rawDeviceId, productId) {
@@ -51,6 +57,30 @@ function readLicense(token) {
   const payload = JSON.parse(json);
   if (!validPayload(payload)) return null;
   return { body: "KV1." + parts[1], signature: signature, payload: payload };
+}
+
+// 只读令牌载荷里的型号：不验签、不校验结构与绑定，只做 base64url → JSON。
+// 手环启动时给「型号字段写入之前」的旧授权记录补型号用，必须便宜且绝不抛错；
+// 读不出来一律回空串（等同没有型号）。
+export function licenseEdition(token) {
+  try {
+    if (typeof token !== "string" || token.length > 2048) return "";
+    const parts = token.split(".");
+    if (parts.length !== 3 || parts[0] !== "KV1") return "";
+    const bytes = decodeBase64(parts[1]);
+    let json = "";
+    for (let i = 0; i < bytes.length; i += 1) {
+      if (bytes[i] > 127) return "";
+      json += String.fromCharCode(bytes[i]);
+    }
+    const payload = JSON.parse(json);
+    const edition = payload && payload.edition;
+    return typeof edition === "string" && EDITION_PATTERN.test(edition)
+      ? edition
+      : "";
+  } catch (_) {
+    return "";
+  }
 }
 
 function boundToLocalDevice(payload, productId, deviceId) {

@@ -1,4 +1,4 @@
-import { decodeLicense, deviceFingerprint } from "@kovela/license";
+import { decodeLicense, deviceFingerprint, licenseEdition } from "@kovela/license";
 
 // connect.send 的 fail 只有两个文档码（iot.mi.com/vela/quickapp
 // features/network/interconnect）：204 链接超时、1006 连接断开。202 是通用
@@ -53,7 +53,9 @@ export function createActivation(
   PRODUCT_ID,
   { device, storage, interconnect },
 ) {
-  // 授权记录：JSON {token, device, licenseId}，写入只在激活握手成功之后发生。
+  // 授权记录：JSON {token, device, licenseId, edition}，写入只在激活握手成功之后发生。
+  // edition 是许可证的型号（付费档位，如 standard / online），没有型号的商品为空串；
+  // 加这个键之前写的记录没有它，启动时只解码令牌载荷补出来（见 adoptToken）。
   // 启动只读取这一条本地记录，不重跑判定，也不调用设备服务；真机上
   // getDeviceId / getInfo 与启动存储请求并发会把系统服务挤到约半分钟
   // 不响应，使页面失去交互并可能连带应用退出。
@@ -78,6 +80,8 @@ export function createActivation(
   let connected = false;
   let linking = false;
   let licenseId = "";
+  // 已激活许可证的型号；未激活或许可证没有型号时为空串。
+  let edition = "";
   let error = "";
   // 设备标识按需读取：只在激活握手与安装包需要时发起（见 ensureDeviceId）。
   let deviceIdPending = false;
@@ -108,6 +112,9 @@ export function createActivation(
       connected,
       linking,
       licenseId,
+      // 型号（付费档位）编号，如 "standard" / "online"。只在 activated 为真时
+      // 有意义；未激活或许可证不带型号时为 ""。应用按它决定解锁哪些内容。
+      edition,
       error,
       saving,
     };
@@ -123,7 +130,7 @@ export function createActivation(
   // 授权记录写失败无所谓：大不了下次启动按未激活处理、重新激活。后续
   // 写入通过 done 链在前一次完成之后发起——真机的存储同刻只应有一个
   // 未完成请求，并发会把先发的回调挤掉。
-  function writeLicenseRecord(token, device, licenseId, done) {
+  function writeLicenseRecord(token, device, licenseId, recordEdition, done) {
     const finish = function () {
       writeInFlight = false;
       if (typeof done === "function") done();
@@ -140,6 +147,7 @@ export function createActivation(
           token: token,
           device: device,
           licenseId: licenseId || "",
+          edition: recordEdition || "",
         }),
         success: finish,
         fail: finish,
@@ -152,7 +160,7 @@ export function createActivation(
   // 旧授权串键也必须清：只清 v2 与指纹缓存的话，下次读链会再次落到
   // 「有旧授权串、无指纹」，错误每次重进、每次重试都重新出现，永远消不掉。
   function clearLicenseCaches() {
-    writeLicenseRecord("", "", "", function () {
+    writeLicenseRecord("", "", "", "", function () {
       clearKey(LEGACY_TOKEN_KEY, function () {
         clearKey(LEGACY_DEVICE_KEY, null);
       });
@@ -275,6 +283,7 @@ export function createActivation(
       loading = false;
       activated = false;
       licenseId = "";
+      edition = "";
       error = "授权读取超时，请重试";
       ready = true;
       publish();
@@ -286,13 +295,16 @@ export function createActivation(
       deviceId = fingerprint;
       activated = !!payload;
       licenseId = payload ? payload.licenseId : "";
+      edition = payload ? payload.edition : "";
       loading = false;
       ready = true;
       publish();
       // 读链期间插件已经在等回执：结论一出就补上，不让对方再等一轮 tick。
       answerWaitingHello();
     }
-    function adoptToken(value, cached, licenseId, migrate) {
+    // recordEdition：v2 记录里的 edition 键；记录里没有这个键（型号上线之前
+    // 写的记录、旧版键迁移）时传 undefined，由令牌载荷补出。
+    function adoptToken(value, cached, licenseId, migrate, recordEdition) {
       if (generation !== epoch) return;
       token = value;
       cachedDevice = typeof cached === "string" ? cached : "";
@@ -321,9 +333,15 @@ export function createActivation(
       // Ed25519 验签要十几秒（Node 参照 19ms），放在启动链路上就是一次
       // 可见的冻结；判定只在激活握手做一次（见 receive），且只解读令牌。
       //
+      // 型号：记录里有就直接用；没有（旧记录）就只解码令牌载荷取出来——
+      // 纯字符串运算、不验签、不碰设备与存储，读不出就当没有型号。这一步
+      // 不回写记录：启动不写盘，下次激活握手会写入带型号的完整记录。
+      const heldEdition =
+        typeof recordEdition === "string" ? recordEdition : licenseEdition(token);
       // 旧版键读出来的配对顺手写成 v2，下次启动只读一次。
-      conclude({ licenseId: licenseId }, cachedDevice);
-      if (migrate) writeLicenseRecord(token, cachedDevice, licenseId, null);
+      conclude({ licenseId: licenseId, edition: heldEdition }, cachedDevice);
+      if (migrate)
+        writeLicenseRecord(token, cachedDevice, licenseId, heldEdition, null);
     }
     function parseRecord(value) {
       try {
@@ -356,6 +374,8 @@ export function createActivation(
                 record.token,
                 record.device,
                 typeof record.licenseId === "string" ? record.licenseId : "",
+                false,
+                typeof record.edition === "string" ? record.edition : undefined,
               );
             } else {
               readLegacyToken();
@@ -552,6 +572,10 @@ export function createActivation(
         send(Object.assign(result, { error: "INVALID_LICENSE" }), true);
         return;
       }
+      // 型号取自刚解读的载荷。已激活时换一份许可证（如普通版升级到联机版，
+      // 编号不同）同样走到这里：解读、落盘，覆盖旧记录。
+      const licensedEdition =
+        typeof payload.edition === "string" ? payload.edition : "";
       saving = true;
       error = "";
       publish();
@@ -567,6 +591,7 @@ export function createActivation(
         activated = true;
         linking = false;
         licenseId = value.licenseId;
+        edition = licensedEdition;
         publish();
         send(Object.assign(result, { success: true }), true);
         answerWaitingHello();
@@ -587,6 +612,7 @@ export function createActivation(
             token: value.licenseToken,
             device: deviceId,
             licenseId: value.licenseId,
+            edition: licensedEdition,
           }),
           success: saved,
           fail: failed,
@@ -616,6 +642,9 @@ export function createActivation(
         activated: activated,
       };
       if (deviceModel) reply.deviceModel = deviceModel;
+      // 当前型号只供插件展示；插件不能据 activated / edition 跳过安装——
+      // 升级时手环已激活普通版，仍要装上新的联机版许可证。
+      if (activated && edition) reply.edition = edition;
       send(reply);
       // 机型名只用于回执标注，回执发出后再单独读：getInfo 与 getDeviceId
       // 并发会挤住真机设备服务（同一刻只应有一个在途请求），反而让指纹
@@ -751,6 +780,7 @@ export function createActivation(
     connected = false;
     linking = false;
     licenseId = "";
+    edition = "";
     deviceId = "";
     deviceIdPending = false;
     waitingHelloId = "";

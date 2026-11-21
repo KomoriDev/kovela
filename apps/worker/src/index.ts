@@ -5,7 +5,12 @@ import AfdianService, {
   type AfdianOrder,
 } from "@kovela/afdian";
 import { signLicense } from "@kovela/license/signing";
-import { PLUGIN_NAME, type ProductConfig, type OfflineLicense } from "@kovela/protocol";
+import {
+  PLUGIN_NAME,
+  type ProductConfig,
+  type ProductEdition,
+  type OfflineLicense,
+} from "@kovela/protocol";
 
 export interface Env {
   DB: D1Database;
@@ -32,6 +37,9 @@ interface Entitlement {
   license_token: string | null;
   issued_at: number | null;
   state: "ready" | "issued" | "activated" | "failed";
+  // 型号编号（没有型号的商品为 NULL）与是否为补差价升级授权（0/1）。
+  edition: string | null;
+  upgrade: number;
 }
 interface Session {
   handoff_hash: string;
@@ -90,6 +98,8 @@ const RECONCILE_PAGES = 2;
 // 单次补单上限：一次 cron 的请求数有上限，私信还有频率限制，剩下的下一轮接着
 // 补。正常节奏下每轮也就一两单。
 const RECONCILE_LIMIT = 20;
+// 账号激活一次最多向爱发电复核几份候选订单。
+const ACCOUNT_CHECKS = 3;
 function oneLine(value: string, maximum = 80) {
   return value
     .replace(/[\u0000-\u001f]/g, " ")
@@ -122,7 +132,7 @@ function chinaTime(unix: number) {
     .format(new Date(unix * 1000))
     .replace("T", " ");
 }
-function purchaseGuide(names: string[], orderNo: string) {
+function purchaseGuide(names: string[], orderNo: string, notes: string[] = []) {
   const labels = names.map((name) => oneLine(name)).filter(Boolean);
   const list = labels
     .map((name, index) => `${index + 1}. 【${name}】\n👉 ${orderNo}`)
@@ -137,6 +147,7 @@ function purchaseGuide(names: string[], orderNo: string) {
       ? ["合成大西瓜：打开 AstroBox 的「合成大西瓜自定义工具」插件，登录并绑定购买商品的爱发电账号，验证后即可导入自定义图片。",
         ...(names.some((name) => name !== "合成大西瓜图片自定义") ? ["其他应用请在 Kovela 插件中输入订单号完成激活。"] : [])]
       : ["请打开 AstroBox 的 Kovela 插件，选择对应应用并输入订单号完成激活。"]),
+    ...notes.map((note) => oneLine(note, 120)),
     "",
     "--------",
     "",
@@ -185,6 +196,113 @@ function deviceModelOf(body: Record<string, unknown>) {
 // 清除 AstroBox 数据后会变，格式不对就当没带。
 const HOST_INSTALL_PATTERN = /^ab-install-[a-f0-9]{32}$/;
 
+const SKU_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const EDITION_ID_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
+const chars = (value: string) => [...value].length;
+function skuIdList(values: unknown): values is string[] {
+  return (
+    Array.isArray(values) &&
+    values.every((value) => typeof value === "string" && SKU_ID_PATTERN.test(value))
+  );
+}
+function skuNameList(values: unknown): values is string[] {
+  return (
+    Array.isArray(values) &&
+    values.every(
+      (value) =>
+        typeof value === "string" && !!value.trim() && chars(value) <= 40,
+    )
+  );
+}
+// 型号配置：可选，非空数组，按档位从低到高排列。每个型号至少要有一个能匹配的
+// SKU（普通或升级），第一个型号不能有升级 SKU（没有更低的档位可升）。
+function validEditions(product: ProductConfig): boolean {
+  const editions: unknown = product.editions;
+  if (editions === undefined) return true;
+  if (!Array.isArray(editions) || !editions.length) return false;
+  const ids = new Set<string>();
+  return editions.every((edition: ProductEdition, index) => {
+    if (
+      !edition ||
+      typeof edition !== "object" ||
+      typeof edition.id !== "string" ||
+      !EDITION_ID_PATTERN.test(edition.id) ||
+      ids.has(edition.id) ||
+      typeof edition.name !== "string" ||
+      !edition.name.trim() ||
+      chars(edition.name) > 20 ||
+      // 展示名「商品（型号）」要能放进插件的 80 字标签。
+      chars(product.productName) + chars(edition.name) + 2 > 80
+    )
+      return false;
+    ids.add(edition.id);
+    const lists = [
+      [edition.skuIds, skuIdList],
+      [edition.skuNames, skuNameList],
+      [edition.upgradeSkuIds, skuIdList],
+      [edition.upgradeSkuNames, skuNameList],
+    ] as const;
+    if (!lists.every(([values, valid]) => values === undefined || valid(values)))
+      return false;
+    const upgrades =
+      (edition.upgradeSkuIds?.length ?? 0) + (edition.upgradeSkuNames?.length ?? 0);
+    const plain = (edition.skuIds?.length ?? 0) + (edition.skuNames?.length ?? 0);
+    return (index === 0 ? upgrades === 0 : true) && plain + upgrades > 0;
+  });
+}
+
+interface EditionMatch {
+  edition: ProductEdition;
+  rank: number;
+  // 只经由补差价升级 SKU 命中：首次绑定要求设备已有更低型号。
+  upgrade: boolean;
+}
+function skuHit(
+  order: AfdianOrder,
+  ids: string[] | undefined,
+  names: string[] | undefined,
+) {
+  const wanted = (names ?? []).map((name) => name.trim());
+  return !!order.sku_detail?.some(
+    (sku) =>
+      sku.count > 0 &&
+      (!!ids?.includes(sku.sku_id) ||
+        (typeof sku.name === "string" && wanted.includes(sku.name.trim()))),
+  );
+}
+// 订单对应的型号：取命中的最高档位。最高档位只由升级 SKU 命中时是升级授权；
+// 但同一订单里同时买了更低档位的普通 SKU（基础版和升级包一起下单）时，基础就在
+// 这单里，按普通授权处理。没有型号的商品返回 null。
+function orderEdition(order: AfdianOrder, product: ProductConfig): EditionMatch | null {
+  const editions = product.editions ?? [];
+  const plain = editions.map((edition) => skuHit(order, edition.skuIds, edition.skuNames));
+  for (let rank = editions.length - 1; rank >= 0; rank -= 1) {
+    const edition = editions[rank];
+    if (plain[rank]) return { edition, rank, upgrade: false };
+    if (skuHit(order, edition.upgradeSkuIds, edition.upgradeSkuNames))
+      return { edition, rank, upgrade: !plain.slice(0, rank).some(Boolean) };
+  }
+  return null;
+}
+function editionRank(product: ProductConfig, edition: string | null | undefined) {
+  return edition ? (product.editions ?? []).findIndex((item) => item.id === edition) : -1;
+}
+// 插件列表、私信里的商品名带上型号，买家能看到自己买的是哪一档。
+function productLabel(product: ProductConfig, edition: string | null | undefined) {
+  const name = product.editions?.find((item) => item.id === edition)?.name;
+  return name ? `${product.productName}（${name}）` : product.productName;
+}
+// 升级授权可以接在任意更低型号上：提示里列出它们，如「普通版」。
+function lowerEditionNames(product: ProductConfig, rank: number) {
+  return (product.editions ?? [])
+    .slice(0, Math.max(rank, 0))
+    .map((edition) => edition.name)
+    .join("或");
+}
+function highestEdition(product: ProductConfig) {
+  return product.editions?.[product.editions.length - 1]?.id ?? null;
+}
+
 function catalog(env: Env): ProductConfig[] {
   let products: unknown = env.PRODUCTS ?? [];
   try {
@@ -205,15 +323,8 @@ function catalog(env: Env): ProductConfig[] {
         typeof product.purchaseUrl !== "string" ||
         (product.purchaseUrl !== "" &&
           new URL(product.purchaseUrl).protocol !== "https:") ||
-        ![product.planIds, product.skuIds].every(
-          (values) =>
-            Array.isArray(values) &&
-            values.every(
-              (value) =>
-                typeof value === "string" &&
-                /^[A-Za-z0-9_-]{1,128}$/.test(value),
-            ),
-        )
+        ![product.planIds, product.skuIds].every((values) => skuIdList(values)) ||
+        !validEditions(product)
       )
         throw new Error();
       ids.add(product.productId);
@@ -248,7 +359,9 @@ function matchesProduct(order: AfdianOrder, product: ProductConfig): boolean {
     (product.skuIds.length === 0 ||
       !!order.sku_detail?.some(
         (sku) => product.skuIds.includes(sku.sku_id) && sku.count > 0,
-      ))
+      )) &&
+    // 配了型号的商品，订单必须命中某个型号的 SKU（普通或升级）才算买了它。
+    (!product.editions?.length || orderEdition(order, product) !== null)
   );
 }
 
@@ -366,6 +479,17 @@ export function createWorker(
   ) {
     const anchor = purchased[0];
     if (!anchor) return;
+    const editions = purchased.map((product) => orderEdition(order, product));
+    const labels = purchased.map((product, index) =>
+      productLabel(product, editions[index]?.edition.id),
+    );
+    const notes = purchased.flatMap((product, index) => {
+      const match = editions[index];
+      if (!match?.upgrade) return [];
+      return [
+        `${labels[index]}为升级订单：请在已激活${lowerEditionNames(product, match.rank)}的同一台手环上激活。`,
+      ];
+    });
     await env.DB.batch([
       env.DB.prepare(
         "INSERT INTO purchases(order_no,buyer_id,plan_id,payment_status,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(order_no) DO UPDATE SET payment_status=excluded.payment_status, updated_at=excluded.updated_at",
@@ -376,15 +500,18 @@ export function createWorker(
         order.status,
         now(),
       ),
-      ...purchased.map((product) =>
+      // 型号只在还没签发时随订单刷新：已签发的令牌里写死了型号，库里要与之一致。
+      ...purchased.map((product, index) =>
         env.DB.prepare(
-          "INSERT INTO entitlements(license_id,order_no,product_id,product_name,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(order_no,product_id) DO UPDATE SET product_name=excluded.product_name",
+          "INSERT INTO entitlements(license_id,order_no,product_id,product_name,updated_at,edition,upgrade) VALUES(?,?,?,?,?,?,?) ON CONFLICT(order_no,product_id) DO UPDATE SET product_name=excluded.product_name,edition=CASE WHEN license_token IS NULL THEN excluded.edition ELSE edition END,upgrade=CASE WHEN license_token IS NULL THEN excluded.upgrade ELSE upgrade END",
         ).bind(
           crypto.randomUUID(),
           order.out_trade_no,
           product.productId,
-          product.productName,
+          labels[index],
           now(),
+          editions[index]?.edition.id ?? null,
+          editions[index]?.upgrade ? 1 : 0,
         ),
       ),
       env.DB.prepare(
@@ -392,10 +519,7 @@ export function createWorker(
       ).bind(
         "guide:" + order.out_trade_no,
         order.user_id,
-        purchaseGuide(
-          purchased.map((product) => product.productName),
-          order.out_trade_no,
-        ),
+        purchaseGuide(labels, order.out_trade_no, notes),
         now(),
         order.out_trade_no,
         anchor.productId,
@@ -477,7 +601,84 @@ export function createWorker(
       .bind(now(), pages, seen, backfilled, error)
       .run();
   }
-  async function bindLicense(env: Env, order: Entitlement, deviceId: string): Promise<Entitlement> {
+  // 这台设备上已绑定的、算数的型号授权：订单已付款（payment_status=2）或创作者
+  // 合成记录。升级要以它为基础，防降级也只看它。
+  async function heldEditions(
+    env: Env,
+    product: ProductConfig,
+    deviceId: string,
+  ): Promise<{ license_id: string; rank: number }[]> {
+    if (!product.editions?.length) return [];
+    const rows = await env.DB.prepare(
+      "SELECT e.license_id,e.edition FROM entitlements e JOIN purchases p ON p.order_no=e.order_no WHERE e.product_id=? AND e.device_id=? AND e.edition IS NOT NULL AND (p.payment_status=2 OR e.order_no LIKE ?)",
+    )
+      .bind(product.productId, deviceId, CREATOR_ORDER_PREFIX + "%")
+      .all<{ license_id: string; edition: string }>();
+    return rows.results.map((row) => ({
+      license_id: row.license_id,
+      rank: editionRank(product, row.edition),
+    }));
+  }
+  // 型号规则，返回拒绝理由（null 表示放行）：
+  // - 防降级：设备已持有更高型号时，不再签发（含重发）更低型号——手环只存一份
+  //   许可证，装上低档位会把高档位覆盖掉。同一授权对同一设备重发照常放行。
+  // - 升级：只经由升级 SKU 获得的授权，首次绑定要求这台设备已持有更低型号。
+  function editionBlock(
+    product: ProductConfig,
+    order: Entitlement,
+    deviceId: string,
+    held: { license_id: string; rank: number }[],
+  ): HttpError | null {
+    if (!order.edition || !product.editions?.length) return null;
+    const rank = editionRank(product, order.edition);
+    const others = held.filter((item) => item.license_id !== order.license_id);
+    const top = others.reduce((maximum, item) => Math.max(maximum, item.rank), -1);
+    const name = product.editions[rank]?.name ?? order.edition;
+    if (top > rank)
+      return new HttpError(
+        409,
+        "EDITION_DOWNGRADE",
+        `这台设备已激活更高版本（${product.editions[top].name}），无需再激活${name}`,
+      );
+    if (order.upgrade && order.device_id !== deviceId) {
+      if (top === rank)
+        return new HttpError(
+          409,
+          "EDITION_DOWNGRADE",
+          `这台设备已激活${name}，无需再使用升级订单`,
+        );
+      if (!others.some((item) => item.rank >= 0 && item.rank < rank)) {
+        const base = lowerEditionNames(product, rank) || "基础版本";
+        return new HttpError(
+          409,
+          "UPGRADE_REQUIRES_BASE",
+          `升级型号需要这台设备先激活${base}，请先用${base}订单激活`,
+        );
+      }
+    }
+    return null;
+  }
+  async function checkEdition(
+    env: Env,
+    product: ProductConfig,
+    order: Entitlement,
+    deviceId: string,
+  ) {
+    if (!order.edition || !product.editions?.length) return;
+    const block = editionBlock(product, order, deviceId, await heldEditions(env, product, deviceId));
+    if (block) throw block;
+  }
+  async function bindLicense(
+    env: Env,
+    product: ProductConfig,
+    order: Entitlement,
+    deviceId: string,
+  ): Promise<Entitlement> {
+    if (order.device_id && order.device_id !== deviceId)
+      throw new HttpError(409, "DEVICE_BOUND", "此应用授权已绑定其他设备。");
+    // 检查与下面的绑定不在同一事务里：同一买家同时激活两档的极端并发下可能都放行，
+    // 结果只是这台设备多绑了一份授权，不会越权拿到没买的型号。
+    await checkEdition(env, product, order, deviceId);
     const issuedAt = now();
     const licenseToken = order.license_token ?? signLicense({
       v: 1,
@@ -485,6 +686,7 @@ export function createWorker(
       productId: order.product_id,
       deviceId,
       issuedAt,
+      ...(order.edition ? { edition: order.edition } : {}),
     }, env.LICENSE_SIGNING_SEED);
     const bound = await env.DB.prepare(
       "UPDATE entitlements SET device_id=?,license_token=COALESCE(license_token,?),issued_at=COALESCE(issued_at,?),state=CASE WHEN state='activated' THEN state ELSE 'issued' END,updated_at=? WHERE license_id=? AND (device_id IS NULL OR device_id=?) RETURNING *",
@@ -502,13 +704,41 @@ export function createWorker(
     product: ProductConfig,
     deviceId?: string,
   ): Promise<Entitlement | null> {
-    const candidates = await env.DB.prepare(
-      "SELECT order_no FROM purchases p WHERE lower(buyer_id)=? AND payment_status=2 AND EXISTS (SELECT 1 FROM entitlements e WHERE e.order_no=p.order_no AND e.product_id=?) ORDER BY updated_at DESC LIMIT 3",
+    // 先只用 D1 挑选：签发时排除已绑定其他设备的授权（以前是复核完爱发电才
+    // 跳过，最新几单都绑了别的设备时，后面没绑定的订单永远轮不到）。
+    const rows = await env.DB.prepare(
+      "SELECT e.* FROM purchases p JOIN entitlements e ON e.order_no=p.order_no WHERE lower(p.buyer_id)=? AND p.payment_status=2 AND e.product_id=? AND (?='' OR e.device_id IS NULL OR e.device_id=?) ORDER BY p.updated_at DESC LIMIT 20",
     )
-      .bind(afdianUserId, product.productId)
-      .all<{ order_no: string }>();
-    for (const candidate of candidates.results) {
-      const order = await api.getOrder(candidate.order_no);
+      .bind(afdianUserId, product.productId, deviceId ?? "", deviceId ?? "")
+      .all<Entitlement>();
+    // 有型号时高档位优先（排序稳定，同档位仍是最新订单在前）；同档位里已绑定
+    // 本机的优先，重复激活拿回原许可证，不额外占用一份订单。
+    const candidates = rows.results
+      .map((entitlement) => ({ entitlement, rank: editionRank(product, entitlement.edition) }))
+      .sort(
+        (a, b) =>
+          b.rank - a.rank ||
+          Number(!!deviceId && b.entitlement.device_id === deviceId) -
+            Number(!!deviceId && a.entitlement.device_id === deviceId),
+      );
+    // 签发时按本机已持有的型号预先排除会被拒的候选：没有基础版的升级订单
+    // 跳过、退回普通订单；低于本机已有型号的订单跳过。都被排除时如实报原因。
+    const held =
+      deviceId && product.editions?.length ? await heldEditions(env, product, deviceId) : [];
+    let blocked: HttpError | null = null;
+    // 每个候选都要现场问一次爱发电：一次请求最多复核 3 单，与以前相同。
+    let checks = 0;
+    for (const { entitlement } of candidates) {
+      if (deviceId) {
+        const block = editionBlock(product, entitlement, deviceId, held);
+        if (block) {
+          blocked ??= block;
+          continue;
+        }
+      }
+      if (checks >= ACCOUNT_CHECKS) break;
+      checks += 1;
+      const order = await api.getOrder(entitlement.order_no);
       if (
         !order ||
         order.user_id.toLowerCase() !== afdianUserId ||
@@ -517,16 +747,9 @@ export function createWorker(
         !matchesProduct(order, product)
       )
         continue;
-      const entitlement = await env.DB.prepare(
-        "SELECT * FROM entitlements WHERE order_no=? AND product_id=?",
-      )
-        .bind(candidate.order_no, product.productId)
-        .first<Entitlement>();
-      if (!entitlement) continue;
-      if (deviceId && entitlement.device_id && entitlement.device_id !== deviceId)
-        continue;
       return entitlement;
     }
+    if (blocked) throw blocked;
     return null;
   }
   // 创作者自用：爱发电不允许创作者购买或兑换自己的商品，所以创作者账号
@@ -552,9 +775,17 @@ export function createWorker(
       env.DB.prepare(
         "INSERT OR IGNORE INTO purchases(order_no,buyer_id,plan_id,payment_status,updated_at) VALUES(?,?,?,0,?)",
       ).bind(orderNo, afdianUserId, product.planIds[0] ?? "creator", time),
+      // 创作者拿最高型号（普通授权，不走升级规则）。已签发的记录保持原型号。
       env.DB.prepare(
-        "INSERT OR IGNORE INTO entitlements(license_id,order_no,product_id,product_name,updated_at) VALUES(?,?,?,?,?)",
-      ).bind(crypto.randomUUID(), orderNo, product.productId, product.productName, time),
+        "INSERT INTO entitlements(license_id,order_no,product_id,product_name,updated_at,edition,upgrade) VALUES(?,?,?,?,?,?,0) ON CONFLICT(order_no,product_id) DO UPDATE SET edition=excluded.edition,product_name=excluded.product_name WHERE license_token IS NULL",
+      ).bind(
+        crypto.randomUUID(),
+        orderNo,
+        product.productId,
+        productLabel(product, highestEdition(product)),
+        time,
+        highestEdition(product),
+      ),
     ]);
     return env.DB.prepare("SELECT * FROM entitlements WHERE order_no=? AND product_id=?")
       .bind(orderNo, product.productId)
@@ -747,12 +978,16 @@ export function createWorker(
             status === 2 && /^\d+(?:\.\d{1,2})?$/.test(data.order.total_amount)
               ? { ...data.order, status }
               : null;
+          // Webhook 签名只覆盖订单号、买家、方案和金额，不覆盖 sku_detail：
+          // 按 SKU（含型号）区分的商品必须等 query-order 查到订单再落库，
+          // 否则改一下推送里的型号就能把普通版写成联机版。
+          const skuBound = (product: ProductConfig) =>
+            product.skuIds.length > 0 || !!product.editions?.length;
           const waitsForSku =
             !!fallback &&
             products.some(
               (product) =>
-                product.planIds.includes(fallback.plan_id) &&
-                product.skuIds.length > 0,
+                product.planIds.includes(fallback.plan_id) && skuBound(product),
             );
           if (!fallback) {
             // Unpaid or malformed notices are not purchase replies.
@@ -764,8 +999,7 @@ export function createWorker(
               fallback,
               products.filter(
                 (product) =>
-                  product.skuIds.length === 0 &&
-                  matchesProduct(fallback, product),
+                  !skuBound(product) && matchesProduct(fallback, product),
               ),
             );
         } else if (!(
@@ -818,10 +1052,10 @@ export function createWorker(
       await deliverPurchaseGuide(env, api, paidOrder, products.filter((item) => item.planIds.length > 0 && matchesProduct(paidOrder, item)));
       const order = await env.DB.prepare("SELECT * FROM entitlements WHERE order_no=? AND product_id=?").bind(orderNo, productId).first<Entitlement>();
       if (!order) throw new HttpError(503, "SERVICE_UNAVAILABLE", "暂时无法读取授权订单。");
-      const bound = await bindLicense(env, order, deviceId);
+      const bound = await bindLicense(env, product, order, deviceId);
       return {
         v: 1, type: "kovela-offline-license", productId,
-        productName: product.productName, deviceId,
+        productName: productLabel(product, bound.edition), deviceId,
         licenseId: bound.license_id, licenseToken: bound.license_token!,
       } satisfies OfflineLicense;
     }
@@ -920,7 +1154,7 @@ export function createWorker(
           .run();
         items.push({
           productId: product.productId,
-          productName: product.productName,
+          productName: productLabel(product, entitlement.edition),
           handoffToken,
           statusToken,
           expiresAt,
@@ -949,7 +1183,11 @@ export function createWorker(
           afdianUserId,
           items: products
             .filter((product) => product.planIds.length && product.productId !== "com.komoridev.watermelon")
-            .map(({ productId, productName }) => ({ productId, productName, boundDeviceId: null })),
+            .map((product) => ({
+              productId: product.productId,
+              productName: productLabel(product, highestEdition(product)),
+              boundDeviceId: null,
+            })),
         };
       const items = [];
       for (const product of products) {
@@ -959,7 +1197,7 @@ export function createWorker(
         if (!order) continue;
         items.push({
           productId: product.productId,
-          productName: product.productName,
+          productName: productLabel(product, order.edition),
           boundDeviceId: order.device_id,
         });
       }
@@ -1021,13 +1259,13 @@ export function createWorker(
         .first();
       if (!claimed)
         throw new HttpError(503, "SERVICE_UNAVAILABLE", "暂时无法完成激活，请重试。");
-      const bound = await bindLicense(env, order, deviceId);
+      const bound = await bindLicense(env, product, order, deviceId);
       return {
         licenseId: bound.license_id,
         licenseToken: bound.license_token,
         receiptToken,
         productId: bound.product_id,
-        productName: product.productName,
+        productName: productLabel(product, bound.edition),
         deviceId,
       };
     }
@@ -1097,6 +1335,9 @@ export function createWorker(
           "DEVICE_BOUND",
           "此订单的应用授权已绑定其他设备，请联系创作者。",
         );
+      // 型号规则在占用会话之前检查：被拒的买家先激活普通版后，还能拿同一个
+      // 激活凭证直接重试升级，不必重新查询订单。
+      await checkEdition(env, product, order, deviceId);
       const receiptToken = await receiptFor(env, hash, requestId, deviceId);
       const claimed = await env.DB.prepare(
         "UPDATE sessions SET device_id=?,request_id=?,receipt_hash=?,receipt_expires_at=? WHERE handoff_hash=? AND expires_at>? AND (device_id IS NULL OR (device_id=? AND request_id=?)) RETURNING handoff_hash",
@@ -1114,7 +1355,7 @@ export function createWorker(
         .first();
       if (!claimed)
         throw new HttpError(409, "HANDOFF_USED", "该激活链接已被使用。");
-      const bound = await bindLicense(env, order, deviceId);
+      const bound = await bindLicense(env, product, order, deviceId);
       return {
         licenseId: bound.license_id,
         licenseToken: bound.license_token,

@@ -19,7 +19,8 @@ export interface AfdianOrder {
   plan_id: string;
   status: number;
   total_amount: string;
-  sku_detail?: { sku_id: string; count: number }[];
+  // 爱发电的型号明细还带 name（型号名称）、pic 等；型号匹配会用到 name。
+  sku_detail?: { sku_id: string; count: number; name?: string }[];
 }
 export class AfdianError extends Error {
   constructor(
